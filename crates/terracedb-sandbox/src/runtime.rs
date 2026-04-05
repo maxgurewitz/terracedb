@@ -270,11 +270,18 @@ enum NodePendingHostOperation {
     ReadBuiltinSource {
         specifier: String,
     },
+    ReadFileBytes {
+        path: String,
+    },
     ResolveModule {
         specifier: String,
         referrer: Option<String>,
         mode: NodeResolveMode,
         options: NodeRequireResolveOptions,
+    },
+    ResolveImportMeta {
+        module_path: String,
+        specifier: String,
     },
     RequireEsmNamespace {
         resolved: NodeResolvedModule,
@@ -339,6 +346,21 @@ enum NodePendingHostOperation {
     FsRename {
         from: String,
         to: String,
+    },
+    ModulesGetNearestParentPackageJsonType {
+        path: String,
+    },
+    ModulesGetNearestParentPackageJson {
+        path: String,
+    },
+    ModulesGetPackageScopeConfig {
+        path: String,
+    },
+    ModulesGetPackageType {
+        path: String,
+    },
+    ModulesReadPackageJson {
+        path: String,
     },
     ChildProcessRun {
         request: JsonValue,
@@ -430,6 +452,18 @@ struct NodeContextifyScriptState {
     source_url: String,
     source_map_url: Option<String>,
     cached_data_rejected: Option<bool>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeProcessWrapSpawnResume {
+    request_id: u64,
+    handle: JsObject,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeSpawnSyncResume {
+    request_id: u64,
+    options: JsObject,
 }
 
 impl Class for NodeContextifyScriptState {
@@ -1694,7 +1728,7 @@ struct NodeZlibDecompressStream {
     inner: Decompress,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct NodeChildProcessRequest {
     command: String,
     #[serde(default)]
@@ -1707,7 +1741,7 @@ struct NodeChildProcessRequest {
     input: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct NodeChildProcessError {
     code: JsonValue,
     message: String,
@@ -1721,7 +1755,7 @@ struct NodeChildProcessError {
     cmd: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct NodeChildProcessResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
@@ -3347,77 +3381,77 @@ async fn execute_node_command_inner(
         cwd = %node_host.process.borrow().cwd
     );
     let _guard = span.enter();
-
-    with_active_node_host(node_host.clone(), |node_host| {
-        node_check_execution_timeout(node_host)?;
-        let gc_budget = node_host.runtime_state.memory_budget().map(|budget| {
-            Arc::new(SandboxGcAllocationBudgetAdapter { budget }) as Arc<dyn GcAllocationBudget>
-        });
-        let _budget_guard = boa_gc_set_allocation_budget(gc_budget);
-        let module_loader = Rc::new(NodeCommandModuleLoader::new(node_host.clone()));
-        let mut context = Context::builder()
-            .module_loader(module_loader)
-            .host_hooks(Rc::new(NodeRuntimeHostHooks))
-            .build()
-            .map_err(|error| SandboxError::Execution {
-                entrypoint: normalized_entrypoint.clone(),
-                message: error.to_string(),
-            })?;
-        node_debug_event(node_host, "stage", "context-built".to_string())?;
-        install_node_host_bindings(&mut context)?;
-        node_debug_event(node_host, "stage", "host-bindings-installed".to_string())?;
-        node_install_base_process_global(&mut context, node_host)?;
-        node_debug_event(node_host, "stage", "base-process-installed".to_string())?;
-        let runtime_state_snapshot = node_host.runtime_state.published_snapshot();
-        node_seed_live_tracked_memory_budget(node_host, &runtime_state_snapshot)?;
-        match node_execute_upstream_bootstrap_and_main_async(
-            &mut context,
-            node_host.clone(),
-            &entrypoint,
-            &normalized_entrypoint,
-        )
-        .await
-        {
-            Ok(()) => {
-                drain_node_jobs_until_quiescent_async(&mut context, node_host.clone(), &entrypoint)
-                    .await?;
-            }
-            Err(SandboxError::ProcessExited) => {}
-            Err(SandboxError::ExecveReplaced) => {}
-            Err(error) => return Err(error),
+    let _active_host = push_active_node_host(node_host.clone());
+    node_check_execution_timeout(&node_host)?;
+    let _ = node_builtin_ids_async(&node_host).await?;
+    let gc_budget = node_host.runtime_state.memory_budget().map(|budget| {
+        Arc::new(SandboxGcAllocationBudgetAdapter { budget }) as Arc<dyn GcAllocationBudget>
+    });
+    let _budget_guard = boa_gc_set_allocation_budget(gc_budget);
+    let module_loader = Rc::new(NodeCommandModuleLoader::new(node_host.clone()));
+    let mut context = Context::builder()
+        .module_loader(module_loader)
+        .host_hooks(Rc::new(NodeRuntimeHostHooks))
+        .build()
+        .map_err(|error| SandboxError::Execution {
+            entrypoint: normalized_entrypoint.clone(),
+            message: error.to_string(),
+        })?;
+    node_debug_event(&node_host, "stage", "context-built".to_string())?;
+    install_node_host_bindings(&mut context)?;
+    node_debug_event(&node_host, "stage", "host-bindings-installed".to_string())?;
+    node_install_base_process_global(&mut context, &node_host)?;
+    node_debug_event(&node_host, "stage", "base-process-installed".to_string())?;
+    let runtime_state_snapshot = node_host.runtime_state.published_snapshot();
+    node_seed_live_tracked_memory_budget(&node_host, &runtime_state_snapshot)?;
+    match node_execute_upstream_bootstrap_and_main_async(
+        &mut context,
+        node_host.clone(),
+        &entrypoint,
+        &normalized_entrypoint,
+    )
+    .await
+    {
+        Ok(()) => {
+            drain_node_jobs_until_quiescent_async(&mut context, node_host.clone(), &entrypoint)
+                .await?;
         }
-        let result = node_command_report_json(node_host);
+        Err(SandboxError::ProcessExited) => {}
+        Err(SandboxError::ExecveReplaced) => {}
+        Err(error) => return Err(error),
+    }
+    let result = node_command_report_json(&node_host);
 
-        let module_graph = node_host
-            .loaded_modules
-            .borrow()
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let package_import_count = module_graph
-            .iter()
-            .filter(|path| path.contains("/node_modules/"))
-            .count();
-        let debug_trace = node_host.debug_trace.borrow().clone();
-        let runtime_state_snapshot = node_host.runtime_state.published_snapshot();
-        let managed_memory = node_runtime_managed_memory_stats(node_host, &runtime_state_snapshot);
-        let gc_stats = boa_gc_runtime_stats();
-        let accounted_bytes = managed_memory
-            .total_bytes
-            .saturating_add(gc_stats.bytes_allocated as u64);
+    let module_graph = node_host
+        .loaded_modules
+        .borrow()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let package_import_count = module_graph
+        .iter()
+        .filter(|path| path.contains("/node_modules/"))
+        .count();
+    let debug_trace = node_host.debug_trace.borrow().clone();
+    let runtime_state_snapshot = node_host.runtime_state.published_snapshot();
+    let managed_memory = node_runtime_managed_memory_stats(&node_host, &runtime_state_snapshot);
+    let gc_stats = boa_gc_runtime_stats();
+    let accounted_bytes = managed_memory
+        .total_bytes
+        .saturating_add(gc_stats.bytes_allocated as u64);
 
-        Ok(SandboxExecutionResult {
-            backend: node_host.runtime_name.clone(),
-            actor_id: node_host.runtime_handle.actor_id.clone(),
-            entrypoint: entrypoint.clone(),
-            result,
-            module_graph: module_graph.clone(),
-            package_imports: Vec::new(),
-            cache_hits: Vec::new(),
-            cache_misses: Vec::new(),
-            cache_entries: runtime_state_snapshot.module_cache.into_values().collect(),
-            capability_calls: Vec::new(),
-            metadata: BTreeMap::from([
+    Ok(SandboxExecutionResult {
+        backend: node_host.runtime_name.clone(),
+        actor_id: node_host.runtime_handle.actor_id.clone(),
+        entrypoint: entrypoint.clone(),
+        result,
+        module_graph: module_graph.clone(),
+        package_imports: Vec::new(),
+        cache_hits: Vec::new(),
+        cache_misses: Vec::new(),
+        cache_entries: runtime_state_snapshot.module_cache.into_values().collect(),
+        capability_calls: Vec::new(),
+        metadata: BTreeMap::from([
                 (
                     "session_revision".to_string(),
                     JsonValue::from(node_host.session_info.revision),
@@ -3531,8 +3565,7 @@ async fn execute_node_command_inner(
                     "node_runtime_accounted_bytes".to_string(),
                     JsonValue::from(accounted_bytes),
                 ),
-            ]),
-        })
+        ]),
     })
 }
 
@@ -3655,73 +3688,6 @@ fn node_install_base_process_global(
 
     drop(process);
     node_store_global(context, "process", JsValue::from(process_object))
-}
-
-fn node_execute_upstream_bootstrap_and_main(
-    context: &mut Context,
-    host: &NodeRuntimeHost,
-    entrypoint: &str,
-    normalized_entrypoint: &str,
-) -> Result<(), SandboxError> {
-    node_check_execution_timeout(host)?;
-    node_debug_event(host, "stage", "bootstrap-realm-start".to_string())?;
-    let realm = node_initialize_bootstrap_realm(context, host)?;
-    let realm_object = realm.as_object().ok_or_else(|| SandboxError::Execution {
-        entrypoint: normalized_entrypoint.to_string(),
-        message: "bootstrap realm did not return an object".to_string(),
-    })?;
-    let process = context
-        .global_object()
-        .get(js_string!("process"), context)
-        .map_err(sandbox_execution_error)?;
-    let internal_binding = realm_object
-        .get(js_string!("internalBinding"), context)
-        .map_err(sandbox_execution_error)?;
-    let require_builtin = realm_object
-        .get(js_string!("requireBuiltin"), context)
-        .map_err(sandbox_execution_error)?;
-    let primordials = host
-        .bootstrap
-        .borrow()
-        .primordials
-        .clone()
-        .map(JsValue::from)
-        .ok_or_else(|| SandboxError::Execution {
-            entrypoint: normalized_entrypoint.to_string(),
-            message: "primordials not initialized".to_string(),
-        })?;
-
-    node_prepare_process_for_bootstrap(context, host, &process, &internal_binding)?;
-    node_debug_event(host, "stage", "bootstrap-realm-done".to_string())?;
-
-    for specifier in [
-        "internal/bootstrap/node",
-        "internal/bootstrap/web/exposed-wildcard",
-        "internal/bootstrap/web/exposed-window-or-worker",
-        "internal/bootstrap/switches/is_main_thread",
-        "internal/bootstrap/switches/does_own_process_state",
-        "internal/main/run_main_module",
-    ] {
-        node_check_execution_timeout(host)?;
-        node_debug_event(host, "stage", format!("builtin-start {specifier}"))?;
-        let result = node_call_builtin_with_node_runtime(
-            context,
-            host,
-            specifier,
-            &[
-                process.clone(),
-                require_builtin.clone(),
-                internal_binding.clone(),
-                primordials.clone(),
-            ],
-            entrypoint,
-        )?;
-        node_await_if_promise(context, host, entrypoint, result)?;
-        node_check_execution_timeout(host)?;
-        node_debug_event(host, "stage", format!("builtin-done {specifier}"))?;
-    }
-
-    Ok(())
 }
 
 fn node_prepare_process_for_bootstrap(
@@ -4258,71 +4224,6 @@ fn node_set_process_env_value(
     Ok(())
 }
 
-fn node_call_builtin_with_node_runtime(
-    context: &mut Context,
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    args: &[JsValue],
-    entrypoint: &str,
-) -> Result<JsValue, SandboxError> {
-    node_check_execution_timeout(host)?;
-    let function = node_compile_builtin_wrapper(
-        context,
-        host,
-        specifier,
-        &["process", "require", "internalBinding", "primordials"],
-        None,
-    )?;
-    let callable = function
-        .as_callable()
-        .ok_or_else(|| SandboxError::Execution {
-            entrypoint: entrypoint.to_string(),
-            message: format!("builtin `{specifier}` did not compile to a callable wrapper"),
-        })?;
-    node_debug_event(host, "builtin", format!("call start {specifier}"))?;
-    match callable.call(&JsValue::undefined(), args, context) {
-        Ok(value) => {
-            node_debug_event(host, "builtin", format!("call ok {specifier}"))?;
-            Ok(value)
-        }
-        Err(error) => {
-            node_debug_event(host, "builtin", format!("call err {specifier}: {error}"))?;
-            Err(sandbox_execution_error(error))
-        }
-    }
-}
-
-fn node_await_if_promise(
-    context: &mut Context,
-    host: &NodeRuntimeHost,
-    entrypoint: &str,
-    value: JsValue,
-) -> Result<JsValue, SandboxError> {
-    let Some(object) = value.as_object() else {
-        return Ok(value);
-    };
-    let Ok(promise) = JsPromise::from_object(object.clone()) else {
-        return Ok(value);
-    };
-    loop {
-        node_check_execution_timeout(host)?;
-        match promise.state() {
-            PromiseState::Pending => {
-                context.run_jobs().map_err(sandbox_execution_error)?;
-            }
-            PromiseState::Fulfilled(_) | PromiseState::Rejected(_) => break,
-        }
-    }
-    if let PromiseState::Rejected(reason) = promise.state() {
-        return Err(node_execution_error(
-            entrypoint,
-            host,
-            boa_engine::JsError::from_opaque(reason),
-        ));
-    }
-    Ok(JsValue::from(object))
-}
-
 fn node_command_report_json(host: &NodeRuntimeHost) -> Option<JsonValue> {
     let process = host.process.borrow();
     Some(serde_json::json!({
@@ -4356,24 +4257,24 @@ fn install_node_host_bindings(context: &mut Context) -> Result<(), SandboxError>
     register_global_native(context, "__terraceSetExitCode", 1, node_set_exit_code)?;
     register_global_native(context, "__terraceWriteStdout", 1, node_write_stdout)?;
     register_global_native(context, "__terraceWriteStderr", 1, node_write_stderr)?;
-    register_global_native(
+    register_global_suspend_native(
         context,
         "__terraceReadBuiltinSource",
         1,
-        node_read_builtin_source,
+        node_read_builtin_source_suspend,
     )?;
-    register_global_native(context, "__terraceResolveModule", 3, node_resolve_module)?;
-    register_global_native(
+    register_global_suspend_native(context, "__terraceResolveModule", 3, node_resolve_module_suspend)?;
+    register_global_suspend_native(
         context,
         "__terraceRequireEsmNamespace",
         1,
-        node_require_esm_namespace,
+        node_require_esm_namespace_suspend,
     )?;
-    register_global_native(
+    register_global_suspend_native(
         context,
         "__terraceRequireResolveImpl",
         3,
-        node_require_resolve,
+        node_require_resolve_suspend,
     )?;
     register_global_native(
         context,
@@ -4387,33 +4288,33 @@ fn install_node_host_bindings(context: &mut Context) -> Result<(), SandboxError>
         1,
         node_read_module_source,
     )?;
-    register_global_native(
+    register_global_suspend_native(
         context,
         "__terraceFsReadTextFile",
         1,
-        node_fs_read_text_file,
+        node_fs_read_text_file_suspend,
     )?;
-    register_global_native(
+    register_global_suspend_native(
         context,
         "__terraceFsWriteTextFile",
         2,
-        node_fs_write_text_file,
+        node_fs_write_text_file_suspend,
     )?;
-    register_global_native(context, "__terraceFsOpen", 3, node_fs_open)?;
-    register_global_native(context, "__terraceFsClose", 1, node_fs_close)?;
+    register_global_suspend_native(context, "__terraceFsOpen", 3, node_fs_open_suspend)?;
+    register_global_suspend_native(context, "__terraceFsClose", 1, node_fs_close_suspend)?;
     register_global_native(context, "__terraceFsReadFd", 3, node_fs_read_fd)?;
-    register_global_native(context, "__terraceFsWriteFd", 3, node_fs_write_fd)?;
-    register_global_native(context, "__terraceFsTruncateFd", 2, node_fs_truncate_fd)?;
-    register_global_native(context, "__terraceFsMkdir", 1, node_fs_mkdir)?;
-    register_global_native(context, "__terraceFsReaddir", 1, node_fs_readdir)?;
-    register_global_native(context, "__terraceFsStat", 1, node_fs_stat)?;
-    register_global_native(context, "__terraceFsLstat", 1, node_fs_lstat)?;
-    register_global_native(context, "__terraceFsReadlink", 1, node_fs_readlink)?;
+    register_global_suspend_native(context, "__terraceFsWriteFd", 3, node_fs_write_fd_suspend)?;
+    register_global_suspend_native(context, "__terraceFsTruncateFd", 2, node_fs_truncate_fd_suspend)?;
+    register_global_suspend_native(context, "__terraceFsMkdir", 1, node_fs_mkdir_suspend)?;
+    register_global_suspend_native(context, "__terraceFsReaddir", 1, node_fs_readdir_suspend)?;
+    register_global_suspend_native(context, "__terraceFsStat", 1, node_fs_stat_suspend)?;
+    register_global_suspend_native(context, "__terraceFsLstat", 1, node_fs_lstat_suspend)?;
+    register_global_suspend_native(context, "__terraceFsReadlink", 1, node_fs_readlink_suspend)?;
     register_global_native(context, "__terraceFsRealpath", 1, node_fs_realpath)?;
-    register_global_native(context, "__terraceFsLink", 2, node_fs_link)?;
-    register_global_native(context, "__terraceFsSymlink", 2, node_fs_symlink)?;
-    register_global_native(context, "__terraceFsUnlink", 1, node_fs_unlink)?;
-    register_global_native(context, "__terraceFsRename", 2, node_fs_rename)?;
+    register_global_suspend_native(context, "__terraceFsLink", 2, node_fs_link_suspend)?;
+    register_global_suspend_native(context, "__terraceFsSymlink", 2, node_fs_symlink_suspend)?;
+    register_global_suspend_native(context, "__terraceFsUnlink", 1, node_fs_unlink_suspend)?;
+    register_global_suspend_native(context, "__terraceFsRename", 2, node_fs_rename_suspend)?;
     register_global_native(
         context,
         "__terraceCryptoGetHashes",
@@ -4475,11 +4376,11 @@ fn install_node_host_bindings(context: &mut Context) -> Result<(), SandboxError>
         1,
         node_zlib_stream_close,
     )?;
-    register_global_native(
+    register_global_suspend_native(
         context,
         "__terraceChildProcessRun",
         1,
-        node_child_process_run,
+        node_child_process_run_suspend,
     )?;
     Ok(())
 }
@@ -4627,6 +4528,255 @@ fn node_unexpected_host_operation_result(
     )))
 }
 
+fn take_host_operation_completion_for_resume(
+    request_id: u64,
+) -> Result<NodeCompletedHostOperation, SandboxError> {
+    let host = active_node_host()?;
+    node_take_host_operation_completion(&host, request_id)
+}
+
+fn node_suspend_host_operation(
+    operation: NodePendingHostOperation,
+    resume: fn(Result<(), boa_engine::JsError>, &u64, &mut Context) -> JsResult<JsValue>,
+) -> JsResult<NativeFunctionResult> {
+    let host = active_node_host().map_err(js_error)?;
+    let request_id = node_queue_host_operation(&host, operation).map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        resume, request_id,
+    ))
+}
+
+fn node_resume_string_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::String(value) => Ok(JsValue::from(JsString::from(value))),
+        other => Err(node_unexpected_host_operation_result("string", &other)),
+    }
+}
+
+fn node_resume_undefined_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Undefined => Ok(JsValue::undefined()),
+        other => Err(node_unexpected_host_operation_result("undefined", &other)),
+    }
+}
+
+fn node_resume_i32_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::I32(value) => Ok(JsValue::from(value)),
+        other => Err(node_unexpected_host_operation_result("i32", &other)),
+    }
+}
+
+fn node_resume_u32_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::U32(value) => Ok(JsValue::from(value)),
+        other => Err(node_unexpected_host_operation_result("u32", &other)),
+    }
+}
+
+fn node_resume_bytes_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Bytes(bytes) => JsUint8Array::from_iter(bytes, context)
+            .map(Into::into)
+            .map_err(sandbox_execution_error)
+            .map_err(js_error),
+        other => Err(node_unexpected_host_operation_result("bytes", &other)),
+    }
+}
+
+fn node_resume_stats_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Stats(stats) => match stats {
+            Some(stats) => JsValue::from_json(&node_stats_to_json(stats), context)
+                .map_err(sandbox_execution_error)
+                .map_err(js_error),
+            None => Ok(JsValue::null()),
+        },
+        other => Err(node_unexpected_host_operation_result("stats", &other)),
+    }
+}
+
+fn node_resume_dir_entries_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::DirEntries(entries) => {
+            let json = JsonValue::Array(
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "name": entry.name,
+                            "kind": format!("{:?}", entry.kind).to_lowercase(),
+                        })
+                    })
+                    .collect(),
+            );
+            JsValue::from_json(&json, context)
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)
+        }
+        other => Err(node_unexpected_host_operation_result("dir entries", &other)),
+    }
+}
+
+fn node_resume_resolved_module_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::ResolvedModule(resolved) => JsValue::from_json(
+            &serde_json::to_value(resolved)
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)?,
+            context,
+        )
+        .map_err(sandbox_execution_error)
+        .map_err(js_error),
+        other => Err(node_unexpected_host_operation_result("resolved module", &other)),
+    }
+}
+
+fn node_resume_json_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Json(value) => JsValue::from_json(&value, context)
+            .map_err(sandbox_execution_error)
+            .map_err(js_error),
+        other => Err(node_unexpected_host_operation_result("json", &other)),
+    }
+}
+
+fn node_resume_json_or_undefined_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Json(value) => JsValue::from_json(&value, context)
+            .map_err(sandbox_execution_error)
+            .map_err(js_error),
+        NodeCompletedHostOperation::Undefined => Ok(JsValue::undefined()),
+        other => Err(node_unexpected_host_operation_result("json|undefined", &other)),
+    }
+}
+
+fn node_resume_string_or_undefined_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::String(value) => Ok(JsValue::from(JsString::from(value))),
+        NodeCompletedHostOperation::Undefined => Ok(JsValue::undefined()),
+        other => Err(node_unexpected_host_operation_result("string|undefined", &other)),
+    }
+}
+
+fn node_resume_string_or_json_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::String(value) => Ok(JsValue::from(JsString::from(value))),
+        NodeCompletedHostOperation::Json(value) => JsValue::from_json(&value, context)
+            .map_err(sandbox_execution_error)
+            .map_err(js_error),
+        other => Err(node_unexpected_host_operation_result("string|json", &other)),
+    }
+}
+
+fn node_resume_js_value_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::JsValue(value) => Ok(value),
+        other => Err(node_unexpected_host_operation_result("js value", &other)),
+    }
+}
+
+fn node_resume_require_resolve_host_operation(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let host = active_node_host().map_err(js_error)?;
+    let completion = node_take_host_operation_completion(&host, *request_id);
+    let report = match completion {
+        Ok(NodeCompletedHostOperation::ResolvedModule(resolved)) => serde_json::json!({
+            "ok": true,
+            "resolved": resolved,
+        }),
+        Ok(other) => return Err(node_unexpected_host_operation_result("resolved module", &other)),
+        Err(error) => {
+            let message = match &error {
+                SandboxError::ModuleNotFound { specifier } => {
+                    format!("Cannot find module '{specifier}'")
+                }
+                other => other.to_string(),
+            };
+            let code = match error {
+                SandboxError::ModuleNotFound { .. } => "MODULE_NOT_FOUND",
+                _ => "ERR_TERRACE_NODE_RESOLVE",
+            };
+            serde_json::json!({
+                "ok": false,
+                "code": code,
+                "message": message,
+            })
+        }
+    };
+    JsValue::from_json(&report, context)
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)
+}
+
+fn take_child_process_result_for_resume(
+    request_id: u64,
+) -> Result<NodeChildProcessResult, SandboxError> {
+    match take_host_operation_completion_for_resume(request_id)? {
+        NodeCompletedHostOperation::Json(value) => {
+            serde_json::from_value(value).map_err(sandbox_execution_error)
+        }
+        other => Err(sandbox_execution_error(format!(
+            "unexpected node host operation result; expected child process json, got {other:?}"
+        ))),
+    }
+}
+
 async fn node_drive_interruptible_value<F>(
     context: &mut Context,
     host: Rc<NodeRuntimeHost>,
@@ -4683,12 +4833,13 @@ where
     }
 }
 
+#[async_recursion(?Send)]
 async fn node_execute_next_host_operation(
     context: &mut Context,
     host: Rc<NodeRuntimeHost>,
 ) -> Result<(), SandboxError> {
     let (request_id, operation) = node_take_pending_host_operation(&host)?;
-    let completion = match operation {
+    let completion: Result<NodeCompletedHostOperation, SandboxError> = match operation {
         NodePendingHostOperation::ReadBuiltinSource { specifier } => {
             if node_upstream_builtin_vfs_path(&specifier).is_none() {
                 Ok(NodeCompletedHostOperation::String(String::new()))
@@ -4696,6 +4847,14 @@ async fn node_execute_next_host_operation(
                 node_read_builtin_source_text_async(&host, &specifier)
                     .await
                     .map(NodeCompletedHostOperation::String)
+            }
+        }
+        NodePendingHostOperation::ReadFileBytes { path } => {
+            let path = resolve_node_path(&host.process.borrow().cwd, &path);
+            match host.session.filesystem().read_file(&path).await {
+                Ok(Some(bytes)) => Ok(NodeCompletedHostOperation::Bytes(bytes)),
+                Ok(None) => Ok(NodeCompletedHostOperation::Undefined),
+                Err(error) => Err(error.into()),
             }
         }
         NodePendingHostOperation::ResolveModule {
@@ -4712,6 +4871,16 @@ async fn node_execute_next_host_operation(
         )
         .await
         .map(NodeCompletedHostOperation::ResolvedModule),
+        NodePendingHostOperation::ResolveImportMeta {
+            module_path,
+            specifier,
+        } => resolve_import_meta_target_async(&host, &module_path, &specifier)
+            .await
+            .map(NodeCompletedHostOperation::String)
+            .or_else(|error| match error {
+                SandboxError::ModuleNotFound { .. } => Ok(NodeCompletedHostOperation::Undefined),
+                other => Err(other),
+            }),
         NodePendingHostOperation::RequireEsmNamespace { resolved } => {
             node_require_esm_namespace_async(context, host.clone(), resolved)
                 .await
@@ -4719,23 +4888,21 @@ async fn node_execute_next_host_operation(
         }
         NodePendingHostOperation::FsReadTextFile { path } => {
             let path = resolve_node_path(&host.process.borrow().cwd, &path);
-            let bytes = host
-                .session
-                .filesystem()
-                .read_file(&path)
-                .await?
-                .ok_or_else(|| SandboxError::ModuleNotFound {
-                    specifier: path.clone(),
-                })?;
-            let text = String::from_utf8(bytes).map_err(|error| SandboxError::Execution {
-                entrypoint: path,
-                message: error.to_string(),
-            })?;
-            Ok(NodeCompletedHostOperation::String(text))
+            match host.session.filesystem().read_file(&path).await {
+                Ok(Some(bytes)) => String::from_utf8(bytes)
+                    .map(NodeCompletedHostOperation::String)
+                    .map_err(|error| SandboxError::Execution {
+                        entrypoint: path,
+                        message: error.to_string(),
+                    }),
+                Ok(None) => Err(SandboxError::ModuleNotFound { specifier: path }),
+                Err(error) => Err(error.into()),
+            }
         }
         NodePendingHostOperation::FsWriteTextFile { path, data } => {
             let path = resolve_node_path(&host.process.borrow().cwd, &path);
-            host.session
+            match host
+                .session
                 .filesystem()
                 .write_file(
                     &path,
@@ -4746,9 +4913,14 @@ async fn node_execute_next_host_operation(
                         ..Default::default()
                     },
                 )
-                .await?;
-            node_graph_invalidate(&host);
-            Ok(NodeCompletedHostOperation::Undefined)
+                .await
+            {
+                Ok(()) => {
+                    node_graph_invalidate(&host);
+                    Ok(NodeCompletedHostOperation::Undefined)
+                }
+                Err(error) => Err(error.into()),
+            }
         }
         NodePendingHostOperation::FsOpen { path, flags } => node_fs_open_impl_async(&host, &path, flags)
             .await
@@ -4774,7 +4946,8 @@ async fn node_execute_next_host_operation(
         }
         NodePendingHostOperation::FsMkdir { path } => {
             let path = resolve_node_path(&host.process.borrow().cwd, &path);
-            host.session
+            match host
+                .session
                 .filesystem()
                 .mkdir(
                     &path,
@@ -4783,9 +4956,14 @@ async fn node_execute_next_host_operation(
                         ..Default::default()
                     },
                 )
-                .await?;
-            node_graph_invalidate(&host);
-            Ok(NodeCompletedHostOperation::Undefined)
+                .await
+            {
+                Ok(()) => {
+                    node_graph_invalidate(&host);
+                    Ok(NodeCompletedHostOperation::Undefined)
+                }
+                Err(error) => Err(error.into()),
+            }
         }
         NodePendingHostOperation::FsReaddir { path } => {
             let path = resolve_node_path(&host.process.borrow().cwd, &path);
@@ -4818,45 +4996,123 @@ async fn node_execute_next_host_operation(
             let cwd = host.process.borrow().cwd.clone();
             let from = resolve_node_path(&cwd, &from);
             let to = resolve_node_path(&cwd, &to);
-            host.session.filesystem().link(&from, &to).await?;
-            node_graph_invalidate(&host);
-            Ok(NodeCompletedHostOperation::Undefined)
+            match host.session.filesystem().link(&from, &to).await {
+                Ok(()) => {
+                    node_graph_invalidate(&host);
+                    Ok(NodeCompletedHostOperation::Undefined)
+                }
+                Err(error) => Err(error.into()),
+            }
         }
         NodePendingHostOperation::FsSymlink { target, linkpath } => {
             let linkpath = resolve_node_path(&host.process.borrow().cwd, &linkpath);
-            host.session
+            match host
+                .session
                 .filesystem()
                 .symlink(&target, &linkpath)
-                .await?;
-            node_graph_invalidate(&host);
-            Ok(NodeCompletedHostOperation::Undefined)
+                .await
+            {
+                Ok(()) => {
+                    node_graph_invalidate(&host);
+                    Ok(NodeCompletedHostOperation::Undefined)
+                }
+                Err(error) => Err(error.into()),
+            }
         }
         NodePendingHostOperation::FsUnlink { path } => {
             let path = resolve_node_path(&host.process.borrow().cwd, &path);
-            let stats = host.session.filesystem().stat(&path).await?;
-            match stats.map(|stats| stats.kind) {
-                Some(FileKind::Directory) => {
-                    host.session.filesystem().rmdir(&path).await?;
+            match host.session.filesystem().stat(&path).await {
+                Ok(stats) => {
+                    let removal = match stats.map(|stats| stats.kind) {
+                        Some(FileKind::Directory) => host.session.filesystem().rmdir(&path).await,
+                        Some(_) => host.session.filesystem().unlink(&path).await,
+                        None => Ok(()),
+                    };
+                    match removal {
+                        Ok(()) => {
+                            node_graph_invalidate(&host);
+                            Ok(NodeCompletedHostOperation::Undefined)
+                        }
+                        Err(error) => Err(error.into()),
+                    }
                 }
-                Some(_) => {
-                    host.session.filesystem().unlink(&path).await?;
-                }
-                None => {}
+                Err(error) => Err(error.into()),
             }
-            node_graph_invalidate(&host);
-            Ok(NodeCompletedHostOperation::Undefined)
         }
         NodePendingHostOperation::FsRename { from, to } => {
             let cwd = host.process.borrow().cwd.clone();
             let from = resolve_node_path(&cwd, &from);
             let to = resolve_node_path(&cwd, &to);
-            host.session.filesystem().rename(&from, &to).await?;
-            node_graph_invalidate(&host);
-            Ok(NodeCompletedHostOperation::Undefined)
+            match host.session.filesystem().rename(&from, &to).await {
+                Ok(()) => {
+                    node_graph_invalidate(&host);
+                    Ok(NodeCompletedHostOperation::Undefined)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        NodePendingHostOperation::ModulesGetNearestParentPackageJsonType { path } => {
+            let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
+            let package_type = node_modules_traverse_parent_package_json_async(&host, &resolved)
+                .await?
+                .and_then(|(package_json, _)| {
+                    package_json
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| *value == "commonjs" || *value == "module")
+                        .map(str::to_string)
+                });
+            Ok(match package_type {
+                Some(value) => NodeCompletedHostOperation::String(value),
+                None => NodeCompletedHostOperation::Undefined,
+            })
+        }
+        NodePendingHostOperation::ModulesGetNearestParentPackageJson { path } => {
+            let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
+            Ok(match node_modules_traverse_parent_package_json_async(&host, &resolved).await? {
+                Some((package_json, package_json_path)) => NodeCompletedHostOperation::Json(
+                    node_modules_serialize_package_json(&package_json, Some(&package_json_path)),
+                ),
+                None => NodeCompletedHostOperation::Undefined,
+            })
+        }
+        NodePendingHostOperation::ModulesGetPackageScopeConfig { path } => {
+            let (package_json, package_json_path) =
+                node_modules_find_package_scope_config_async(&host, &path).await?;
+            Ok(match package_json {
+                Some(package_json) => NodeCompletedHostOperation::Json(
+                    node_modules_serialize_package_json(&package_json, Some(&package_json_path)),
+                ),
+                None => NodeCompletedHostOperation::String(package_json_path),
+            })
+        }
+        NodePendingHostOperation::ModulesGetPackageType { path } => {
+            let (package_json, _) = node_modules_find_package_scope_config_async(&host, &path).await?;
+            Ok(match package_json
+                .and_then(|package_json| {
+                    package_json
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| *value == "commonjs" || *value == "module")
+                        .map(str::to_string)
+                }) {
+                Some(value) => NodeCompletedHostOperation::String(value),
+                None => NodeCompletedHostOperation::Undefined,
+            })
+        }
+        NodePendingHostOperation::ModulesReadPackageJson { path } => {
+            let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
+            Ok(match read_package_json_async(&host, &resolved).await? {
+                Some(package_json) => NodeCompletedHostOperation::Json(
+                    node_modules_serialize_package_json(&package_json, Some(&resolved)),
+                ),
+                None => NodeCompletedHostOperation::Undefined,
+            })
         }
         NodePendingHostOperation::ChildProcessRun { request } => {
-            let result = node_child_process_run_async(context, host.clone(), request).await?;
-            Ok(NodeCompletedHostOperation::Json(result))
+            node_child_process_run_async(context, host.clone(), request)
+                .await
+                .map(NodeCompletedHostOperation::Json)
         }
     };
     node_store_host_operation_completion(&host, request_id, completion);
@@ -5124,91 +5380,30 @@ async fn node_graph_read_file_async(
     Ok(bytes)
 }
 
-fn node_readonly_fs(
-    host: &NodeRuntimeHost,
-) -> Result<Arc<dyn ReadOnlyVfsFileSystem>, SandboxError> {
-    node_check_execution_timeout(host)?;
-    if let Some(fs) = host.read_snapshot_fs.borrow().clone() {
-        return Ok(fs);
-    }
-    node_debug_event(host, "fs", "capture_visible_snapshot".to_string())?;
-    let snapshot = futures::executor::block_on(host.session.volume().visible_snapshot())?;
-    let fs = snapshot.fs();
-    *host.read_snapshot_fs.borrow_mut() = Some(fs.clone());
-    Ok(fs)
-}
-
-fn node_read_stat(host: &NodeRuntimeHost, path: &str) -> Result<Option<Stats>, SandboxError> {
-    let fs = node_readonly_fs(host)?;
-    futures::executor::block_on(fs.stat(path)).map_err(Into::into)
-}
-
-fn node_read_lstat(host: &NodeRuntimeHost, path: &str) -> Result<Option<Stats>, SandboxError> {
-    let fs = node_readonly_fs(host)?;
-    futures::executor::block_on(fs.lstat(path)).map_err(Into::into)
-}
-
-fn node_read_file(host: &NodeRuntimeHost, path: &str) -> Result<Option<Vec<u8>>, SandboxError> {
-    let fs = node_readonly_fs(host)?;
-    futures::executor::block_on(fs.read_file(path)).map_err(Into::into)
-}
-
-fn node_read_readdir(
-    host: &NodeRuntimeHost,
-    path: &str,
-) -> Result<Vec<terracedb_vfs::DirEntry>, SandboxError> {
-    let fs = node_readonly_fs(host)?;
-    futures::executor::block_on(fs.readdir(path)).map_err(Into::into)
-}
-
-fn node_read_readlink(host: &NodeRuntimeHost, path: &str) -> Result<String, SandboxError> {
-    let fs = node_readonly_fs(host)?;
-    futures::executor::block_on(fs.readlink(path)).map_err(Into::into)
-}
-
-fn node_graph_stat(host: &NodeRuntimeHost, path: &str) -> Result<Option<Stats>, SandboxError> {
-    if let Some(cached) = host.module_graph.borrow().stat_cache.get(path).cloned() {
-        return Ok(cached);
-    }
-    node_debug_event(host, "fs", format!("stat {path}"))?;
-    let stats = node_read_stat(host, path)?;
-    host.module_graph
-        .borrow_mut()
-        .stat_cache
-        .insert(path.to_string(), stats.clone());
-    node_sync_live_module_cache_budget(host)?;
-    Ok(stats)
-}
-
-fn node_graph_read_file(
-    host: &NodeRuntimeHost,
-    path: &str,
-) -> Result<Option<Vec<u8>>, SandboxError> {
-    if let Some(cached) = host.module_graph.borrow().file_cache.get(path).cloned() {
-        return Ok(cached);
-    }
-    node_debug_event(host, "fs", format!("read_file {path}"))?;
-    let bytes = node_read_file(host, path)?;
-    host.module_graph
-        .borrow_mut()
-        .file_cache
-        .insert(path.to_string(), bytes.clone());
-    node_sync_live_module_cache_budget(host)?;
-    Ok(bytes)
-}
-
 fn with_active_node_host<T>(
     host: Rc<NodeRuntimeHost>,
     f: impl FnOnce(&Rc<NodeRuntimeHost>) -> Result<T, SandboxError>,
 ) -> Result<T, SandboxError> {
-    ACTIVE_NODE_HOST_STACK.with(|stack| {
-        stack.borrow_mut().push(host.clone());
-    });
+    let _scope = push_active_node_host(host.clone());
     let result = f(&host);
-    ACTIVE_NODE_HOST_STACK.with(|stack| {
-        let _ = stack.borrow_mut().pop();
-    });
     result
+}
+
+struct ActiveNodeHostScope;
+
+impl Drop for ActiveNodeHostScope {
+    fn drop(&mut self) {
+        ACTIVE_NODE_HOST_STACK.with(|stack| {
+            let _ = stack.borrow_mut().pop();
+        });
+    }
+}
+
+fn push_active_node_host(host: Rc<NodeRuntimeHost>) -> ActiveNodeHostScope {
+    ACTIVE_NODE_HOST_STACK.with(|stack| {
+        stack.borrow_mut().push(host);
+    });
+    ActiveNodeHostScope
 }
 
 impl NodeCommandModuleLoader {
@@ -5337,12 +5532,17 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
                 );
             }
         }
+        if let Ok(symbol) = node_host_private_symbol(&self.host, "import_meta.module_path") {
+            let _ = import_meta.set(
+                symbol,
+                JsValue::from(JsString::from(path.clone())),
+                true,
+                context,
+            );
+        }
         let resolver = FunctionObjectBuilder::new(
             context.realm(),
-            NativeFunction::from_copy_closure_with_captures(
-                node_import_meta_resolve_for_module,
-                JsString::from(path),
-            ),
+            NativeFunction::from_suspend_fn_ptr(node_import_meta_resolve_for_module_suspend),
         )
         .name(js_string!("resolve"))
         .length(1)
@@ -5512,7 +5712,7 @@ fn node_file_url_from_path(path: &str) -> Result<String, SandboxError> {
         })
 }
 
-fn resolve_import_meta_target(
+async fn resolve_import_meta_target_async(
     host: &NodeRuntimeHost,
     module_path: &str,
     specifier: &str,
@@ -5541,49 +5741,74 @@ fn resolve_import_meta_target(
         return node_file_url_from_path(&resolved);
     }
 
-    let resolved = resolve_node_module_path(
+    let resolved = resolve_node_module_path_async(
         host,
         specifier,
         Some(&referrer_path),
         NodeResolveMode::Import,
         None,
-    )?;
+    )
+    .await?;
     if node_builtin_name(&resolved).is_some() {
         return Ok(resolved);
     }
     node_file_url_from_path(&resolved)
 }
 
-fn node_import_meta_resolve_for_module(
-    _this: &JsValue,
-    args: &[JsValue],
-    module_path: &JsString,
+fn node_resume_import_meta_resolve(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeImportMetaResolveResume,
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let request = node_arg_string(args, 0, context)?;
-
-    let result = node_with_host(|host| {
-        resolve_import_meta_target(host, &module_path.to_std_string_escaped(), &request)
-    })
-    .map_err(|error| match error {
-        SandboxError::ModuleNotFound { .. } => node_error_with_code(
-            context,
-            JsNativeError::error(),
-            format!(
-                "Cannot find package '{request}' imported from {}",
-                module_path.to_std_string_escaped()
-            ),
-            "ERR_MODULE_NOT_FOUND",
-        ),
-        other => node_error_with_code(
-            context,
-            JsNativeError::error(),
-            other.to_string(),
-            "ERR_TERRACE_NODE_IMPORT_META_RESOLVE",
-        ),
-    })?;
-
+    let result = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::String(value) => value,
+        NodeCompletedHostOperation::Undefined => {
+            return Err(node_error_with_code(
+                context,
+                JsNativeError::error(),
+                format!(
+                    "Cannot find package '{}' imported from {}",
+                    capture.request, capture.module_path
+                ),
+                "ERR_MODULE_NOT_FOUND",
+            ));
+        }
+        other => return Err(node_unexpected_host_operation_result("string|undefined", &other)),
+    };
     Ok(JsValue::from(JsString::from(result)))
+}
+
+fn node_import_meta_resolve_for_module_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let request = node_arg_string(args, 0, context)?;
+    let host = active_node_host().map_err(js_error)?;
+    let symbol = node_host_private_symbol(&host, "import_meta.module_path").map_err(js_error)?;
+    let module_path: String = _this
+        .as_object()
+        .ok_or_else(|| JsNativeError::typ().with_message("import.meta.resolve receiver must be an object"))?
+        .get(symbol, context)?
+        .as_string()
+        .map(|value| value.to_std_string_escaped())
+        .ok_or_else(|| JsNativeError::typ().with_message("missing import.meta module path"))?;
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::ResolveImportMeta {
+            module_path: module_path.clone(),
+            specifier: request.clone(),
+        },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_import_meta_resolve,
+        NodeImportMetaResolveResume {
+            request_id,
+            module_path,
+            request,
+        },
+    ))
 }
 
 fn node_bytes_from_js(value: &JsValue, context: &mut Context) -> JsResult<Vec<u8>> {
@@ -6680,42 +6905,6 @@ fn node_bootstrap_array_entry(
         .map_err(sandbox_execution_error)
 }
 
-fn drain_node_next_ticks(
-    context: &mut Context,
-    host: &NodeRuntimeHost,
-    entrypoint: &str,
-) -> Result<usize, SandboxError> {
-    let tick_callback = host.bootstrap.borrow().tick_callback.clone();
-    let Some(tick_callback) = tick_callback else {
-        return Ok(0);
-    };
-    let scheduled_before = node_bootstrap_array_entry(context, host, "tickInfo", 0)?;
-    let rejection_before = node_bootstrap_array_entry(context, host, "tickInfo", 1)?;
-    let mut drained = 0usize;
-    if scheduled_before == 0 {
-        drained = drained.saturating_add(node_run_microtask_checkpoint(context, host)?);
-    }
-    let scheduled_after = node_bootstrap_array_entry(context, host, "tickInfo", 0)?;
-    let rejection_after = node_bootstrap_array_entry(context, host, "tickInfo", 1)?;
-    if scheduled_after == 0 && rejection_after == 0 {
-        return Ok(drained);
-    }
-    tick_callback
-        .call(&JsValue::undefined(), &[], context)
-        .map_err(|error| node_execution_error(entrypoint, host, error))?;
-    let drained_microtasks =
-        node_run_microtask_checkpoint(context, host).map_err(|error| match error {
-            SandboxError::Execution { .. } => error,
-            other => SandboxError::Execution {
-                entrypoint: entrypoint.to_string(),
-                message: other.to_string(),
-            },
-        })?;
-    Ok(drained
-        + usize::from(scheduled_after > 0 || rejection_before > 0 || rejection_after > 0)
-        + drained_microtasks)
-}
-
 fn drain_node_timers(
     context: &mut Context,
     host: &NodeRuntimeHost,
@@ -6771,51 +6960,6 @@ fn drain_node_timers(
         }
     }
     Ok(drained)
-}
-
-fn drain_node_jobs_until_quiescent(
-    context: &mut Context,
-    host: &NodeRuntimeHost,
-    entrypoint: &str,
-) -> Result<(), SandboxError> {
-    let mut stable_rounds = 0usize;
-    let mut previous = node_runtime_progress_snapshot(host);
-    for _ in 0..NODE_RUNTIME_JOB_DRAIN_BUDGET {
-        node_check_execution_timeout(host)?;
-        let drained_before = drain_node_next_ticks(context, host, entrypoint)?;
-        let drained_timers = drain_node_timers(context, host, entrypoint)?;
-        let drained_after = drain_node_next_ticks(context, host, entrypoint)?;
-        if drained_before == 0 && drained_after == 0 && drained_timers == 0 {
-            let now_ms = node_monotonic_now_ms(host);
-            let bootstrap = host.bootstrap.borrow();
-            let next_due = bootstrap
-                .timer_is_refed
-                .then_some(bootstrap.next_timer_due_ms)
-                .flatten();
-            if let Some(next_due) = next_due.filter(|next_due| *next_due > now_ms) {
-                node_advance_monotonic_now_ms(host, next_due - now_ms);
-                previous = node_runtime_progress_snapshot(host);
-                stable_rounds = 0;
-                continue;
-            }
-        }
-        let current = node_runtime_progress_snapshot(host);
-        if drained_before == 0 && drained_after == 0 && drained_timers == 0 && current == previous {
-            stable_rounds = stable_rounds.saturating_add(1);
-            if stable_rounds >= 2 {
-                return Ok(());
-            }
-        } else {
-            stable_rounds = 0;
-            previous = current;
-        }
-    }
-    node_debug_event(
-        host,
-        "js",
-        format!("job-drain-budget-exhausted entrypoint={entrypoint}"),
-    )?;
-    Ok(())
 }
 
 fn node_get_process_info(
@@ -6904,150 +7048,19 @@ fn node_write_stderr(
     .map_err(js_error)
 }
 
-fn node_read_builtin_source(
+fn node_read_builtin_source_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let name = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        node_debug_event(
-            host,
-            "builtin",
-            format!("read_source start specifier={name}"),
-        )?;
-        let Some(path) = node_upstream_builtin_vfs_path(&name) else {
-            node_debug_event(
-                host,
-                "builtin",
-                format!("read_source empty specifier={name}"),
-            )?;
-            return Ok(JsValue::from(JsString::from(String::new())));
-        };
-        let bytes = node_read_file(host, &path)?.ok_or_else(|| SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: format!("upstream Node builtin source `{name}` is missing from sandbox VFS"),
-        })?;
-        let source = String::from_utf8(bytes).map_err(|error| SandboxError::Service {
-            service: "node_runtime",
-            message: format!("builtin `{name}` is not valid UTF-8: {error}"),
-        })?;
-        node_debug_event(
-            host,
-            "builtin",
-            format!("read_source done specifier={name} bytes={}", source.len()),
-        )?;
-        Ok(JsValue::from(JsString::from(source)))
-    })
-    .map_err(js_error)
-}
-
-fn node_initialize_bootstrap_realm(
-    context: &mut Context,
-    host: &NodeRuntimeHost,
-) -> Result<JsValue, SandboxError> {
-    node_debug_event(host, "bootstrap", "init_bootstrap_realm:start".to_string())?;
-    let exports = ObjectInitializer::new(context).build();
-    let primordials = JsObject::with_null_proto();
-    let private_symbols = node_private_symbols_object(context)?;
-    let per_isolate_symbols = node_per_isolate_symbols_object(context)?;
-    {
-        let mut bootstrap = host.bootstrap.borrow_mut();
-        bootstrap.per_context_exports = Some(exports.clone());
-        bootstrap.primordials = Some(primordials.clone());
-    }
-
-    for specifier in [
-        "internal/per_context/primordials",
-        "internal/per_context/domexception",
-        "internal/per_context/messageport",
-    ] {
-        let function = node_compile_builtin_wrapper(
-            context,
-            host,
-            specifier,
-            &[
-                "exports",
-                "primordials",
-                "privateSymbols",
-                "perIsolateSymbols",
-            ],
-            None,
-        )?;
-        let callable = function
-            .as_callable()
-            .ok_or_else(|| SandboxError::Execution {
-                entrypoint: "<node-runtime>".to_string(),
-                message: format!("builtin `{specifier}` did not compile to a callable wrapper"),
-            })?;
-        callable
-            .call(
-                &JsValue::undefined(),
-                &[
-                    JsValue::from(exports.clone()),
-                    JsValue::from(primordials.clone()),
-                    JsValue::from(private_symbols.clone()),
-                    JsValue::from(per_isolate_symbols.clone()),
-                ],
-                context,
-            )
-            .map_err(sandbox_execution_error)?;
-    }
-
-    let process = context
-        .global_object()
-        .get(js_string!("process"), context)
-        .map_err(sandbox_execution_error)?;
-    let get_linked_binding = FunctionObjectBuilder::new(
-        context.realm(),
-        NativeFunction::from_fn_ptr(node_get_linked_binding),
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "builtin", format!("read_source start specifier={name}"))
+        .map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::ReadBuiltinSource { specifier: name },
+        node_resume_string_host_operation,
     )
-    .name(js_string!("getLinkedBinding"))
-    .length(1)
-    .constructor(false)
-    .build();
-    let get_internal_binding = FunctionObjectBuilder::new(
-        context.realm(),
-        NativeFunction::from_fn_ptr(node_get_internal_binding),
-    )
-    .name(js_string!("getInternalBinding"))
-    .length(1)
-    .constructor(false)
-    .build();
-    let realm_factory = node_compile_builtin_wrapper(
-        context,
-        host,
-        "internal/bootstrap/realm",
-        &[
-            "process",
-            "getLinkedBinding",
-            "getInternalBinding",
-            "primordials",
-        ],
-        Some(
-            "; return { internalBinding, BuiltinModule, require: requireBuiltin, requireBuiltin };",
-        ),
-    )?;
-    let callable = realm_factory
-        .as_callable()
-        .ok_or_else(|| SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: "bootstrap realm did not compile to a callable wrapper".to_string(),
-        })?;
-    let realm = callable
-        .call(
-            &JsValue::undefined(),
-            &[
-                process,
-                JsValue::from(get_linked_binding),
-                JsValue::from(get_internal_binding),
-                JsValue::from(primordials),
-            ],
-            context,
-        )
-        .map_err(sandbox_execution_error)?;
-    node_debug_event(host, "bootstrap", "init_bootstrap_realm:done".to_string())?;
-    Ok(realm)
 }
 
 fn node_store_global(
@@ -7199,27 +7212,6 @@ fn node_per_isolate_symbols_object(context: &mut Context) -> Result<JsObject, Sa
     Ok(object)
 }
 
-fn node_builtin_ids(host: &NodeRuntimeHost) -> Result<Vec<String>, SandboxError> {
-    if let Some(ids) = host.builtin_ids.borrow().clone() {
-        return Ok(ids);
-    }
-    let mut ids = Vec::new();
-    node_collect_builtin_ids(host, &format!("{NODE_UPSTREAM_VFS_ROOT}/lib"), "", &mut ids)?;
-    if node_read_stat(host, &format!("{NODE_UPSTREAM_VFS_ROOT}/deps"))?.is_some() {
-        node_collect_builtin_ids(
-            host,
-            &format!("{NODE_UPSTREAM_VFS_ROOT}/deps"),
-            "internal/deps",
-            &mut ids,
-        )?;
-    }
-    ids.sort();
-    ids.dedup();
-    *host.builtin_ids.borrow_mut() = Some(ids.clone());
-    node_sync_live_node_compat_state_budget(host)?;
-    Ok(ids)
-}
-
 async fn node_builtin_ids_async(host: &NodeRuntimeHost) -> Result<Vec<String>, SandboxError> {
     if let Some(ids) = host.builtin_ids.borrow().clone() {
         return Ok(ids);
@@ -7244,39 +7236,6 @@ async fn node_builtin_ids_async(host: &NodeRuntimeHost) -> Result<Vec<String>, S
     *host.builtin_ids.borrow_mut() = Some(ids.clone());
     node_sync_live_node_compat_state_budget(host)?;
     Ok(ids)
-}
-
-fn node_collect_builtin_ids(
-    host: &NodeRuntimeHost,
-    directory: &str,
-    prefix: &str,
-    output: &mut Vec<String>,
-) -> Result<(), SandboxError> {
-    for entry in node_read_readdir(host, directory)? {
-        let child_path = format!("{directory}/{}", entry.name);
-        match entry.kind {
-            FileKind::Directory => {
-                let next_prefix = if prefix.is_empty() {
-                    entry.name.clone()
-                } else {
-                    format!("{prefix}/{}", entry.name)
-                };
-                node_collect_builtin_ids(host, &child_path, &next_prefix, output)?;
-            }
-            FileKind::File => {
-                if let Some(stem) = entry.name.strip_suffix(".js") {
-                    let id = if prefix.is_empty() {
-                        stem.to_string()
-                    } else {
-                        format!("{prefix}/{}", stem)
-                    };
-                    output.push(id);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 #[async_recursion(?Send)]
@@ -7313,27 +7272,6 @@ async fn node_collect_builtin_ids_async(
     Ok(())
 }
 
-fn node_read_builtin_source_text(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-) -> Result<String, SandboxError> {
-    let path =
-        node_upstream_builtin_vfs_path(specifier).ok_or_else(|| SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: format!(
-                "upstream Node builtin source `{specifier}` is missing from sandbox VFS"
-            ),
-        })?;
-    let bytes = node_read_file(host, &path)?.ok_or_else(|| SandboxError::Execution {
-        entrypoint: "<node-runtime>".to_string(),
-        message: format!("upstream Node builtin source `{specifier}` is missing from sandbox VFS"),
-    })?;
-    String::from_utf8(bytes).map_err(|error| SandboxError::Service {
-        service: "node_runtime",
-        message: format!("builtin `{specifier}` is not valid UTF-8: {error}"),
-    })
-}
-
 async fn node_read_builtin_source_text_async(
     host: &NodeRuntimeHost,
     specifier: &str,
@@ -7359,47 +7297,12 @@ async fn node_read_builtin_source_text_async(
     })
 }
 
-fn node_compile_builtin_wrapper(
-    context: &mut Context,
-    host: &NodeRuntimeHost,
+fn node_wrapped_builtin_source(
     specifier: &str,
+    source: &str,
     parameters: &[&str],
     suffix: Option<&str>,
-) -> Result<JsValue, SandboxError> {
-    node_check_execution_timeout(host)?;
-    let source = node_read_builtin_source_text(host, specifier)?;
-    let mut wrapped = format!("(function({}) {{\n{}", parameters.join(", "), source);
-    if !wrapped.ends_with('\n') {
-        wrapped.push('\n');
-    }
-    if let Some(suffix) = suffix {
-        wrapped.push_str(suffix);
-        if !suffix.ends_with('\n') {
-            wrapped.push('\n');
-        }
-    }
-    wrapped.push_str(&format!(
-        "//# sourceURL=node:{}\n}})",
-        specifier.replace('\\', "\\\\")
-    ));
-    context
-        .eval(
-            Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(
-                node_upstream_builtin_vfs_path(specifier).unwrap(),
-            )),
-        )
-        .map_err(sandbox_execution_error)
-}
-
-async fn node_compile_builtin_wrapper_async(
-    context: &mut Context,
-    host: Rc<NodeRuntimeHost>,
-    specifier: &str,
-    parameters: &[&str],
-    suffix: Option<&str>,
-) -> Result<JsValue, SandboxError> {
-    node_check_execution_timeout(&host)?;
-    let source = node_read_builtin_source_text_async(&host, specifier).await?;
+) -> Result<(String, String), SandboxError> {
     let mut wrapped = format!("(function({}) {{\n{}", parameters.join(", "), source);
     if !wrapped.ends_with('\n') {
         wrapped.push('\n');
@@ -7420,6 +7323,34 @@ async fn node_compile_builtin_wrapper_async(
             "upstream Node builtin source `{specifier}` is missing from sandbox VFS"
         ),
     })?;
+    Ok((wrapped, path))
+}
+
+fn node_compile_builtin_wrapper_from_source(
+    context: &mut Context,
+    specifier: &str,
+    source: &str,
+    parameters: &[&str],
+    suffix: Option<&str>,
+) -> Result<JsValue, SandboxError> {
+    let (wrapped, path) = node_wrapped_builtin_source(specifier, source, parameters, suffix)?;
+    context
+        .eval(
+            Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(path)),
+        )
+        .map_err(sandbox_execution_error)
+}
+
+async fn node_compile_builtin_wrapper_async(
+    context: &mut Context,
+    host: Rc<NodeRuntimeHost>,
+    specifier: &str,
+    parameters: &[&str],
+    suffix: Option<&str>,
+) -> Result<JsValue, SandboxError> {
+    node_check_execution_timeout(&host)?;
+    let source = node_read_builtin_source_text_async(&host, specifier).await?;
+    let (wrapped, path) = node_wrapped_builtin_source(specifier, &source, parameters, suffix)?;
     let script = Script::parse(
         Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(path)),
         None,
@@ -9257,7 +9188,7 @@ fn node_tty_wrap_is_tty(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    let fd = args
+    let _fd = args
         .first()
         .cloned()
         .unwrap_or_else(|| JsValue::from(-1))
@@ -10534,16 +10465,38 @@ fn node_process_wrap_constructor(context: &mut Context) -> Result<JsFunction, Sa
             context,
         )
         .map_err(sandbox_execution_error)?;
+    let spawn = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_suspend_fn_ptr(node_process_wrap_spawn_suspend),
+    )
+    .name(js_string!("spawn"))
+    .length(1)
+    .constructor(false)
+    .build();
+    prototype
+        .set(js_string!("spawn"), JsValue::from(spawn), true, context)
+        .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
         (
-            "spawn",
+            "kill",
             1usize,
-            node_process_wrap_spawn as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+            node_process_wrap_kill as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("kill", 1usize, node_process_wrap_kill),
-        ("close", 0usize, node_process_wrap_close),
-        ("ref", 0usize, node_process_wrap_ref),
-        ("unref", 0usize, node_process_wrap_unref),
+        (
+            "close",
+            0usize,
+            node_process_wrap_close as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "ref",
+            0usize,
+            node_process_wrap_ref as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "unref",
+            0usize,
+            node_process_wrap_unref as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
     ] {
         prototype
             .set(
@@ -10602,115 +10555,172 @@ fn node_process_wrap_construct(
     })
 }
 
-fn node_process_wrap_spawn(
+fn node_process_wrap_spawn_request(
+    options: &JsObject,
+    context: &mut Context,
+) -> Result<NodeChildProcessRequest, SandboxError> {
+    let file = options
+        .get(js_string!("file"), context)
+        .map_err(sandbox_execution_error)?
+        .to_string(context)
+        .map_err(sandbox_execution_error)?
+        .to_std_string_escaped();
+    let args_value = options
+        .get(js_string!("args"), context)
+        .map_err(sandbox_execution_error)?;
+    let mut argv = Vec::new();
+    if let Some(args_array) = args_value.as_object() {
+        let len = args_array
+            .get(js_string!("length"), context)
+            .map_err(sandbox_execution_error)?
+            .to_length(context)
+            .map_err(sandbox_execution_error)?;
+        for index in 0..len {
+            argv.push(
+                args_array
+                    .get(index, context)
+                    .map_err(sandbox_execution_error)?
+                    .to_string(context)
+                    .map_err(sandbox_execution_error)?
+                    .to_std_string_escaped(),
+            );
+        }
+    }
+    let cwd = options
+        .get(js_string!("cwd"), context)
+        .map_err(sandbox_execution_error)
+        .ok()
+        .filter(|value| !value.is_null() && !value.is_undefined())
+        .map(|value| {
+            value
+                .to_string(context)
+                .map_err(sandbox_execution_error)
+                .map(|value| value.to_std_string_escaped())
+        })
+        .transpose()?;
+    let mut env = BTreeMap::new();
+    if let Some(env_pairs) = options
+        .get(js_string!("envPairs"), context)
+        .map_err(sandbox_execution_error)?
+        .as_object()
+    {
+        let len = env_pairs
+            .get(js_string!("length"), context)
+            .map_err(sandbox_execution_error)?
+            .to_length(context)
+            .map_err(sandbox_execution_error)?;
+        for index in 0..len {
+            let pair = env_pairs
+                .get(index, context)
+                .map_err(sandbox_execution_error)?
+                .to_string(context)
+                .map_err(sandbox_execution_error)?
+                .to_std_string_escaped();
+            if let Some((key, value)) = pair.split_once('=') {
+                env.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    Ok(NodeChildProcessRequest {
+        command: file,
+        args: argv,
+        cwd,
+        env,
+        shell: false,
+        input: None,
+    })
+}
+
+fn node_process_wrap_spawn_suspend(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(this) = this.as_object() else {
-        return Ok(JsValue::from(NODE_UV_EBADF));
+        return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EBADF)));
     };
     let options = args
         .first()
         .and_then(JsValue::as_object)
         .ok_or_else(|| JsNativeError::typ().with_message("options must be an object"))?;
-    node_with_host_js(context, |host, context| {
-        let file = options
-            .get(js_string!("file"), context)
-            .map_err(sandbox_execution_error)?
-            .to_string(context)
-            .map_err(sandbox_execution_error)?
-            .to_std_string_escaped();
-        let args_value = options
-            .get(js_string!("args"), context)
-            .map_err(sandbox_execution_error)?;
-        let mut argv = Vec::new();
-        if let Some(args_array) = args_value.as_object() {
-            let len = args_array
-                .get(js_string!("length"), context)
-                .map_err(sandbox_execution_error)?
-                .to_length(context)
-                .map_err(sandbox_execution_error)?;
-            for index in 0..len {
-                argv.push(
-                    args_array
-                        .get(index, context)
-                        .map_err(sandbox_execution_error)?
-                        .to_string(context)
-                        .map_err(sandbox_execution_error)?
-                        .to_std_string_escaped(),
-                );
-            }
+    let request = node_process_wrap_spawn_request(&options, context).map_err(js_error)?;
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(
+        &host,
+        "child_process",
+        format!(
+            "run command={} shell={} cwd={}",
+            request.command,
+            request.shell,
+            request.cwd.as_deref().unwrap_or("<inherit>")
+        ),
+    )
+    .map_err(js_error)?;
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::ChildProcessRun {
+            request: serde_json::to_value(request)
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)?,
+        },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_process_wrap_spawn_resume,
+        NodeProcessWrapSpawnResume {
+            request_id,
+            handle: this.clone(),
+        },
+    ))
+}
+
+fn node_process_wrap_spawn_resume(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeProcessWrapSpawnResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let host = active_node_host().map_err(js_error)?;
+    let result = take_child_process_result_for_resume(capture.request_id).map_err(js_error)?;
+    let pid = result.pid.unwrap_or(0);
+    let exit_status = result.status.unwrap_or(0);
+    let term_signal = result.signal.clone();
+    let errno = if let Some(error) = result.error.as_ref() {
+        match error.code.as_str().unwrap_or_default() {
+            "ENOENT" => -2,
+            "EACCES" => -13,
+            _ => NODE_UV_EINVAL,
         }
-        let cwd = options
-            .get(js_string!("cwd"), context)
-            .map_err(sandbox_execution_error)
-            .ok()
-            .filter(|value| !value.is_null() && !value.is_undefined())
-            .map(|value| {
-                value
-                    .to_string(context)
-                    .map_err(sandbox_execution_error)
-                    .map(|value| value.to_std_string_escaped())
-            })
-            .transpose()?;
-        let mut env = BTreeMap::new();
-        if let Some(env_pairs) = options
-            .get(js_string!("envPairs"), context)
-            .map_err(sandbox_execution_error)?
-            .as_object()
-        {
-            let len = env_pairs
-                .get(js_string!("length"), context)
-                .map_err(sandbox_execution_error)?
-                .to_length(context)
-                .map_err(sandbox_execution_error)?;
-            for index in 0..len {
-                let pair = env_pairs
-                    .get(index, context)
-                    .map_err(sandbox_execution_error)?
-                    .to_string(context)
-                    .map_err(sandbox_execution_error)?
-                    .to_std_string_escaped();
-                if let Some((key, value)) = pair.split_once('=') {
-                    env.insert(key.to_string(), value.to_string());
-                }
-            }
-        }
-        let request = NodeChildProcessRequest {
-            command: file.clone(),
-            args: argv,
-            cwd,
-            env,
-            shell: false,
-            input: None,
-        };
-        let result = execute_child_process_request(host, request, context)?;
-        let pid = result.pid.unwrap_or(0);
-        let exit_status = result.status.unwrap_or(0);
-        let term_signal = result.signal.clone();
-        let errno = if let Some(error) = result.error.as_ref() {
-            match error.code.as_str().unwrap_or_default() {
-                "ENOENT" => -2,
-                "EACCES" => -13,
-                _ => NODE_UV_EINVAL,
-            }
-        } else {
-            0
-        };
-        node_process_handle_state_mut(host, &this, context, |state| {
-            state.pid = result.pid;
-            state.exit_status = result.status;
-            state.term_signal = result.signal.clone();
-            state.result = Some(result.clone());
-        })?;
-        this.set(js_string!("pid"), JsValue::from(pid), true, context)
-            .map_err(sandbox_execution_error)?;
-        if errno == 0 {
-            node_process_schedule_onexit(this.clone(), exit_status, term_signal, context);
-        }
-        Ok(JsValue::from(errno))
+    } else {
+        0
+    };
+    node_process_handle_state_mut(&host, &capture.handle, context, |state| {
+        state.pid = result.pid;
+        state.exit_status = result.status;
+        state.term_signal = result.signal.clone();
+        state.result = Some(result.clone());
+        Ok::<(), SandboxError>(())
     })
+    .map_err(js_error)?;
+    capture
+        .handle
+        .set(js_string!("pid"), JsValue::from(pid), true, context)?;
+    let onexit = capture
+        .handle
+        .get(js_string!("onexit"), context)?;
+    if let Some(onexit) = onexit.as_callable() {
+        let _ = onexit.call(
+            &JsValue::from(capture.handle.clone()),
+            &[
+                JsValue::from(errno),
+                JsValue::from(exit_status),
+                term_signal
+                    .map(|signal| JsValue::from(JsString::from(signal)))
+                    .unwrap_or_else(JsValue::null),
+            ],
+            context,
+        );
+    }
+    Ok(JsValue::from(errno))
 }
 
 fn node_process_wrap_kill(
@@ -10799,7 +10809,7 @@ fn node_internal_binding_process_wrap(context: &mut Context) -> Result<JsObject,
 fn node_internal_binding_spawn_sync(context: &mut Context) -> Result<JsObject, SandboxError> {
     let spawn = FunctionObjectBuilder::new(
         context.realm(),
-        NativeFunction::from_fn_ptr(node_spawn_sync_spawn),
+        NativeFunction::from_suspend_fn_ptr(node_spawn_sync_spawn_suspend),
     )
     .name(js_string!("spawn"))
     .length(1)
@@ -10849,7 +10859,7 @@ fn node_internal_binding_fs(context: &mut Context) -> Result<JsObject, SandboxEr
         (
             "internalModuleStat",
             node_internal_fs_internal_module_stat
-                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
         ),
         ("stat", node_internal_fs_stat),
         ("lstat", node_internal_fs_lstat),
@@ -10857,7 +10867,10 @@ fn node_internal_binding_fs(context: &mut Context) -> Result<JsObject, SandboxEr
         ("realpath", node_internal_fs_realpath),
     ] {
         let value =
-            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_suspend_fn_ptr(function),
+            )
                 .name(JsString::from(name))
                 .length(4)
                 .constructor(false)
@@ -10870,21 +10883,20 @@ fn node_internal_binding_fs(context: &mut Context) -> Result<JsObject, SandboxEr
         (
             "open",
             4usize,
-            node_internal_fs_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+            node_internal_fs_open
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
         ),
         ("close", 2usize, node_internal_fs_close),
         ("read", 6usize, node_internal_fs_read),
         ("readFileUtf8", 2usize, node_internal_fs_read_file_utf8),
         ("writeBuffer", 7usize, node_internal_fs_write_buffer),
         ("writeString", 6usize, node_internal_fs_write_string),
-        (
-            "getFormatOfExtensionlessFile",
-            1usize,
-            node_internal_fs_get_format_of_extensionless_file,
-        ),
     ] {
         let value =
-            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_suspend_fn_ptr(function),
+            )
                 .name(JsString::from(name))
                 .length(length)
                 .constructor(false)
@@ -10893,6 +10905,22 @@ fn node_internal_binding_fs(context: &mut Context) -> Result<JsObject, SandboxEr
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    let get_format = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_fn_ptr(node_internal_fs_get_format_of_extensionless_file),
+    )
+    .name(js_string!("getFormatOfExtensionlessFile"))
+    .length(1)
+    .constructor(false)
+    .build();
+    object
+        .set(
+            js_string!("getFormatOfExtensionlessFile"),
+            JsValue::from(get_format),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -10900,7 +10928,7 @@ fn node_internal_binding_fs_dir(context: &mut Context) -> Result<JsObject, Sandb
     let object = ObjectInitializer::new(context).build();
     let opendir = FunctionObjectBuilder::new(
         context.realm(),
-        NativeFunction::from_fn_ptr(node_fs_dir_opendir),
+        NativeFunction::from_suspend_fn_ptr(node_fs_dir_opendir_suspend),
     )
     .name(js_string!("opendir"))
     .length(3)
@@ -11004,19 +11032,42 @@ fn node_fs_dir_make_handle(
     Ok(handle)
 }
 
-fn node_fs_dir_opendir(
+fn node_resume_fs_dir_opendir(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeFsDirOpendirResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let entries = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::DirEntries(entries) => entries,
+        other => return Err(node_unexpected_host_operation_result("dir entries", &other)),
+    };
+    let host = active_node_host().map_err(js_error)?;
+    let handle = node_fs_dir_make_handle(&host, context, &capture.path, &entries).map_err(js_error)?;
+    node_fs_req_complete(capture.req.as_ref(), context, JsValue::from(handle)).map_err(js_error)
+}
+
+fn node_fs_dir_opendir_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
     let req = args.get(2).cloned();
-    node_with_host_js(context, |host, context| {
-        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        let entries = node_read_readdir(host, &resolved)?;
-        let handle = node_fs_dir_make_handle(host, context, &resolved, &entries)?;
-        node_fs_req_complete(req.as_ref(), context, JsValue::from(handle))
-    })
+    let host = active_node_host().map_err(js_error)?;
+    let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::FsReaddir { path: resolved.clone() },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_fs_dir_opendir,
+        NodeFsDirOpendirResume {
+            request_id,
+            req,
+            path: resolved,
+        },
+    ))
 }
 
 fn node_fs_dir_handle_read(
@@ -11184,102 +11235,275 @@ fn node_fs_req_complete(
     }
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct NodeInternalFsReqResume {
+    request_id: u64,
+    req: Option<JsValue>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeInternalFsReadResume {
+    request_id: u64,
+    req: Option<JsValue>,
+    buffer: JsObject,
+    offset: usize,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeInternalFsWriteResume {
+    request_id: u64,
+    req: Option<JsValue>,
+    ctx: Option<JsObject>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeFsDirOpendirResume {
+    request_id: u64,
+    req: Option<JsValue>,
+    path: String,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeBuiltinCompileResume {
+    request_id: u64,
+    specifier: String,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeProcessLoadEnvFileResume {
+    request_id: u64,
+    display_path: String,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeProcessChdirResume {
+    request_id: u64,
+    next_path: String,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeReportWriteResume {
+    request_id: u64,
+    resolved_path: String,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeImportMetaResolveResume {
+    request_id: u64,
+    module_path: String,
+    request: String,
+}
+
+fn node_internal_fs_complete_req(
+    req: Option<&JsValue>,
+    context: &mut Context,
+    result: JsValue,
+) -> JsResult<JsValue> {
+    node_fs_req_complete(req, context, result).map_err(js_error)
+}
+
+fn node_internal_fs_queue_req_operation(
+    operation: NodePendingHostOperation,
+    req: Option<JsValue>,
+    resume: fn(Result<(), boa_engine::JsError>, &NodeInternalFsReqResume, &mut Context) -> JsResult<JsValue>,
+) -> JsResult<NativeFunctionResult> {
+    let host = active_node_host().map_err(js_error)?;
+    let request_id = node_queue_host_operation(&host, operation).map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        resume,
+        NodeInternalFsReqResume { request_id, req },
+    ))
+}
+
+fn node_resume_internal_fs_internal_module_stat(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    let code = match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Stats(Some(stats)) => match stats.kind {
+            FileKind::File | FileKind::Symlink => 0,
+            FileKind::Directory => 1,
+        },
+        NodeCompletedHostOperation::Stats(None) => -1,
+        other => return Err(node_unexpected_host_operation_result("stats", &other)),
+    };
+    Ok(JsValue::from(code))
+}
+
+fn node_resume_internal_fs_stat_like(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeInternalFsReqResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Stats(Some(stats)) => {
+            let stat_values = node_fs_binding_stat_values(context).map_err(js_error)?;
+            node_fill_fs_stat_values(context, &stat_values, &stats).map_err(js_error)?;
+            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(stat_values))
+        }
+        NodeCompletedHostOperation::Stats(None) => {
+            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::undefined())
+        }
+        other => Err(node_unexpected_host_operation_result("stats", &other)),
+    }
+}
+
+fn node_resume_internal_fs_string_req(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeInternalFsReqResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::String(value) => node_internal_fs_complete_req(
+            capture.req.as_ref(),
+            context,
+            JsValue::from(JsString::from(value)),
+        ),
+        other => Err(node_unexpected_host_operation_result("string", &other)),
+    }
+}
+
+fn node_resume_internal_fs_i32_req(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeInternalFsReqResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::I32(value) => {
+            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(value))
+        }
+        other => Err(node_unexpected_host_operation_result("i32", &other)),
+    }
+}
+
+fn node_resume_internal_fs_undefined_req(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeInternalFsReqResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Undefined => {
+            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::undefined())
+        }
+        other => Err(node_unexpected_host_operation_result("undefined", &other)),
+    }
+}
+
+fn node_resume_internal_fs_read(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeInternalFsReadResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let bytes = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Bytes(bytes) => bytes,
+        other => return Err(node_unexpected_host_operation_result("bytes", &other)),
+    };
+    let dest = JsUint8Array::from_object(capture.buffer.clone()).map_err(|_| {
+        JsNativeError::typ().with_message("read buffer must be a Uint8Array-compatible object")
+    })?;
+    let mut written = 0usize;
+    for (index, byte) in bytes.into_iter().enumerate() {
+        dest.set((capture.offset + index) as u32, byte, true, context)?;
+        written = written.saturating_add(1);
+    }
+    node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written as u32))
+}
+
+fn node_resume_internal_fs_write(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeInternalFsWriteResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let written = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::U32(value) => value,
+        other => return Err(node_unexpected_host_operation_result("u32", &other)),
+    };
+    if let Some(ctx_object) = capture.ctx.as_ref() {
+        ctx_object
+            .set(js_string!("errno"), JsValue::undefined(), true, context)
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+    }
+    node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written))
+}
+
 fn node_internal_fs_internal_module_stat(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let stats = node_read_stat(host, &path)?;
-        let code = match stats.map(|value| value.kind) {
-            Some(FileKind::File) | Some(FileKind::Symlink) => 0,
-            Some(FileKind::Directory) => 1,
-            None => -1,
-        };
-        Ok(JsValue::from(code))
-    })
-    .map_err(js_error)
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsStat { path },
+        node_resume_internal_fs_internal_module_stat,
+    )
 }
 
-fn node_internal_fs_stat_like(
-    context: &mut Context,
+fn node_internal_fs_stat_suspend_impl(
     args: &[JsValue],
+    context: &mut Context,
     lstat: bool,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    let req = args.get(2);
-    node_with_host_js(context, |host, context| {
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let stats = if lstat {
-            node_read_lstat(host, &path)?
-        } else {
-            node_read_stat(host, &path)?
-        };
-        let Some(stats) = stats else {
-            return node_fs_req_complete(req, context, JsValue::undefined());
-        };
-        let stat_values = node_fs_binding_stat_values(context)?;
-        node_fill_fs_stat_values(context, &stat_values, &stats)?;
-        node_fs_req_complete(req, context, JsValue::from(stat_values))
-    })
+    let req = args.get(2).cloned();
+    let operation = if lstat {
+        NodePendingHostOperation::FsLstat { path }
+    } else {
+        NodePendingHostOperation::FsStat { path }
+    };
+    node_internal_fs_queue_req_operation(operation, req, node_resume_internal_fs_stat_like)
 }
 
 fn node_internal_fs_stat(
-    this: &JsValue,
+    _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
-    let _ = this;
-    node_internal_fs_stat_like(context, args, false)
+) -> JsResult<NativeFunctionResult> {
+    node_internal_fs_stat_suspend_impl(args, context, false)
 }
 
 fn node_internal_fs_lstat(
-    this: &JsValue,
+    _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
-    let _ = this;
-    node_internal_fs_stat_like(context, args, true)
+) -> JsResult<NativeFunctionResult> {
+    node_internal_fs_stat_suspend_impl(args, context, true)
 }
 
 fn node_internal_fs_readlink(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    let req = args.get(2);
-    node_with_host(|host| {
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let target = node_read_readlink(host, &path)?;
-        Ok(JsValue::from(JsString::from(target)))
-    })
-    .and_then(|result| node_fs_req_complete(req, context, result))
-    .map_err(js_error)
+    let req = args.get(2).cloned();
+    node_internal_fs_queue_req_operation(
+        NodePendingHostOperation::FsReadlink { path },
+        req,
+        node_resume_internal_fs_string_req,
+    )
 }
 
 fn node_internal_fs_realpath(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    let req = args.get(2);
-    node_with_host(|host| {
-        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        Ok(JsValue::from(JsString::from(resolved)))
-    })
-    .and_then(|result| node_fs_req_complete(req, context, result))
-    .map_err(js_error)
+    let req = args.get(2).cloned();
+    node_internal_fs_queue_req_operation(
+        NodePendingHostOperation::FsRealpath { path },
+        req,
+        node_resume_internal_fs_string_req,
+    )
 }
 
 fn node_internal_fs_open(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
     let flags = args
         .get(1)
@@ -11287,37 +11511,38 @@ fn node_internal_fs_open(
         .unwrap_or_else(JsValue::undefined)
         .to_i32(context)
         .map(node_fs_open_flags_from_numeric)?;
-    let req = args.get(3);
-    node_with_host(|host| node_fs_open_impl(host, &path, flags).map(JsValue::from))
-        .and_then(|result| node_fs_req_complete(req, context, result))
-        .map_err(js_error)
+    let req = args.get(3).cloned();
+    node_internal_fs_queue_req_operation(
+        NodePendingHostOperation::FsOpen { path, flags },
+        req,
+        node_resume_internal_fs_i32_req,
+    )
 }
 
 fn node_internal_fs_close(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let fd = node_arg_i32(args, 0, context)?;
-    let req = args.get(1);
-    node_with_host(|host| node_fs_close_impl(host, fd).map(|_| JsValue::undefined()))
-        .and_then(|result| node_fs_req_complete(req, context, result))
-        .map_err(js_error)
+    let req = args.get(1).cloned();
+    node_internal_fs_queue_req_operation(
+        NodePendingHostOperation::FsClose { fd },
+        req,
+        node_resume_internal_fs_undefined_req,
+    )
 }
 
 fn node_internal_fs_read(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let fd = node_arg_i32(args, 0, context)?;
     let buffer = args
         .get(1)
         .and_then(JsValue::as_object)
         .ok_or_else(|| JsNativeError::typ().with_message("read buffer must be an object"))?;
-    let dest = JsUint8Array::from_object(buffer.clone()).map_err(|_| {
-        JsNativeError::typ().with_message("read buffer must be a Uint8Array-compatible object")
-    })?;
     let offset = args
         .get(2)
         .cloned()
@@ -11341,24 +11566,33 @@ fn node_internal_fs_read(
                 .to_length(context)? as usize,
         )
     };
-    let req = args.get(5);
-    node_with_host_js(context, |host, context| {
-        let bytes = node_fs_read_impl(host, fd, length, position)?;
-        let mut written = 0usize;
-        for (index, byte) in bytes.into_iter().enumerate() {
-            dest.set((offset + index) as u32, byte, true, context)
-                .map_err(sandbox_execution_error)?;
-            written = written.saturating_add(1);
-        }
-        node_fs_req_complete(req, context, JsValue::from(written as u32))
-    })
+    let req = args.get(5).cloned();
+    let host = active_node_host().map_err(js_error)?;
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::FsReadFd {
+            fd,
+            length,
+            position,
+        },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_internal_fs_read,
+        NodeInternalFsReadResume {
+            request_id,
+            req,
+            buffer: buffer.clone(),
+            offset,
+        },
+    ))
 }
 
 fn node_internal_fs_write_buffer(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let fd = node_arg_i32(args, 0, context)?;
     let buffer = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
     let bytes = node_bytes_from_js(&buffer, context)?;
@@ -11385,39 +11619,43 @@ fn node_internal_fs_write_buffer(
                 .to_length(context)? as usize,
         )
     };
-    let req = args.get(5);
-    let ctx = args.get(6);
+    let req = args.get(5).cloned();
+    let ctx = args.get(6).and_then(JsValue::as_object);
     let end = offset.saturating_add(length).min(bytes.len());
-    let slice = if offset >= bytes.len() {
+    let data = if offset >= bytes.len() {
         Vec::new()
     } else {
         bytes[offset..end].to_vec()
     };
-    let result = node_with_host(|host| {
-        node_fs_write_impl(host, fd, &slice, position).map(|written| JsValue::from(written as u32))
-    })
+    let host = active_node_host().map_err(js_error)?;
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::FsWriteFd { fd, data, position },
+    )
     .map_err(js_error)?;
-    if let Some(ctx_object) = ctx.and_then(JsValue::as_object) {
-        ctx_object
-            .set(js_string!("errno"), JsValue::undefined(), true, context)
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-    }
-    node_fs_req_complete(req, context, result).map_err(js_error)
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_internal_fs_write,
+        NodeInternalFsWriteResume {
+            request_id,
+            req,
+            ctx,
+        },
+    ))
 }
 
 fn node_internal_fs_write_string(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let fd = node_arg_i32(args, 0, context)?;
     let data = args
         .get(1)
         .cloned()
         .unwrap_or_else(JsValue::undefined)
         .to_string(context)?
-        .to_std_string_escaped();
+        .to_std_string_escaped()
+        .into_bytes();
     let position = if args
         .get(2)
         .is_some_and(|value| value.is_null() || value.is_undefined())
@@ -11431,20 +11669,22 @@ fn node_internal_fs_write_string(
                 .to_length(context)? as usize,
         )
     };
-    let req = args.get(4);
-    let ctx = args.get(5);
-    let result = node_with_host(|host| {
-        node_fs_write_impl(host, fd, data.as_bytes(), position)
-            .map(|written| JsValue::from(written as u32))
-    })
+    let req = args.get(4).cloned();
+    let ctx = args.get(5).and_then(JsValue::as_object);
+    let host = active_node_host().map_err(js_error)?;
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::FsWriteFd { fd, data, position },
+    )
     .map_err(js_error)?;
-    if let Some(ctx_object) = ctx.and_then(JsValue::as_object) {
-        ctx_object
-            .set(js_string!("errno"), JsValue::undefined(), true, context)
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-    }
-    node_fs_req_complete(req, context, result).map_err(js_error)
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_internal_fs_write,
+        NodeInternalFsWriteResume {
+            request_id,
+            req,
+            ctx,
+        },
+    ))
 }
 
 fn node_internal_fs_get_format_of_extensionless_file(
@@ -11459,7 +11699,7 @@ fn node_internal_fs_read_file_utf8(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
     let _flags = args
         .get(1)
@@ -11467,32 +11707,26 @@ fn node_internal_fs_read_file_utf8(
         .unwrap_or_else(JsValue::undefined)
         .to_i32(context)
         .unwrap_or_default();
-    node_with_host(|host| {
-        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        let bytes =
-            node_read_file(host, &resolved)?.ok_or_else(|| SandboxError::ModuleNotFound {
-                specifier: resolved.clone(),
-            })?;
-        let text = String::from_utf8(bytes).map_err(|error| SandboxError::Execution {
-            entrypoint: resolved,
-            message: error.to_string(),
-        })?;
-        Ok(JsValue::from(JsString::from(text)))
-    })
-    .map_err(js_error)
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsReadTextFile { path },
+        node_resume_string_host_operation,
+    )
 }
 
 fn node_internal_binding_builtins(
     host: &NodeRuntimeHost,
     context: &mut Context,
 ) -> Result<JsObject, SandboxError> {
-    let ids = node_builtin_ids(host)?;
+    let ids = host.builtin_ids.borrow().clone().ok_or_else(|| SandboxError::Service {
+        service: "node_runtime",
+        message: "builtin ids were not prepared before bootstrap".to_string(),
+    })?;
     let ids =
         JsValue::from_json(&serde_json::json!(ids), context).map_err(sandbox_execution_error)?;
     let object = ObjectInitializer::new(context).build();
     let compile = FunctionObjectBuilder::new(
         context.realm(),
-        NativeFunction::from_fn_ptr(node_builtins_compile_function),
+        NativeFunction::from_suspend_fn_ptr(node_builtins_compile_function_suspend),
     )
     .name(js_string!("compileFunction"))
     .length(1)
@@ -11546,11 +11780,6 @@ fn node_internal_binding_blob(context: &mut Context) -> Result<JsObject, Sandbox
             2usize,
             node_blob_create_blob as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        (
-            "createBlobFromFilePath",
-            1usize,
-            node_blob_create_blob_from_file_path,
-        ),
         ("concat", 1usize, node_blob_concat),
         ("getDataObject", 1usize, node_blob_get_data_object),
         ("storeDataObject", 4usize, node_blob_store_data_object),
@@ -11566,6 +11795,22 @@ fn node_internal_binding_blob(context: &mut Context) -> Result<JsObject, Sandbox
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    let create_blob_from_file_path = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_suspend_fn_ptr(node_blob_create_blob_from_file_path_suspend),
+    )
+    .name(js_string!("createBlobFromFilePath"))
+    .length(1)
+    .constructor(false)
+    .build();
+    object
+        .set(
+            js_string!("createBlobFromFilePath"),
+            JsValue::from(create_blob_from_file_path),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -11797,23 +12042,6 @@ fn node_internal_binding_modules(context: &mut Context) -> Result<JsObject, Sand
             node_modules_get_compile_cache_dir,
         ),
         (
-            "getNearestParentPackageJSONType",
-            1usize,
-            node_modules_get_nearest_parent_package_json_type,
-        ),
-        (
-            "getNearestParentPackageJSON",
-            1usize,
-            node_modules_get_nearest_parent_package_json,
-        ),
-        (
-            "getPackageScopeConfig",
-            1usize,
-            node_modules_get_package_scope_config,
-        ),
-        ("getPackageType", 1usize, node_modules_get_package_type),
-        ("readPackageJSON", 4usize, node_modules_read_package_json),
-        (
             "flushCompileCache",
             0usize,
             node_modules_flush_compile_cache,
@@ -11835,6 +12063,38 @@ fn node_internal_binding_modules(context: &mut Context) -> Result<JsObject, Sand
                 .length(length)
                 .constructor(false)
                 .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    for (name, length, function) in [
+        (
+            "getNearestParentPackageJSONType",
+            1usize,
+            node_modules_get_nearest_parent_package_json_type_suspend
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
+        ),
+        (
+            "getNearestParentPackageJSON",
+            1usize,
+            node_modules_get_nearest_parent_package_json_suspend,
+        ),
+        (
+            "getPackageScopeConfig",
+            1usize,
+            node_modules_get_package_scope_config_suspend,
+        ),
+        ("getPackageType", 1usize, node_modules_get_package_type_suspend),
+        ("readPackageJSON", 4usize, node_modules_read_package_json_suspend),
+    ] {
+        let value = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_suspend_fn_ptr(function),
+        )
+        .name(JsString::from(name))
+        .length(length)
+        .constructor(false)
+        .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -12865,8 +13125,6 @@ fn node_internal_binding_process_methods(
         ("memoryUsage", 1usize, node_process_methods_memory_usage),
         ("rss", 0usize, node_process_methods_rss),
         ("resourceUsage", 1usize, node_process_methods_resource_usage),
-        ("loadEnvFile", 1usize, node_process_methods_load_env_file),
-        ("execve", 3usize, node_process_methods_execve),
         (
             "constrainedMemory",
             0usize,
@@ -12879,7 +13137,6 @@ fn node_internal_binding_process_methods(
         ),
         ("abort", 0usize, node_process_methods_abort),
         ("cwd", 0usize, node_process_methods_cwd),
-        ("chdir", 1usize, node_process_methods_chdir),
         ("umask", 1usize, node_process_methods_umask),
         (
             "setEmitWarningSync",
@@ -12898,6 +13155,31 @@ fn node_internal_binding_process_methods(
                 .length(length)
                 .constructor(false)
                 .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    for (name, length, function) in [
+        (
+            "loadEnvFile",
+            1usize,
+            node_process_methods_load_env_file_suspend
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
+        ),
+        (
+            "chdir",
+            1usize,
+            node_process_methods_chdir_suspend,
+        ),
+    ] {
+        let value = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_suspend_fn_ptr(function),
+        )
+        .name(JsString::from(name))
+        .length(length)
+        .constructor(false)
+        .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -13158,6 +13440,23 @@ fn node_internal_binding_locks(context: &mut Context) -> Result<JsObject, Sandbo
             )
             .map_err(sandbox_execution_error)?;
     }
+    object
+        .set(
+            js_string!("execve"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_process_methods_execve_suspend),
+                )
+                .name(js_string!("execve"))
+                .length(3)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -13217,7 +13516,7 @@ fn node_locks_release_request(
 }
 
 fn node_locks_attach_release_handlers(
-    host: &NodeRuntimeHost,
+    _host: &NodeRuntimeHost,
     request_id: u64,
     result: JsValue,
     resolve: JsObject,
@@ -15044,13 +15343,23 @@ fn node_internal_binding_sea(context: &mut Context) -> Result<JsObject, SandboxE
 
 fn node_internal_binding_report(context: &mut Context) -> Result<JsObject, SandboxError> {
     let object = ObjectInitializer::new(context).build();
+    let write_report = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_suspend_fn_ptr(node_report_write_report_suspend),
+    )
+    .name(js_string!("writeReport"))
+    .length(4)
+    .constructor(false)
+    .build();
+    object
+        .set(js_string!("writeReport"), JsValue::from(write_report), true, context)
+        .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
         (
-            "writeReport",
-            4usize,
-            node_report_write_report as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+            "getReport",
+            1usize,
+            node_report_get_report as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("getReport", 1usize, node_report_get_report),
         ("getDirectory", 0usize, node_report_get_directory),
         ("setDirectory", 1usize, node_report_set_directory),
         ("getFilename", 0usize, node_report_get_filename),
@@ -15945,11 +16254,24 @@ fn node_sea_get_asset_keys(
     })
 }
 
-fn node_report_write_report(
+fn node_resume_report_write_report(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeReportWriteResume,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Undefined => {
+            Ok(JsValue::from(JsString::from(capture.resolved_path.clone())))
+        }
+        other => Err(node_unexpected_host_operation_result("undefined", &other)),
+    }
+}
+
+fn node_report_write_report_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let event = node_arg_string(args, 0, context)?;
     let trigger = node_arg_string(args, 1, context)?;
     let file = if args
@@ -15973,7 +16295,7 @@ fn node_report_write_report(
                 process.stdout.push('\n');
             }
             node_sync_live_process_state_budget(host)?;
-            return Ok((report, path));
+            return Ok((report, path, false));
         }
         if path == "stderr" {
             {
@@ -15982,23 +16304,33 @@ fn node_report_write_report(
                 process.stderr.push('\n');
             }
             node_sync_live_process_state_budget(host)?;
-            return Ok((report, path));
+            return Ok((report, path, false));
         }
         let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        futures::executor::block_on(host.session.filesystem().write_file(
-            &resolved,
-            report.as_bytes().to_vec(),
-            CreateOptions {
-                create_parents: true,
-                overwrite: true,
-                ..Default::default()
-            },
-        ))?;
-        node_graph_invalidate(host);
-        Ok((report, resolved))
+        Ok((report, resolved, true))
     })
     .map_err(js_error)?;
-    Ok(JsValue::from(JsString::from(report_json.1)))
+    if !report_json.2 {
+        return Ok(NativeFunctionResult::complete(JsValue::from(JsString::from(
+            report_json.1,
+        ))));
+    }
+    let host = active_node_host().map_err(js_error)?;
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::FsWriteTextFile {
+            path: report_json.1.clone(),
+            data: report_json.0,
+        },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_report_write_report,
+        NodeReportWriteResume {
+            request_id,
+            resolved_path: report_json.1,
+        },
+    ))
 }
 
 fn node_report_get_report(
@@ -17384,11 +17716,11 @@ fn node_process_methods_resource_usage(
     .map_err(js_error)
 }
 
-fn node_process_methods_execve(
+fn node_process_methods_execve_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let command = node_arg_string(args, 0, context)?;
     let argv = args
         .get(1)
@@ -17416,25 +17748,51 @@ fn node_process_methods_execve(
                 .map(|(key, value)| (key.to_string(), value.to_string()))
         })
         .collect::<BTreeMap<_, _>>();
-    node_with_host(|host| {
-        let cwd = host.process.borrow().cwd.clone();
-        let result =
-            execute_direct_child_process(host, command.clone(), argv.clone(), cwd, env, None)?;
-        if let Some(error) = result.error {
-            return Err(SandboxError::Execution {
-                entrypoint: "<node-runtime>".to_string(),
-                message: error.message,
-            });
-        }
-        let mut process = host.process.borrow_mut();
-        process.stdout.push_str(&result.stdout);
-        process.stderr.push_str(&result.stderr);
-        process.exit_code = result.status.unwrap_or_default();
-        drop(process);
-        node_sync_live_process_state_budget(host)?;
-        Err(SandboxError::ExecveReplaced)
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    let cwd = host.process.borrow().cwd.clone();
+    let request = NodeChildProcessRequest {
+        command,
+        args: argv,
+        cwd: Some(cwd),
+        env,
+        shell: false,
+        input: None,
+    };
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::ChildProcessRun {
+            request: serde_json::to_value(request)
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)?,
+        },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_process_methods_execve_resume,
+        request_id,
+    ))
+}
+
+fn node_process_methods_execve_resume(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    let host = active_node_host().map_err(js_error)?;
+    let result = take_child_process_result_for_resume(*request_id).map_err(js_error)?;
+    if let Some(error) = result.error {
+        return Err(js_error(SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: error.message,
+        }));
+    }
+    let mut process = host.process.borrow_mut();
+    process.stdout.push_str(&result.stdout);
+    process.stderr.push_str(&result.stderr);
+    process.exit_code = result.status.unwrap_or_default();
+    drop(process);
+    node_sync_live_process_state_budget(&host).map_err(js_error)?;
+    Err(js_error(SandboxError::ExecveReplaced))
 }
 
 fn node_process_methods_constrained_memory(
@@ -17475,11 +17833,46 @@ fn node_process_methods_available_memory(
     .map_err(js_error)
 }
 
-fn node_process_methods_load_env_file(
+fn node_resume_process_methods_load_env_file(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeProcessLoadEnvFileResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let text = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::String(text) => text,
+        NodeCompletedHostOperation::Undefined => {
+            return Err(js_error(SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: format!(
+                    "ENOENT: no such file or directory, open '{}'",
+                    capture.display_path
+                ),
+            }));
+        }
+        other => return Err(node_unexpected_host_operation_result("string|undefined", &other)),
+    };
+    let parsed = node_parse_dotenv(&text).map_err(|_| {
+        js_error(SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!(
+                "Contents of '{}' should be a valid string.",
+                capture.display_path
+            ),
+        })
+    })?;
+    node_with_host_js(context, |host, context| {
+        for (key, value) in &parsed {
+            node_set_process_env_value(key, value, host, context)?;
+        }
+        Ok(JsValue::undefined())
+    })
+}
+
+fn node_process_methods_load_env_file_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = if args
         .first()
         .is_some_and(|value| !value.is_null() && !value.is_undefined())
@@ -17488,29 +17881,24 @@ fn node_process_methods_load_env_file(
     } else {
         None
     };
-    node_with_host_js(context, |host, context| {
-        let display_path = path.clone().unwrap_or_else(|| ".env".to_string());
-        let resolved = path
-            .as_deref()
-            .map(|path| resolve_node_path(&host.process.borrow().cwd, path))
-            .unwrap_or_else(|| resolve_node_path(&host.process.borrow().cwd, ".env"));
-        let Some(bytes) = node_read_file(host, &resolved)? else {
-            return Err(SandboxError::Execution {
-                entrypoint: "<node-runtime>".to_string(),
-                message: format!("ENOENT: no such file or directory, open '{display_path}'"),
-            });
-        };
-        let parsed = node_parse_dotenv(&String::from_utf8_lossy(&bytes)).map_err(|_| {
-            SandboxError::Execution {
-                entrypoint: "<node-runtime>".to_string(),
-                message: format!("Contents of '{display_path}' should be a valid string."),
-            }
-        })?;
-        for (key, value) in parsed {
-            node_set_process_env_value(&key, &value, host, context)?;
-        }
-        Ok(JsValue::undefined())
-    })
+    let display_path = path.clone().unwrap_or_else(|| ".env".to_string());
+    let host = active_node_host().map_err(js_error)?;
+    let resolved = path
+        .as_deref()
+        .map(|path| resolve_node_path(&host.process.borrow().cwd, path))
+        .unwrap_or_else(|| resolve_node_path(&host.process.borrow().cwd, ".env"));
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::FsReadTextFile { path: resolved },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_process_methods_load_env_file,
+        NodeProcessLoadEnvFileResume {
+            request_id,
+            display_path,
+        },
+    ))
 }
 
 fn node_process_methods_abort(
@@ -17539,33 +17927,52 @@ fn node_process_methods_cwd(
     .map_err(js_error)
 }
 
-fn node_process_methods_chdir(
+fn node_resume_process_methods_chdir(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeProcessChdirResume,
+    _context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Stats(Some(stats)) => {
+            if !matches!(stats.kind, FileKind::Directory) {
+                return Err(js_error(SandboxError::Execution {
+                    entrypoint: "<node-runtime>".to_string(),
+                    message: format!("ENOTDIR: not a directory, chdir '{}'", capture.next_path),
+                }));
+            }
+            node_with_host(|host| {
+                host.process.borrow_mut().cwd = capture.next_path.clone();
+                node_sync_live_process_state_budget(host)?;
+                Ok(JsValue::undefined())
+            })
+            .map_err(js_error)
+        }
+        NodeCompletedHostOperation::Stats(None) => Err(js_error(SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!("ENOENT: no such file or directory, chdir '{}'", capture.next_path),
+        })),
+        other => Err(node_unexpected_host_operation_result("stats", &other)),
+    }
+}
+
+fn node_process_methods_chdir_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        let current_cwd = host.process.borrow().cwd.clone();
-        let next = resolve_node_path(&current_cwd, &path);
-        let stats = node_read_stat(host, &next)?;
-        let Some(stats) = stats else {
-            return Err(SandboxError::Execution {
-                entrypoint: "<node-runtime>".to_string(),
-                message: format!("ENOENT: no such file or directory, chdir '{next}'"),
-            });
-        };
-        if !matches!(stats.kind, FileKind::Directory) {
-            return Err(SandboxError::Execution {
-                entrypoint: "<node-runtime>".to_string(),
-                message: format!("ENOTDIR: not a directory, chdir '{next}'"),
-            });
-        }
-        host.process.borrow_mut().cwd = next;
-        node_sync_live_process_state_budget(host)?;
-        Ok(JsValue::undefined())
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    let current_cwd = host.process.borrow().cwd.clone();
+    let next = resolve_node_path(&current_cwd, &path);
+    let request_id = node_queue_host_operation(&host, NodePendingHostOperation::FsStat { path: next.clone() })
+        .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_process_methods_chdir,
+        NodeProcessChdirResume {
+            request_id,
+            next_path: next,
+        },
+    ))
 }
 
 fn node_process_methods_umask(
@@ -19018,28 +19425,53 @@ fn node_contextify_script_create_cached_data(
     Ok(cached_data)
 }
 
-fn node_builtins_compile_function(
+fn node_resume_builtins_compile_function(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeBuiltinCompileResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let source = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::String(value) => value,
+        other => return Err(node_unexpected_host_operation_result("string", &other)),
+    };
+    node_compile_builtin_wrapper_from_source(
+        context,
+        &capture.specifier,
+        &source,
+        &[
+            "exports",
+            "require",
+            "module",
+            "process",
+            "internalBinding",
+            "primordials",
+        ],
+        None,
+    )
+    .map_err(js_error)
+}
+
+fn node_builtins_compile_function_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let id = node_arg_string(args, 0, context)?;
-    node_with_host_js(context, |host, context| {
-        node_compile_builtin_wrapper(
-            context,
-            host,
-            &id,
-            &[
-                "exports",
-                "require",
-                "module",
-                "process",
-                "internalBinding",
-                "primordials",
-            ],
-            None,
-        )
-    })
+    let host = active_node_host().map_err(js_error)?;
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::ReadBuiltinSource {
+            specifier: id.clone(),
+        },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_resume_builtins_compile_function,
+        NodeBuiltinCompileResume {
+            request_id,
+            specifier: id,
+        },
+    ))
 }
 
 fn node_builtins_set_internal_loaders(
@@ -19093,7 +19525,7 @@ fn node_errors_set_prepare_stack_trace_callback(
 fn node_errors_set_source_maps_enabled(
     _this: &JsValue,
     args: &[JsValue],
-    context: &mut Context,
+    _context: &mut Context,
 ) -> JsResult<JsValue> {
     let enabled = args
         .first()
@@ -20129,25 +20561,38 @@ fn node_blob_create_blob(
     })
 }
 
-fn node_blob_create_blob_from_file_path(
+fn node_resume_blob_create_from_file_path(
+    _completion: Result<(), boa_engine::JsError>,
+    request_id: &u64,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
+        NodeCompletedHostOperation::Bytes(bytes) => {
+            let length = bytes.len() as u32;
+            node_with_host_js(context, |host, context| {
+                let blob_id = node_blob_register_bytes(host, bytes);
+                let handle = node_blob_make_handle(context, blob_id)?;
+                Ok(JsValue::from(JsArray::from_iter(
+                    [JsValue::from(handle), JsValue::from(length)],
+                    context,
+                )?))
+            })
+        }
+        NodeCompletedHostOperation::Undefined => Ok(JsValue::undefined()),
+        other => Err(node_unexpected_host_operation_result("bytes|undefined", &other)),
+    }
+}
+
+fn node_blob_create_blob_from_file_path_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host_js(context, |host, context| {
-        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        let Some(bytes) = node_read_file(host, &resolved)? else {
-            return Ok(JsValue::undefined());
-        };
-        let length = bytes.len() as u32;
-        let blob_id = node_blob_register_bytes(host, bytes);
-        let handle = node_blob_make_handle(context, blob_id)?;
-        Ok(JsValue::from(JsArray::from_iter(
-            [JsValue::from(handle), JsValue::from(length)],
-            context,
-        )?))
-    })
+    node_suspend_host_operation(
+        NodePendingHostOperation::ReadFileBytes { path },
+        node_resume_blob_create_from_file_path,
+    )
 }
 
 fn node_blob_concat(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -21126,29 +21571,16 @@ fn node_modules_get_compile_cache_dir(
     .map_err(js_error)
 }
 
-fn node_modules_get_nearest_parent_package_json_type(
+fn node_modules_get_nearest_parent_package_json_type_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        let package_type = node_modules_traverse_parent_package_json(host, &resolved)?.and_then(
-            |(package_json, _)| {
-                package_json
-                    .get("type")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| *value == "commonjs" || *value == "module")
-                    .map(str::to_string)
-            },
-        );
-        Ok(match package_type {
-            Some(value) => JsValue::from(JsString::from(value)),
-            None => JsValue::undefined(),
-        })
-    })
-    .map_err(js_error)
+    node_suspend_host_operation(
+        NodePendingHostOperation::ModulesGetNearestParentPackageJsonType { path },
+        node_resume_string_or_undefined_host_operation,
+    )
 }
 
 fn node_modules_serialize_package_json(
@@ -21208,7 +21640,7 @@ fn node_modules_package_scope_start_path(
     Ok(normalize_node_path(&package_json.to_string_lossy()))
 }
 
-fn node_modules_find_package_scope_config(
+async fn node_modules_find_package_scope_config_async(
     host: &NodeRuntimeHost,
     input: &str,
 ) -> Result<(Option<serde_json::Value>, String), SandboxError> {
@@ -21218,7 +21650,7 @@ fn node_modules_find_package_scope_config(
         if current.ends_with("/node_modules/package.json") {
             break;
         }
-        if let Some(package_json) = read_package_json(host, &current)? {
+        if let Some(package_json) = read_package_json_async(host, &current).await? {
             return Ok((Some(package_json), current));
         }
         let parent = std::path::Path::new(&current)
@@ -21236,7 +21668,7 @@ fn node_modules_find_package_scope_config(
     Ok((None, initial))
 }
 
-fn node_modules_traverse_parent_package_json(
+async fn node_modules_traverse_parent_package_json_async(
     host: &NodeRuntimeHost,
     path: &str,
 ) -> Result<Option<(serde_json::Value, String)>, SandboxError> {
@@ -21257,95 +21689,59 @@ fn node_modules_traverse_parent_package_json(
             return Ok(None);
         }
         let package_json_path = normalize_node_path(&format!("{}/package.json", current.display()));
-        if let Some(package_json) = read_package_json(host, &package_json_path)? {
+        if let Some(package_json) = read_package_json_async(host, &package_json_path).await? {
             return Ok(Some((package_json, package_json_path)));
         }
     }
     Ok(None)
 }
 
-fn node_modules_get_nearest_parent_package_json(
+fn node_modules_get_nearest_parent_package_json_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    let value = node_with_host(|host| {
-        let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
-        Ok(
-            node_modules_traverse_parent_package_json(host, &resolved)?.map(
-                |(package_json, package_json_path)| {
-                    node_modules_serialize_package_json(&package_json, Some(&package_json_path))
-                },
-            ),
-        )
-    })
-    .map_err(js_error)?;
-    match value {
-        Some(value) => JsValue::from_json(&value, context),
-        None => Ok(JsValue::undefined()),
-    }
+    node_suspend_host_operation(
+        NodePendingHostOperation::ModulesGetNearestParentPackageJson { path },
+        node_resume_json_or_undefined_host_operation,
+    )
 }
 
-fn node_modules_get_package_scope_config(
+fn node_modules_get_package_scope_config_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host_js(context, |host, context| {
-        let (package_json, package_json_path) =
-            node_modules_find_package_scope_config(host, &path)?;
-        match package_json {
-            Some(package_json) => JsValue::from_json(
-                &node_modules_serialize_package_json(&package_json, Some(&package_json_path)),
-                context,
-            )
-            .map_err(sandbox_execution_error),
-            None => Ok(JsValue::from(JsString::from(package_json_path))),
-        }
-    })
+    node_suspend_host_operation(
+        NodePendingHostOperation::ModulesGetPackageScopeConfig { path },
+        node_resume_string_or_json_host_operation,
+    )
 }
 
-fn node_modules_get_package_type(
+fn node_modules_get_package_type_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        let (package_json, _) = node_modules_find_package_scope_config(host, &path)?;
-        let value = package_json
-            .and_then(|package_json| {
-                package_json
-                    .get("type")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| *value == "commonjs" || *value == "module")
-                    .map(str::to_string)
-            })
-            .map(|value| JsValue::from(JsString::from(value)))
-            .unwrap_or_else(JsValue::undefined);
-        Ok(value)
-    })
-    .map_err(js_error)
+    node_suspend_host_operation(
+        NodePendingHostOperation::ModulesGetPackageType { path },
+        node_resume_string_or_undefined_host_operation,
+    )
 }
 
-fn node_modules_read_package_json(
+fn node_modules_read_package_json_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let json_path = node_arg_string(args, 0, context)?;
-    let value = node_with_host(|host| {
-        let resolved = resolve_node_path(&host.process.borrow().cwd, &json_path);
-        let package_json = read_package_json(host, &resolved)?;
-        Ok(package_json.map(|value| node_modules_serialize_package_json(&value, Some(&resolved))))
-    })
-    .map_err(js_error)?;
-    match value {
-        Some(value) => JsValue::from_json(&value, context),
-        None => Ok(JsValue::undefined()),
-    }
+    node_suspend_host_operation(
+        NodePendingHostOperation::ModulesReadPackageJson { path: json_path },
+        node_resume_json_or_undefined_host_operation,
+    )
 }
 
 fn node_modules_flush_compile_cache(
@@ -24327,11 +24723,11 @@ fn node_credentials_safe_getenv(
     })
 }
 
-fn node_resolve_module(
+fn node_resolve_module_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let specifier = node_arg_string(args, 0, context)?;
     let referrer = args
         .get(1)
@@ -24362,35 +24758,70 @@ fn node_resolve_module(
         }
         _ => NodeRequireResolveOptions::default(),
     };
-    node_with_host_js(context, |host, context| {
-        node_debug_event(
-            host,
-            "resolve",
-            format!(
-                "resolve_module specifier={specifier} referrer={} mode={mode:?}",
-                referrer.as_deref().unwrap_or("<root>")
-            ),
-        )?;
-        let resolved = resolve_node_module(
-            host,
-            &specifier,
-            referrer.as_deref(),
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(
+        &host,
+        "resolve",
+        format!(
+            "resolve_module specifier={specifier} referrer={} mode={mode:?}",
+            referrer.as_deref().unwrap_or("<root>")
+        ),
+    )
+    .map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::ResolveModule {
+            specifier,
+            referrer,
             mode,
-            options.extensions.as_deref(),
-        )?;
-        JsValue::from_json(
-            &serde_json::to_value(resolved).map_err(sandbox_execution_error)?,
-            context,
-        )
-        .map_err(sandbox_execution_error)
-    })
+            options,
+        },
+        node_resume_resolved_module_host_operation,
+    )
 }
 
-fn node_require_esm_namespace(
+async fn node_require_esm_namespace_async(
+    context: &mut Context,
+    host: Rc<NodeRuntimeHost>,
+    resolved: NodeResolvedModule,
+) -> Result<JsValue, SandboxError> {
+    if resolved.kind != NodeResolvedKind::EsModule {
+        return Err(SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!(
+                "__terraceRequireEsmNamespace expected an esm module, got {:?}",
+                resolved.kind
+            ),
+        });
+    }
+    node_debug_event(&host, "load", format!("require_esm {}", resolved.id))?;
+    let loader = NodeCommandModuleLoader::new(host.clone());
+    let module = loader.materialize(&resolved, context)?;
+    let promise = module.load_link_evaluate(context);
+    loop {
+        node_check_execution_timeout(&host)?;
+        match promise.state() {
+            PromiseState::Pending => {
+                context.run_jobs_async().await.map_err(sandbox_execution_error)?;
+            }
+            PromiseState::Fulfilled(_) | PromiseState::Rejected(_) => break,
+        }
+    }
+    drain_node_jobs_until_quiescent_async(context, host.clone(), &resolved.id).await?;
+    if let PromiseState::Rejected(reason) = promise.state() {
+        return Err(node_execution_error(
+            &resolved.id,
+            &host,
+            boa_engine::JsError::from_opaque(reason),
+        ));
+    }
+    Ok(module.namespace(context)?.into())
+}
+
+fn node_require_esm_namespace_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let resolved: NodeResolvedModule = node_arg_json(args, 0, context)?;
     if resolved.kind != NodeResolvedKind::EsModule {
         return Err(node_error_with_code(
@@ -24405,20 +24836,10 @@ fn node_require_esm_namespace(
     }
     let host = active_node_host().map_err(js_error)?;
     node_debug_event(&host, "load", format!("require_esm {}", resolved.id)).map_err(js_error)?;
-    let loader = NodeCommandModuleLoader::new(host.clone());
-    let module = loader
-        .materialize(&resolved, context)
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?;
-    let promise = module.load_link_evaluate(context);
-    match promise.await_blocking(context) {
-        Ok(_) | Err(_) => {}
-    }
-    drain_node_jobs_until_quiescent(context, &host, &resolved.id).map_err(js_error)?;
-    if let PromiseState::Rejected(reason) = promise.state() {
-        return Err(boa_engine::JsError::from_opaque(reason));
-    }
-    Ok(module.namespace(context)?.into())
+    node_suspend_host_operation(
+        NodePendingHostOperation::RequireEsmNamespace { resolved },
+        node_resume_js_value_host_operation,
+    )
 }
 
 fn node_read_module_source(
@@ -24441,11 +24862,11 @@ fn node_read_module_source(
     .map_err(js_error)
 }
 
-fn node_require_resolve(
+fn node_require_resolve_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let specifier = node_arg_string(args, 0, context)?;
     let referrer = args
         .get(1)
@@ -24465,21 +24886,15 @@ fn node_require_resolve(
         }
         _ => NodeRequireResolveOptions::default(),
     };
-
-    node_with_host_js(context, |host, context| {
-        let report = resolve_require_report(
-            host,
-            &specifier,
-            referrer.as_deref(),
-            options.paths.as_deref(),
-            options.extensions.as_deref(),
-        );
-        JsValue::from_json(
-            &serde_json::to_value(report).map_err(sandbox_execution_error)?,
-            context,
-        )
-        .map_err(sandbox_execution_error)
-    })
+    node_suspend_host_operation(
+        NodePendingHostOperation::ResolveModule {
+            specifier,
+            referrer,
+            mode: NodeResolveMode::Require,
+            options,
+        },
+        node_resume_require_resolve_host_operation,
+    )
 }
 
 fn node_require_resolve_paths(
@@ -24503,64 +24918,6 @@ fn node_require_resolve_paths(
             context,
         )
         .map_err(sandbox_execution_error)
-    })
-}
-
-fn resolve_require_report(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    referrer: Option<&str>,
-    paths: Option<&[String]>,
-    extensions: Option<&[String]>,
-) -> JsonValue {
-    match resolve_require_target(host, specifier, referrer, paths, extensions) {
-        Ok(resolved) => serde_json::json!({
-            "ok": true,
-            "resolved": resolved,
-        }),
-        Err((code, message)) => serde_json::json!({
-            "ok": false,
-            "code": code,
-            "message": message,
-        }),
-    }
-}
-
-fn resolve_require_target(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    referrer: Option<&str>,
-    paths: Option<&[String]>,
-    extensions: Option<&[String]>,
-) -> Result<String, (String, String)> {
-    if let Some(builtin) = node_builtin_name(specifier) {
-        return Ok(if specifier.starts_with("node:") {
-            format!("node:{builtin}")
-        } else {
-            builtin
-        });
-    }
-
-    resolve_node_module_path_with_paths(
-        host,
-        specifier,
-        referrer,
-        NodeResolveMode::Require,
-        paths,
-        extensions,
-    )
-    .map_err(|error| {
-        let message = match &error {
-            SandboxError::ModuleNotFound { .. } => {
-                format!("Cannot find module '{specifier}'")
-            }
-            other => other.to_string(),
-        };
-        let code = match error {
-            SandboxError::ModuleNotFound { .. } => "MODULE_NOT_FOUND",
-            _ => "ERR_TERRACE_NODE_RESOLVE",
-        };
-        (code.to_string(), message)
     })
 }
 
@@ -24589,50 +24946,33 @@ fn require_resolve_lookup_paths(
     Ok(Some(node_module_lookup_paths_from(host, &base)?))
 }
 
-fn node_fs_read_text_file(
+fn node_fs_read_text_file_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("read_text_file {path}"))?;
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let bytes = node_read_file(host, &path)?.ok_or_else(|| SandboxError::ModuleNotFound {
-            specifier: path.clone(),
-        })?;
-        let text = String::from_utf8(bytes).map_err(|error| SandboxError::Execution {
-            entrypoint: path.clone(),
-            message: error.to_string(),
-        })?;
-        Ok(JsValue::from(JsString::from(text)))
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("read_text_file {path}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsReadTextFile { path },
+        node_resume_string_host_operation,
+    )
 }
 
-fn node_fs_write_text_file(
+fn node_fs_write_text_file_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
     let data = node_arg_string(args, 1, context)?;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("write_text_file {path}"))?;
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        futures::executor::block_on(host.session.filesystem().write_file(
-            &path,
-            data.into_bytes(),
-            CreateOptions {
-                create_parents: true,
-                overwrite: true,
-                ..Default::default()
-            },
-        ))?;
-        node_graph_invalidate(host);
-        Ok(JsValue::undefined())
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("write_text_file {path}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsWriteTextFile { path, data },
+        node_resume_undefined_host_operation,
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -24896,105 +25236,6 @@ async fn node_fs_close_impl_async(host: &NodeRuntimeHost, fd: i32) -> Result<(),
     Ok(())
 }
 
-fn node_fs_open_impl(
-    host: &NodeRuntimeHost,
-    path: &str,
-    flags: NodeFsOpenFlags,
-) -> Result<i32, SandboxError> {
-    node_debug_event(host, "fs", format!("open {path}"))?;
-    let path = resolve_node_path(&host.process.borrow().cwd, path);
-    let existing = futures::executor::block_on(host.session.filesystem().stat(&path))?;
-    let existed = existing.is_some();
-    let mut contents = futures::executor::block_on(host.session.filesystem().read_file(&path))?
-        .unwrap_or_default();
-    match existing {
-        Some(stats) => {
-            if stats.kind == FileKind::Directory {
-                return Err(SandboxError::Service {
-                    service: "node_runtime",
-                    message: format!("EISDIR: illegal operation on a directory, open '{path}'"),
-                });
-            }
-        }
-        None if !flags.create => {
-            return Err(SandboxError::Service {
-                service: "node_runtime",
-                message: format!("ENOENT: no such file or directory, open '{path}'"),
-            });
-        }
-        None => {}
-    }
-
-    if flags.exclusive && existed {
-        return Err(SandboxError::Service {
-            service: "node_runtime",
-            message: format!("EEXIST: file already exists, open '{path}'"),
-        });
-    }
-
-    if flags.truncate && flags.writable && !flags.append {
-        contents.clear();
-    }
-
-    if flags.create && !existed {
-        futures::executor::block_on(host.session.filesystem().write_file(
-            &path,
-            contents.clone(),
-            CreateOptions {
-                create_parents: false,
-                overwrite: true,
-                ..Default::default()
-            },
-        ))?;
-        node_graph_invalidate(host);
-    }
-
-    if flags.truncate && flags.writable && !flags.append {
-        node_graph_invalidate(host);
-    }
-
-    let mut open_files = host.open_files.borrow_mut();
-    let fd = open_files.next_fd;
-    open_files.next_fd = open_files.next_fd.saturating_add(1);
-    open_files.entries.insert(
-        fd,
-        NodeOpenFile {
-            path,
-            readable: flags.readable,
-            writable: flags.writable,
-            append: flags.append,
-            cursor: if flags.append { contents.len() } else { 0 },
-            contents,
-        },
-    );
-    drop(open_files);
-    node_sync_live_host_buffer_budget(host)?;
-    Ok(fd)
-}
-
-fn node_fs_close_impl(host: &NodeRuntimeHost, fd: i32) -> Result<(), SandboxError> {
-    node_debug_event(host, "fs", format!("close {fd}"))?;
-    if fd == 0 || fd == 1 || fd == 2 {
-        return Ok(());
-    }
-    if let Some(entry) = host.open_files.borrow_mut().entries.remove(&fd) {
-        if entry.writable {
-            futures::executor::block_on(host.session.filesystem().write_file(
-                &entry.path,
-                entry.contents,
-                CreateOptions {
-                    create_parents: false,
-                    overwrite: true,
-                    ..Default::default()
-                },
-            ))?;
-            node_graph_invalidate(host);
-        }
-    }
-    node_sync_live_host_buffer_budget(host)?;
-    Ok(())
-}
-
 fn node_fs_read_impl(
     host: &NodeRuntimeHost,
     fd: i32,
@@ -25156,93 +25397,29 @@ async fn node_fs_truncate_fd_impl_async(
     Ok(())
 }
 
-fn node_fs_write_impl(
-    host: &NodeRuntimeHost,
-    fd: i32,
-    data: &[u8],
-    position: Option<usize>,
-) -> Result<usize, SandboxError> {
-    node_debug_event(host, "fs", format!("write-fd {fd} len={}", data.len()))?;
-    if fd == 1 {
-        host.process
-            .borrow_mut()
-            .stdout
-            .push_str(&String::from_utf8_lossy(data));
-        node_sync_live_process_state_budget(host)?;
-        return Ok(data.len());
-    }
-    if fd == 2 {
-        host.process
-            .borrow_mut()
-            .stderr
-            .push_str(&String::from_utf8_lossy(data));
-        node_sync_live_process_state_budget(host)?;
-        return Ok(data.len());
-    }
-    if fd == 0 {
-        return Err(SandboxError::Service {
-            service: "node_runtime",
-            message: "EBADF: bad file descriptor, write".to_string(),
-        });
-    }
-    let (path, contents) = {
-        let mut open_files = host.open_files.borrow_mut();
-        let entry = open_files
-            .entries
-            .get_mut(&fd)
-            .ok_or_else(|| SandboxError::Service {
-                service: "node_runtime",
-                message: "EBADF: bad file descriptor, write".to_string(),
-            })?;
-        if !entry.writable {
-            return Err(SandboxError::Service {
-                service: "node_runtime",
-                message: "EBADF: bad file descriptor, write".to_string(),
-            });
-        }
-        let start = if entry.append {
-            entry.contents.len()
-        } else {
-            position.unwrap_or(entry.cursor)
-        };
-        if start > entry.contents.len() {
-            entry.contents.resize(start, 0);
-        }
-        let end = start.saturating_add(data.len());
-        if end > entry.contents.len() {
-            entry.contents.resize(end, 0);
-        }
-        entry.contents[start..end].copy_from_slice(data);
-        if position.is_none() || entry.append {
-            entry.cursor = end;
-        }
-        (entry.path.clone(), entry.contents.clone())
-    };
-    node_sync_live_host_buffer_budget(host)?;
-    futures::executor::block_on(host.session.filesystem().write_file(
-        &path,
-        contents,
-        CreateOptions {
-            create_parents: false,
-            overwrite: true,
-            ..Default::default()
-        },
-    ))?;
-    node_graph_invalidate(host);
-    Ok(data.len())
-}
-
-fn node_fs_open(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_open_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
     let flags = node_fs_open_flags_from_js(args, 1, context)?;
-    node_with_host(|host| node_fs_open_impl(host, &path, flags).map(JsValue::from))
-        .map_err(js_error)
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsOpen { path, flags },
+        node_resume_i32_host_operation,
+    )
 }
 
-fn node_fs_close(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_close_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let fd = node_arg_i32(args, 0, context)?;
-    node_with_host(|host| node_fs_close_impl(host, fd).map(|_| JsValue::undefined()))
-        .map_err(js_error)
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsClose { fd },
+        node_resume_undefined_host_operation,
+    )
 }
 
 fn node_fs_read_fd(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -25261,145 +25438,108 @@ fn node_fs_read_fd(_this: &JsValue, args: &[JsValue], context: &mut Context) -> 
     })
 }
 
-fn node_fs_write_fd(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_write_fd_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let fd = node_arg_i32(args, 0, context)?;
     let data = node_bytes_from_js(
         &args.get(1).cloned().unwrap_or_else(JsValue::undefined),
         context,
     )?;
     let position = node_arg_optional_usize(args, 2, context)?;
-    node_with_host(|host| {
-        node_fs_write_impl(host, fd, &data, position).map(|written| JsValue::from(written as u32))
-    })
-    .map_err(js_error)
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsWriteFd { fd, data, position },
+        node_resume_u32_host_operation,
+    )
 }
 
-fn node_fs_truncate_fd(
+fn node_fs_truncate_fd_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let fd = node_arg_i32(args, 0, context)?;
     let length = args
         .get(1)
         .cloned()
         .unwrap_or_else(JsValue::undefined)
         .to_length(context)? as usize;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("truncate-fd {fd} len={length}"))?;
-        let (path, contents) = {
-            let mut open_files = host.open_files.borrow_mut();
-            let entry = open_files
-                .entries
-                .get_mut(&fd)
-                .ok_or_else(|| SandboxError::Service {
-                    service: "node_runtime",
-                    message: "EBADF: bad file descriptor, ftruncate".to_string(),
-                })?;
-            if !entry.writable {
-                return Err(SandboxError::Service {
-                    service: "node_runtime",
-                    message: "EBADF: bad file descriptor, ftruncate".to_string(),
-                });
-            }
-            entry.contents.resize(length, 0);
-            if entry.cursor > length {
-                entry.cursor = length;
-            }
-            (entry.path.clone(), entry.contents.clone())
-        };
-        node_sync_live_host_buffer_budget(host)?;
-        futures::executor::block_on(host.session.filesystem().write_file(
-            &path,
-            contents,
-            CreateOptions {
-                create_parents: false,
-                overwrite: true,
-                ..Default::default()
-            },
-        ))?;
-        node_graph_invalidate(host);
-        Ok(JsValue::undefined())
-    })
-    .map_err(js_error)
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsTruncateFd { fd, size: length },
+        node_resume_undefined_host_operation,
+    )
 }
 
-fn node_fs_mkdir(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_mkdir_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("mkdir {path}"))?;
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        futures::executor::block_on(host.session.filesystem().mkdir(
-            &path,
-            MkdirOptions {
-                recursive: true,
-                ..Default::default()
-            },
-        ))?;
-        node_graph_invalidate(host);
-        Ok(JsValue::undefined())
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("mkdir {path}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsMkdir { path },
+        node_resume_undefined_host_operation,
+    )
 }
 
-fn node_fs_readdir(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_readdir_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host_js(context, |host, context| {
-        node_debug_event(host, "fs", format!("readdir {path}"))?;
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let entries = node_read_readdir(host, &path)?;
-        let json = serde_json::Value::Array(
-            entries
-                .into_iter()
-                .map(|entry| {
-                    serde_json::json!({
-                        "name": entry.name,
-                        "kind": format!("{:?}", entry.kind).to_lowercase(),
-                    })
-                })
-                .collect(),
-        );
-        JsValue::from_json(&json, context).map_err(sandbox_execution_error)
-    })
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("readdir {path}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsReaddir { path },
+        node_resume_dir_entries_host_operation,
+    )
 }
 
-fn node_fs_stat(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_stat_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host_js(context, |host, context| {
-        node_debug_event(host, "fs", format!("stat {path}"))?;
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let stats = node_read_stat(host, &path)?;
-        match stats {
-            Some(stats) => JsValue::from_json(&node_stats_to_json(stats), context)
-                .map_err(sandbox_execution_error),
-            None => Ok(JsValue::null()),
-        }
-    })
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("stat {path}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsStat { path },
+        node_resume_stats_host_operation,
+    )
 }
 
-fn node_fs_lstat(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_lstat_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host_js(context, |host, context| {
-        node_debug_event(host, "fs", format!("lstat {path}"))?;
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let stats = node_read_lstat(host, &path)?;
-        match stats {
-            Some(stats) => JsValue::from_json(&node_stats_to_json(stats), context)
-                .map_err(sandbox_execution_error),
-            None => Ok(JsValue::null()),
-        }
-    })
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("lstat {path}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsLstat { path },
+        node_resume_stats_host_operation,
+    )
 }
 
-fn node_fs_readlink(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_readlink_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("readlink {path}"))?;
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let target = node_read_readlink(host, &path)?;
-        Ok(JsValue::from(JsString::from(target)))
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("readlink {path}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsReadlink { path },
+        node_resume_string_host_operation,
+    )
 }
 
 fn node_fs_realpath(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -25414,68 +25554,63 @@ fn node_fs_realpath(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     .map_err(js_error)
 }
 
-fn node_fs_link(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_link_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let from = node_arg_string(args, 0, context)?;
     let to = node_arg_string(args, 1, context)?;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("link {from} -> {to}"))?;
-        let cwd = host.process.borrow().cwd.clone();
-        let from = resolve_node_path(&cwd, &from);
-        let to = resolve_node_path(&cwd, &to);
-        futures::executor::block_on(host.session.filesystem().link(&from, &to))?;
-        node_graph_invalidate(host);
-        Ok(JsValue::undefined())
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("link {from} -> {to}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsLink { from, to },
+        node_resume_undefined_host_operation,
+    )
 }
 
-fn node_fs_symlink(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_symlink_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let target = node_arg_string(args, 0, context)?;
     let linkpath = node_arg_string(args, 1, context)?;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("symlink {target} -> {linkpath}"))?;
-        let linkpath = resolve_node_path(&host.process.borrow().cwd, &linkpath);
-        futures::executor::block_on(host.session.filesystem().symlink(&target, &linkpath))?;
-        node_graph_invalidate(host);
-        Ok(JsValue::undefined())
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("symlink {target} -> {linkpath}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsSymlink { target, linkpath },
+        node_resume_undefined_host_operation,
+    )
 }
 
-fn node_fs_unlink(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_unlink_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let path = node_arg_string(args, 0, context)?;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("unlink {path}"))?;
-        let path = resolve_node_path(&host.process.borrow().cwd, &path);
-        let stats = futures::executor::block_on(host.session.filesystem().stat(&path))?;
-        match stats.map(|stats| stats.kind) {
-            Some(FileKind::Directory) => {
-                futures::executor::block_on(host.session.filesystem().rmdir(&path))?;
-            }
-            Some(_) => {
-                futures::executor::block_on(host.session.filesystem().unlink(&path))?;
-            }
-            None => {}
-        }
-        node_graph_invalidate(host);
-        Ok(JsValue::undefined())
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("unlink {path}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsUnlink { path },
+        node_resume_undefined_host_operation,
+    )
 }
 
-fn node_fs_rename(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+fn node_fs_rename_suspend(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let from = node_arg_string(args, 0, context)?;
     let to = node_arg_string(args, 1, context)?;
-    node_with_host(|host| {
-        node_debug_event(host, "fs", format!("rename {from} -> {to}"))?;
-        futures::executor::block_on(host.session.filesystem().rename(
-            &resolve_node_path(&host.process.borrow().cwd, &from),
-            &resolve_node_path(&host.process.borrow().cwd, &to),
-        ))?;
-        node_graph_invalidate(host);
-        Ok(JsValue::undefined())
-    })
-    .map_err(js_error)
+    let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "fs", format!("rename {from} -> {to}")).map_err(js_error)?;
+    node_suspend_host_operation(
+        NodePendingHostOperation::FsRename { from, to },
+        node_resume_undefined_host_operation,
+    )
 }
 
 const NODE_CRYPTO_HASHES: &[&str] = &[
@@ -26375,46 +26510,83 @@ fn node_zlib_crc32(_this: &JsValue, args: &[JsValue], context: &mut Context) -> 
     })
 }
 
-fn node_child_process_run(
+fn node_child_process_run_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
-    let request = node_arg_json::<NodeChildProcessRequest>(args, 0, context)?;
-    node_with_host_js(context, |host, context| {
-        node_debug_event(
-            host,
-            "child_process",
-            format!(
-                "run command={} shell={} cwd={}",
-                request.command,
-                request.shell,
-                request.cwd.as_deref().unwrap_or("<inherit>")
-            ),
-        )?;
-        let result = execute_child_process_request(host, request, context)?;
-        JsValue::from_json(
-            &serde_json::to_value(result).map_err(sandbox_execution_error)?,
-            context,
-        )
+) -> JsResult<NativeFunctionResult> {
+    let request = args
+        .first()
+        .cloned()
+        .unwrap_or_else(JsValue::undefined)
+        .to_json(context)
         .map_err(sandbox_execution_error)
-    })
+        .map_err(js_error)?
+        .unwrap_or(JsonValue::Null);
+    node_suspend_host_operation(
+        NodePendingHostOperation::ChildProcessRun { request },
+        node_resume_json_host_operation,
+    )
 }
 
-fn node_spawn_sync_spawn(
+async fn node_child_process_run_async(
+    context: &mut Context,
+    host: Rc<NodeRuntimeHost>,
+    request: JsonValue,
+) -> Result<JsonValue, SandboxError> {
+    let request = serde_json::from_value::<NodeChildProcessRequest>(request)
+        .map_err(sandbox_execution_error)?;
+    node_debug_event(
+        &host,
+        "child_process",
+        format!(
+            "run command={} shell={} cwd={}",
+            request.command,
+            request.shell,
+            request.cwd.as_deref().unwrap_or("<inherit>")
+        ),
+    )?;
+    let result = execute_child_process_request_async(host, request, context).await?;
+    serde_json::to_value(result).map_err(sandbox_execution_error)
+}
+
+fn node_spawn_sync_spawn_suspend(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let options = args
         .first()
         .and_then(JsValue::as_object)
         .ok_or_else(|| JsNativeError::typ().with_message("options must be an object"))?;
-    node_with_host_js(context, |host, context| {
-        let request = node_spawn_sync_request_from_options(host, &options, context)?;
-        let result = execute_child_process_request(host, request, context)?;
-        node_spawn_sync_result_to_js(host, &result, &options, context)
-    })
+    let host = active_node_host().map_err(js_error)?;
+    let request = node_spawn_sync_request_from_options(&host, &options, context).map_err(js_error)?;
+    let request_id = node_queue_host_operation(
+        &host,
+        NodePendingHostOperation::ChildProcessRun {
+            request: serde_json::to_value(request)
+                .map_err(sandbox_execution_error)
+                .map_err(js_error)?,
+        },
+    )
+    .map_err(js_error)?;
+    Ok(NativeFunctionResult::suspend_with_copy_closure(
+        node_spawn_sync_spawn_resume,
+        NodeSpawnSyncResume {
+            request_id,
+            options: options.clone(),
+        },
+    ))
+}
+
+fn node_spawn_sync_spawn_resume(
+    _completion: Result<(), boa_engine::JsError>,
+    capture: &NodeSpawnSyncResume,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let host = active_node_host().map_err(js_error)?;
+    let result = take_child_process_result_for_resume(capture.request_id).map_err(js_error)?;
+    node_spawn_sync_result_to_js(&host, &result, &capture.options, context).map_err(js_error)
 }
 
 fn node_spawn_sync_request_from_options(
@@ -26647,8 +26819,8 @@ fn node_spawn_sync_error_number(error: &NodeChildProcessError) -> i32 {
     }
 }
 
-fn execute_child_process_request(
-    host: &NodeRuntimeHost,
+async fn execute_child_process_request_async(
+    host: Rc<NodeRuntimeHost>,
     request: NodeChildProcessRequest,
     context: &mut Context,
 ) -> Result<NodeChildProcessResult, SandboxError> {
@@ -26658,7 +26830,7 @@ fn execute_child_process_request(
         .filter(|cwd| !cwd.is_empty())
         .map(|cwd| resolve_node_path(&host.process.borrow().cwd, cwd))
         .unwrap_or_else(|| host.process.borrow().cwd.clone());
-    match node_read_stat(host, &cwd)? {
+    match node_read_stat_async(&host, &cwd).await? {
         Some(stats) if stats.kind == FileKind::Directory => {}
         _ => {
             return Ok(child_process_spawn_error(
@@ -26673,16 +26845,16 @@ fn execute_child_process_request(
     }
 
     let env = if request.env.is_empty() {
-        node_sync_process_env_from_js(host, context)?;
+        node_sync_process_env_from_js(&host, context)?;
         host.process.borrow().env.clone()
     } else {
         request.env
     };
 
     if request.shell {
-        execute_shell_child_process(host, request.command, cwd, env, request.input)
+        execute_shell_child_process_async(host, request.command, cwd, env, request.input).await
     } else {
-        execute_direct_child_process(host, request.command, request.args, cwd, env, request.input)
+        execute_direct_child_process_async(host, request.command, request.args, cwd, env, request.input).await
     }
 }
 
@@ -26721,15 +26893,15 @@ fn next_child_pid(host: &NodeRuntimeHost) -> u32 {
     pid
 }
 
-fn execute_direct_child_process(
-    host: &NodeRuntimeHost,
+async fn execute_direct_child_process_async(
+    host: Rc<NodeRuntimeHost>,
     command: String,
     args: Vec<String>,
     cwd: String,
     env: BTreeMap<String, String>,
     stdin: Option<String>,
 ) -> Result<NodeChildProcessResult, SandboxError> {
-    let resolved = match resolve_child_command(host, &command, &cwd, &env)? {
+    let resolved = match resolve_child_command_async(&host, &command, &cwd, &env).await? {
         Some(value) => value,
         None => {
             return Ok(child_process_spawn_error(
@@ -26742,7 +26914,7 @@ fn execute_direct_child_process(
             ));
         }
     };
-    let pid = next_child_pid(host);
+    let pid = next_child_pid(&host);
     match resolved.as_str() {
         "pwd" => Ok(NodeChildProcessResult {
             pid: Some(pid),
@@ -26812,8 +26984,9 @@ fn execute_direct_child_process(
                 let mut output = String::new();
                 for arg in &args {
                     let path = resolve_node_path(&cwd, arg);
-                    let bytes =
-                        node_read_file(host, &path)?.ok_or_else(|| SandboxError::Service {
+                    let bytes = node_read_file_async(&host, &path)
+                        .await?
+                        .ok_or_else(|| SandboxError::Service {
                             service: "node_runtime",
                             message: format!("ENOENT: no such file or directory, open '{path}'"),
                         })?;
@@ -26833,8 +27006,8 @@ fn execute_direct_child_process(
                 error: None,
             })
         }
-        resolved_path if child_command_is_node(host, &command, resolved_path) => {
-            execute_node_child_process(
+        resolved_path if child_command_is_node_async(&host, &command, resolved_path).await? => {
+            execute_node_child_process_async(
                 host,
                 pid,
                 command,
@@ -26843,6 +27016,7 @@ fn execute_direct_child_process(
                 cwd,
                 env,
             )
+            .await
         }
         resolved_path => Ok(child_process_spawn_error(
             resolved_path.to_string(),
@@ -26855,8 +27029,8 @@ fn execute_direct_child_process(
     }
 }
 
-fn execute_shell_child_process(
-    host: &NodeRuntimeHost,
+async fn execute_shell_child_process_async(
+    host: Rc<NodeRuntimeHost>,
     command: String,
     cwd: String,
     env: BTreeMap<String, String>,
@@ -26866,7 +27040,7 @@ fn execute_shell_child_process(
     let pipeline = split_shell_pipeline(&command);
     let mut stdin = stdin;
     let mut last = NodeChildProcessResult {
-        pid: Some(next_child_pid(host)),
+        pid: Some(next_child_pid(&host)),
         file: shell_path.clone(),
         spawnfile: shell_path.clone(),
         spawnargs: vec![shell_path.clone(), "-c".to_string(), command.clone()],
@@ -26881,27 +27055,28 @@ fn execute_shell_child_process(
         if argv.is_empty() {
             continue;
         }
-        last = execute_direct_child_process(
-            host,
+        last = execute_direct_child_process_async(
+            host.clone(),
             argv[0].clone(),
             argv[1..].to_vec(),
             cwd.clone(),
             env.clone(),
             stdin.take(),
-        )?;
+        )
+        .await?;
         stdin = Some(last.stdout.clone());
     }
     last.file = shell_path.clone();
     last.spawnfile = shell_path.clone();
     last.spawnargs = vec![shell_path, "-c".to_string(), command];
     if last.error.is_none() {
-        last.pid = Some(next_child_pid(host));
+        last.pid = Some(next_child_pid(&host));
     }
     Ok(last)
 }
 
-fn execute_node_child_process(
-    host: &NodeRuntimeHost,
+async fn execute_node_child_process_async(
+    host: Rc<NodeRuntimeHost>,
     pid: u32,
     command: String,
     resolved_command: String,
@@ -26910,7 +27085,7 @@ fn execute_node_child_process(
     env: BTreeMap<String, String>,
 ) -> Result<NodeChildProcessResult, SandboxError> {
     let exec_path = host.process.borrow().exec_path.clone();
-    let (entrypoint, child_argv) = if child_command_is_exec_path(host, &command) {
+    let (entrypoint, child_argv) = if child_command_is_exec_path(&host, &command) {
         match args.first().cloned() {
             Some(flag) if flag == "-e" || flag == "--eval" => {
                 let source = args.get(1).cloned().unwrap_or_default();
@@ -26918,15 +27093,18 @@ fn execute_node_child_process(
                     "{}/.terrace/runtime/child-eval-{}.cjs",
                     host.workspace_root, pid
                 );
-                futures::executor::block_on(host.session.filesystem().write_file(
-                    &temp_path,
-                    source.into_bytes(),
-                    CreateOptions {
-                        create_parents: true,
-                        overwrite: true,
-                        ..Default::default()
-                    },
-                ))?;
+                host.session
+                    .filesystem()
+                    .write_file(
+                        &temp_path,
+                        source.into_bytes(),
+                        CreateOptions {
+                            create_parents: true,
+                            overwrite: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
                 let argv = vec![exec_path.clone(), temp_path.clone()];
                 (temp_path, argv)
             }
@@ -26937,15 +27115,18 @@ fn execute_node_child_process(
                     host.workspace_root, pid
                 );
                 let source = format!("console.log({expression});\n");
-                futures::executor::block_on(host.session.filesystem().write_file(
-                    &temp_path,
-                    source.into_bytes(),
-                    CreateOptions {
-                        create_parents: true,
-                        overwrite: true,
-                        ..Default::default()
-                    },
-                ))?;
+                host.session
+                    .filesystem()
+                    .write_file(
+                        &temp_path,
+                        source.into_bytes(),
+                        CreateOptions {
+                            create_parents: true,
+                            overwrite: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
                 let argv = vec![exec_path.clone(), temp_path.clone()];
                 (temp_path, argv)
             }
@@ -27031,29 +27212,24 @@ fn execute_node_child_process(
         next_child_pid: host.next_child_pid.clone(),
         zlib_streams: Rc::new(RefCell::new(NodeZlibStreamTable::default())),
         bootstrap: Rc::new(RefCell::new(NodeBootstrapState {
-            monotonic_now_ms: node_monotonic_now_ms(host),
+            monotonic_now_ms: node_monotonic_now_ms(&host),
             ..Default::default()
         })),
         execution_timeout: host.execution_timeout.clone(),
     });
-    let child_result = execute_node_command_inner(
+    let result = execute_node_command_inner(
         child_host,
         entrypoint.clone(),
         resolve_node_path(&host.process.borrow().cwd, &entrypoint),
-    );
-    node_sync_live_module_cache_budget(host)?;
-    node_sync_live_task_queue_budget(host)?;
-    node_sync_live_process_state_budget(host)?;
-    let result = child_result?;
+    )
+    .await?;
+    node_sync_live_module_cache_budget(&host)?;
+    node_sync_live_task_queue_budget(&host)?;
+    node_sync_live_process_state_budget(&host)?;
     let report = result.result.unwrap_or(JsonValue::Null);
     let stdout = json_object_string(&report, "stdout");
     let stderr = json_object_string(&report, "stderr");
-    let status = report
-        .as_object()
-        .and_then(|object| object.get("exitCode"))
-        .and_then(|value| value.as_i64())
-        .map(|value| value as i32)
-        .unwrap_or_default();
+    let status = json_object_i32(&report, "exitCode").unwrap_or_default();
     Ok(NodeChildProcessResult {
         pid: Some(pid),
         file: command.clone(),
@@ -27072,21 +27248,24 @@ fn child_command_is_exec_path(host: &NodeRuntimeHost, command: &str) -> bool {
     command == exec_path || command == "node" || command.ends_with("/node")
 }
 
-fn child_command_is_node(host: &NodeRuntimeHost, command: &str, resolved: &str) -> bool {
+async fn child_command_is_node_async(
+    host: &NodeRuntimeHost,
+    command: &str,
+    resolved: &str,
+) -> Result<bool, SandboxError> {
     if child_command_is_exec_path(host, command) {
-        return true;
+        return Ok(true);
     }
-    resolved.ends_with(".js")
-        || resolved.ends_with(".cjs")
-        || resolved.ends_with(".mjs")
-        || node_read_file(host, resolved)
-            .ok()
-            .flatten()
-            .map(|bytes| String::from_utf8_lossy(&bytes).starts_with("#!"))
-            .unwrap_or(false)
+    if resolved.ends_with(".js") || resolved.ends_with(".cjs") || resolved.ends_with(".mjs") {
+        return Ok(true);
+    }
+    Ok(node_read_file_async(host, resolved)
+        .await?
+        .map(|bytes| String::from_utf8_lossy(&bytes).starts_with("#!"))
+        .unwrap_or(false))
 }
 
-fn resolve_child_command(
+async fn resolve_child_command_async(
     host: &NodeRuntimeHost,
     command: &str,
     cwd: &str,
@@ -27103,7 +27282,7 @@ fn resolve_child_command(
     }
     if command.contains('/') {
         let resolved = resolve_node_path(cwd, command);
-        let exists = node_read_stat(host, &resolved)?;
+        let exists = node_read_stat_async(host, &resolved).await?;
         return Ok(exists.map(|_| resolved));
     }
     let path = env
@@ -27115,7 +27294,7 @@ fn resolve_child_command(
             continue;
         }
         let candidate = resolve_node_path(cwd, &format!("{dir}/{command}"));
-        if node_read_stat(host, &candidate)?.is_some() {
+        if node_read_stat_async(host, &candidate).await?.is_some() {
             return Ok(Some(candidate));
         }
     }
@@ -27198,6 +27377,14 @@ fn json_object_string(value: &JsonValue, key: &str) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+fn json_object_i32(value: &JsonValue, key: &str) -> Option<i32> {
+    value
+        .as_object()
+        .and_then(|object| object.get(key))
+        .and_then(|value| value.as_i64())
+        .map(|value| value as i32)
 }
 
 fn node_builtin_name(specifier: &str) -> Option<String> {
@@ -27907,558 +28094,6 @@ async fn node_module_lookup_paths_from_async(
     Ok(paths)
 }
 
-fn resolve_node_module(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    referrer: Option<&str>,
-    mode: NodeResolveMode,
-    extensions: Option<&[String]>,
-) -> Result<NodeResolvedModule, SandboxError> {
-    if let Some(builtin) = node_builtin_name(specifier) {
-        return Ok(NodeResolvedModule {
-            id: builtin.clone(),
-            specifier: format!("node:{builtin}"),
-            kind: NodeResolvedKind::Builtin,
-        });
-    }
-
-    let resolved_path = resolve_node_module_path(host, specifier, referrer, mode, extensions)?;
-    if let Some(loaded) = host.loaded_modules.borrow().get(&resolved_path).cloned() {
-        return Ok(NodeResolvedModule {
-            id: loaded.runtime_path.clone(),
-            specifier: loaded.runtime_path,
-            kind: loaded.kind,
-        });
-    }
-    let loaded = load_node_module_from_path(host, &resolved_path)?;
-    let resolved = NodeResolvedModule {
-        id: loaded.runtime_path.clone(),
-        specifier: loaded.runtime_path.clone(),
-        kind: loaded.kind,
-    };
-    host.loaded_modules
-        .borrow_mut()
-        .insert(resolved.id.clone(), loaded);
-    node_sync_live_module_cache_budget(host)?;
-    Ok(resolved)
-}
-
-fn resolve_node_module_path(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    referrer: Option<&str>,
-    mode: NodeResolveMode,
-    extensions: Option<&[String]>,
-) -> Result<String, SandboxError> {
-    resolve_node_module_path_with_paths(host, specifier, referrer, mode, None, extensions)
-}
-
-fn resolve_node_module_path_with_paths(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    referrer: Option<&str>,
-    mode: NodeResolveMode,
-    paths: Option<&[String]>,
-    extensions: Option<&[String]>,
-) -> Result<String, SandboxError> {
-    let cache_key = NodeResolveCacheKey {
-        specifier: specifier.to_string(),
-        referrer: referrer.map(str::to_string),
-        mode,
-        paths: paths.unwrap_or_default().to_vec(),
-        extensions: normalize_require_extensions(extensions),
-    };
-    if let Some(cached) = host
-        .module_graph
-        .borrow()
-        .resolve_path_cache
-        .get(&cache_key)
-        .cloned()
-    {
-        return cached.ok_or_else(|| SandboxError::ModuleNotFound {
-            specifier: specifier.to_string(),
-        });
-    }
-
-    let result = resolve_node_module_path_with_paths_uncached(
-        host, specifier, referrer, mode, paths, extensions,
-    );
-    match &result {
-        Ok(resolved) => {
-            host.module_graph
-                .borrow_mut()
-                .resolve_path_cache
-                .insert(cache_key, Some(resolved.clone()));
-            node_sync_live_module_cache_budget(host)?;
-        }
-        Err(SandboxError::ModuleNotFound { .. }) => {
-            host.module_graph
-                .borrow_mut()
-                .resolve_path_cache
-                .insert(cache_key, None);
-            node_sync_live_module_cache_budget(host)?;
-        }
-        Err(_) => {}
-    }
-    result
-}
-
-fn resolve_node_module_path_with_paths_uncached(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    referrer: Option<&str>,
-    mode: NodeResolveMode,
-    paths: Option<&[String]>,
-    extensions: Option<&[String]>,
-) -> Result<String, SandboxError> {
-    if specifier.starts_with('/') {
-        return resolve_as_file_or_directory(
-            host,
-            &normalize_node_path(specifier),
-            mode,
-            extensions,
-        )?
-        .ok_or_else(|| SandboxError::ModuleNotFound {
-            specifier: specifier.to_string(),
-        });
-    }
-
-    if matches!(specifier, "." | "..")
-        || specifier.starts_with("./")
-        || specifier.starts_with("../")
-    {
-        if let Some(paths) = paths {
-            let cwd = host.process.borrow().cwd.clone();
-            for lookup_base in paths {
-                let normalized = if lookup_base.starts_with('/') {
-                    normalize_node_path(lookup_base)
-                } else {
-                    normalize_node_path(&format!("{cwd}/{lookup_base}"))
-                };
-                if let Some(resolved) = resolve_as_file_or_directory(
-                    host,
-                    &resolve_node_path(&normalized, specifier),
-                    mode,
-                    extensions,
-                )? {
-                    return Ok(resolved);
-                }
-            }
-            return Err(SandboxError::ModuleNotFound {
-                specifier: specifier.to_string(),
-            });
-        }
-        let base = referrer
-            .map(directory_for_path)
-            .unwrap_or_else(|| host.process.borrow().cwd.clone());
-        return resolve_as_file_or_directory(
-            host,
-            &resolve_node_path(&base, specifier),
-            mode,
-            extensions,
-        )?
-        .ok_or_else(|| SandboxError::ModuleNotFound {
-            specifier: specifier.to_string(),
-        });
-    }
-
-    if specifier.starts_with('#') {
-        return resolve_package_import_from_referrer(host, specifier, referrer, mode, extensions);
-    }
-
-    if let Some(paths) = paths {
-        return resolve_bare_node_module_with_lookup_paths(
-            host, specifier, mode, paths, extensions,
-        );
-    }
-
-    let base = referrer
-        .map(directory_for_path)
-        .unwrap_or_else(|| host.process.borrow().cwd.clone());
-    let (package_name, subpath) = split_package_request(specifier)?;
-    for directory in node_module_lookup_paths_from(host, &base)? {
-        let package_root = normalize_node_path(&format!("{directory}/{package_name}"));
-        if let Some(resolved) = resolve_package_entry_from_directory(
-            host,
-            &package_root,
-            subpath.as_deref(),
-            mode,
-            extensions,
-        )? {
-            return Ok(resolved);
-        }
-    }
-
-    Err(SandboxError::ModuleNotFound {
-        specifier: specifier.to_string(),
-    })
-}
-
-fn resolve_bare_node_module_with_lookup_paths(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    mode: NodeResolveMode,
-    paths: &[String],
-    extensions: Option<&[String]>,
-) -> Result<String, SandboxError> {
-    let (package_name, subpath) = split_package_request(specifier)?;
-    let cwd = host.process.borrow().cwd.clone();
-    for lookup_base in paths {
-        let normalized = if lookup_base.starts_with('/') {
-            normalize_node_path(lookup_base)
-        } else {
-            normalize_node_path(&format!("{cwd}/{lookup_base}"))
-        };
-        for directory in node_module_lookup_paths_from(host, &normalized)? {
-            let package_root = normalize_node_path(&format!("{directory}/{package_name}"));
-            if let Some(resolved) = resolve_package_entry_from_directory(
-                host,
-                &package_root,
-                subpath.as_deref(),
-                mode,
-                extensions,
-            )? {
-                return Ok(resolved);
-            }
-        }
-    }
-
-    Err(SandboxError::ModuleNotFound {
-        specifier: specifier.to_string(),
-    })
-}
-
-fn resolve_package_import_from_referrer(
-    host: &NodeRuntimeHost,
-    specifier: &str,
-    referrer: Option<&str>,
-    mode: NodeResolveMode,
-    extensions: Option<&[String]>,
-) -> Result<String, SandboxError> {
-    let referrer = referrer.ok_or_else(|| SandboxError::InvalidModuleSpecifier {
-        specifier: specifier.to_string(),
-    })?;
-    let package_root =
-        find_nearest_package_root(host, referrer)?.ok_or_else(|| SandboxError::ModuleNotFound {
-            specifier: specifier.to_string(),
-        })?;
-    let package_json_path = normalize_node_path(&format!("{package_root}/package.json"));
-    let package_json = read_package_json(host, &package_json_path)?.ok_or_else(|| {
-        SandboxError::ModuleNotFound {
-            specifier: specifier.to_string(),
-        }
-    })?;
-    let imports = package_json
-        .get("imports")
-        .ok_or_else(|| SandboxError::ModuleNotFound {
-            specifier: specifier.to_string(),
-        })?;
-    let target = select_package_map_target(imports, specifier, mode).ok_or_else(|| {
-        SandboxError::ModuleNotFound {
-            specifier: specifier.to_string(),
-        }
-    })?;
-    resolve_package_target(host, &package_root, &target, mode, extensions)?.ok_or_else(|| {
-        SandboxError::ModuleNotFound {
-            specifier: specifier.to_string(),
-        }
-    })
-}
-
-fn find_nearest_package_root(
-    host: &NodeRuntimeHost,
-    referrer: &str,
-) -> Result<Option<String>, SandboxError> {
-    let base = directory_for_path(referrer);
-    if let Some(cached) = host
-        .module_graph
-        .borrow()
-        .nearest_package_root_cache
-        .get(&base)
-        .cloned()
-    {
-        return Ok(cached);
-    }
-    for directory in ancestor_directories_to_root(&base) {
-        let package_json_path = normalize_node_path(&format!("{directory}/package.json"));
-        if read_package_json(host, &package_json_path)?.is_some() {
-            host.module_graph
-                .borrow_mut()
-                .nearest_package_root_cache
-                .insert(base, Some(directory.clone()));
-            node_sync_live_module_cache_budget(host)?;
-            return Ok(Some(directory));
-        }
-    }
-    host.module_graph
-        .borrow_mut()
-        .nearest_package_root_cache
-        .insert(base, None);
-    node_sync_live_module_cache_budget(host)?;
-    Ok(None)
-}
-
-fn resolve_package_entry_from_directory(
-    host: &NodeRuntimeHost,
-    package_root: &str,
-    subpath: Option<&str>,
-    mode: NodeResolveMode,
-    extensions: Option<&[String]>,
-) -> Result<Option<String>, SandboxError> {
-    let cache_key = NodePackageEntryCacheKey {
-        package_root: package_root.to_string(),
-        subpath: subpath.map(str::to_string),
-        mode,
-        extensions: normalize_require_extensions(extensions),
-    };
-    if let Some(cached) = host
-        .module_graph
-        .borrow()
-        .package_entry_cache
-        .get(&cache_key)
-        .cloned()
-    {
-        return Ok(cached);
-    }
-
-    node_debug_event(
-        host,
-        "resolve",
-        format!(
-            "package_entry package_root={package_root} subpath={}",
-            subpath.unwrap_or("<root>")
-        ),
-    )?;
-    let Some(stats) = node_graph_stat(host, package_root)? else {
-        host.module_graph
-            .borrow_mut()
-            .package_entry_cache
-            .insert(cache_key, None);
-        node_sync_live_module_cache_budget(host)?;
-        return Ok(None);
-    };
-    if stats.kind != FileKind::Directory {
-        host.module_graph
-            .borrow_mut()
-            .package_entry_cache
-            .insert(cache_key, None);
-        node_sync_live_module_cache_budget(host)?;
-        return Ok(None);
-    }
-
-    let package_json_path = normalize_node_path(&format!("{package_root}/package.json"));
-    let package_json = read_package_json(host, &package_json_path)?;
-
-    let resolved = if let Some(subpath) = subpath {
-        if let Some(package_json) = package_json.as_ref() {
-            let export_key = format!("./{subpath}");
-            if let Some(exports) = package_json.get("exports") {
-                if let Some(target) = select_package_map_target(exports, &export_key, mode) {
-                    if let Some(resolved) =
-                        resolve_package_target(host, package_root, &target, mode, extensions)?
-                    {
-                        host.module_graph
-                            .borrow_mut()
-                            .package_entry_cache
-                            .insert(cache_key, Some(resolved.clone()));
-                        node_sync_live_module_cache_budget(host)?;
-                        return Ok(Some(resolved));
-                    }
-                }
-            }
-        }
-        resolve_as_file_or_directory(
-            host,
-            &normalize_node_path(&format!("{package_root}/{subpath}")),
-            mode,
-            extensions,
-        )?
-    } else {
-        let mut resolved = None;
-
-        if let Some(package_json) = package_json.as_ref() {
-            if let Some(target) = package_json
-                .get("exports")
-                .and_then(|value| select_package_map_target(value, ".", mode))
-            {
-                if let Some(found) =
-                    resolve_package_target(host, package_root, &target, mode, extensions)?
-                {
-                    resolved = Some(found);
-                }
-            }
-
-            if resolved.is_none() {
-                if let Some(target) = package_json.get("main").and_then(|value| value.as_str()) {
-                    let candidate = normalize_node_path(&format!("{package_root}/{target}"));
-                    resolved = resolve_as_file_or_directory(host, &candidate, mode, extensions)?;
-                }
-            }
-        }
-
-        if resolved.is_none() {
-            resolved = resolve_as_file_or_directory(
-                host,
-                &normalize_node_path(&format!("{package_root}/index")),
-                mode,
-                extensions,
-            )?;
-        }
-
-        resolved
-    };
-    host.module_graph
-        .borrow_mut()
-        .package_entry_cache
-        .insert(cache_key, resolved.clone());
-    node_sync_live_module_cache_budget(host)?;
-    Ok(resolved)
-}
-
-fn resolve_package_target(
-    host: &NodeRuntimeHost,
-    package_root: &str,
-    target: &str,
-    mode: NodeResolveMode,
-    extensions: Option<&[String]>,
-) -> Result<Option<String>, SandboxError> {
-    if target.starts_with("./") || target.starts_with("../") {
-        return resolve_as_file_or_directory(
-            host,
-            &normalize_node_path(&format!("{package_root}/{target}")),
-            mode,
-            extensions,
-        );
-    }
-    if target.starts_with('/') {
-        return resolve_as_file_or_directory(host, &normalize_node_path(target), mode, extensions);
-    }
-    let package_referrer = format!("{package_root}/package.json");
-    resolve_node_module_path(host, target, Some(&package_referrer), mode, extensions).map(Some)
-}
-
-fn resolve_as_file_or_directory(
-    host: &NodeRuntimeHost,
-    base: &str,
-    mode: NodeResolveMode,
-    extensions: Option<&[String]>,
-) -> Result<Option<String>, SandboxError> {
-    let cache_key = NodeFileOrDirectoryCacheKey {
-        base: base.to_string(),
-        mode,
-        extensions: normalize_require_extensions(extensions),
-    };
-    if let Some(cached) = host
-        .module_graph
-        .borrow()
-        .file_or_directory_cache
-        .get(&cache_key)
-        .cloned()
-    {
-        return Ok(cached);
-    }
-    node_debug_event(host, "resolve", format!("file_or_directory base={base}"))?;
-    let resolved_extensions = normalize_require_extensions(extensions);
-    for candidate in candidate_module_paths(base, &resolved_extensions) {
-        let Some(stats) = node_graph_stat(host, &candidate)? else {
-            continue;
-        };
-        match stats.kind {
-            FileKind::File => {
-                host.module_graph
-                    .borrow_mut()
-                    .file_or_directory_cache
-                    .insert(cache_key, Some(candidate.clone()));
-                node_sync_live_module_cache_budget(host)?;
-                return Ok(Some(candidate));
-            }
-            FileKind::Directory => {
-                if let Some(resolved) =
-                    resolve_package_entry_from_directory(host, &candidate, None, mode, extensions)?
-                {
-                    host.module_graph
-                        .borrow_mut()
-                        .file_or_directory_cache
-                        .insert(cache_key, Some(resolved.clone()));
-                    node_sync_live_module_cache_budget(host)?;
-                    return Ok(Some(resolved));
-                }
-            }
-            _ => {}
-        }
-    }
-    host.module_graph
-        .borrow_mut()
-        .file_or_directory_cache
-        .insert(cache_key, None);
-    node_sync_live_module_cache_budget(host)?;
-    Ok(None)
-}
-
-fn load_node_module_from_path(
-    host: &NodeRuntimeHost,
-    path: &str,
-) -> Result<NodeLoadedModule, SandboxError> {
-    node_debug_event(host, "load", format!("load_module {path}"))?;
-    let bytes = node_graph_read_file(host, path)?.ok_or_else(|| SandboxError::ModuleNotFound {
-        specifier: path.to_string(),
-    })?;
-    let source = String::from_utf8(bytes).map_err(|error| SandboxError::Execution {
-        entrypoint: path.to_string(),
-        message: error.to_string(),
-    })?;
-    let kind = node_module_kind_for_path(host, path)?;
-    let media_type = match kind {
-        NodeResolvedKind::Json => "application/json",
-        _ => "text/javascript",
-    }
-    .to_string();
-    Ok(NodeLoadedModule {
-        runtime_path: path.to_string(),
-        media_type: media_type.clone(),
-        kind,
-        source,
-    })
-}
-
-fn read_package_json(
-    host: &NodeRuntimeHost,
-    path: &str,
-) -> Result<Option<serde_json::Value>, SandboxError> {
-    if let Some(cached) = host
-        .module_graph
-        .borrow()
-        .package_json_cache
-        .get(path)
-        .cloned()
-    {
-        return Ok(cached);
-    }
-    let Some(bytes) = node_graph_read_file(host, path)? else {
-        host.module_graph
-            .borrow_mut()
-            .package_json_cache
-            .insert(path.to_string(), None);
-        node_sync_live_module_cache_budget(host)?;
-        return Ok(None);
-    };
-    let text = String::from_utf8(bytes).map_err(|error| SandboxError::Service {
-        service: "node_runtime",
-        message: format!("package manifest {path} is not valid UTF-8: {error}"),
-    })?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&text).map_err(|error| SandboxError::Service {
-            service: "node_runtime",
-            message: format!("package manifest {path} is invalid JSON: {error}"),
-        })?;
-    host.module_graph
-        .borrow_mut()
-        .package_json_cache
-        .insert(path.to_string(), Some(parsed.clone()));
-    node_sync_live_module_cache_budget(host)?;
-    Ok(Some(parsed))
-}
-
 fn split_package_request(specifier: &str) -> Result<(String, Option<String>), SandboxError> {
     if specifier.is_empty() {
         return Err(SandboxError::InvalidModuleSpecifier {
@@ -28548,79 +28183,6 @@ fn match_pattern_key(pattern: &str, request: &str) -> Option<String> {
         .strip_prefix(prefix)?
         .strip_suffix(suffix)
         .map(|capture| capture.to_string())
-}
-
-fn node_module_kind_for_path(
-    host: &NodeRuntimeHost,
-    path: &str,
-) -> Result<NodeResolvedKind, SandboxError> {
-    if let Some(cached) = host
-        .module_graph
-        .borrow()
-        .module_kind_cache
-        .get(path)
-        .copied()
-    {
-        return Ok(cached);
-    }
-    let kind: NodeResolvedKind = match PathBuf::from(path).extension().and_then(|ext| ext.to_str())
-    {
-        Some("json") => NodeResolvedKind::Json,
-        Some("mjs") => NodeResolvedKind::EsModule,
-        Some("cjs") => NodeResolvedKind::CommonJs,
-        Some("js") => {
-            let package_type = nearest_package_type(host, path)?;
-            if package_type.as_deref() == Some("module") {
-                NodeResolvedKind::EsModule
-            } else {
-                NodeResolvedKind::CommonJs
-            }
-        }
-        _ => NodeResolvedKind::CommonJs,
-    };
-    host.module_graph
-        .borrow_mut()
-        .module_kind_cache
-        .insert(path.to_string(), kind);
-    node_sync_live_module_cache_budget(host)?;
-    Ok(kind)
-}
-
-fn nearest_package_type(
-    host: &NodeRuntimeHost,
-    path: &str,
-) -> Result<Option<String>, SandboxError> {
-    let base = directory_for_path(path);
-    if let Some(cached) = host
-        .module_graph
-        .borrow()
-        .nearest_package_type_cache
-        .get(&base)
-        .cloned()
-    {
-        return Ok(cached);
-    }
-    for directory in ancestor_directories_to_root(&base) {
-        let package_json_path = normalize_node_path(&format!("{directory}/package.json"));
-        if let Some(package_json) = read_package_json(host, &package_json_path)? {
-            let resolved = package_json
-                .get("type")
-                .and_then(|value| value.as_str())
-                .map(str::to_string);
-            host.module_graph
-                .borrow_mut()
-                .nearest_package_type_cache
-                .insert(base, resolved.clone());
-            node_sync_live_module_cache_budget(host)?;
-            return Ok(resolved);
-        }
-    }
-    host.module_graph
-        .borrow_mut()
-        .nearest_package_type_cache
-        .insert(base, None);
-    node_sync_live_module_cache_budget(host)?;
-    Ok(None)
 }
 
 fn normalize_require_extensions(extensions: Option<&[String]>) -> Vec<String> {
