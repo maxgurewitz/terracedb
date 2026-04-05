@@ -13,6 +13,7 @@ use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
 use turmoil::net::{TcpListener, TcpStream};
 
 use terracedb::{
@@ -1913,6 +1914,28 @@ pub struct SeededSimulationRunner {
     hosts: Vec<SimulationHost>,
 }
 
+pub struct SeededSimulationExecution<T> {
+    sim: turmoil::Sim<'static>,
+    result: Arc<Mutex<Option<turmoil::Result<T>>>>,
+}
+
+impl<T> SeededSimulationExecution<T> {
+    pub fn step(&mut self) -> turmoil::Result<bool> {
+        self.sim.step()
+    }
+
+    pub fn run(mut self) -> turmoil::Result<T> {
+        self.sim.run()?;
+        self.finish()
+    }
+
+    pub fn finish(self) -> turmoil::Result<T> {
+        lock(&self.result)
+            .take()
+            .unwrap_or_else(|| Err("simulation client did not produce a result".into()))
+    }
+}
+
 impl SeededSimulationRunner {
     pub fn new(seed: u64) -> Self {
         Self {
@@ -2010,6 +2033,15 @@ impl SeededSimulationRunner {
         F: FnOnce(SimulationContext) -> Fut + 'static,
         Fut: Future<Output = turmoil::Result<T>> + 'static,
     {
+        self.prepare_run(run).run()
+    }
+
+    pub fn prepare_run<T, F, Fut>(&self, run: F) -> SeededSimulationExecution<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(SimulationContext) -> Fut + 'static,
+        Fut: Future<Output = turmoil::Result<T>> + 'static,
+    {
         let mut builder = turmoil_determinism::Builder::new(self.seed);
         builder
             .simulation_duration(self.simulation_duration)
@@ -2019,8 +2051,13 @@ impl SeededSimulationRunner {
             .enable_random_order();
 
         let mut sim = builder.build();
-        sim.host(OBJECT_STORE_HOST, || async move {
-            run_object_store_host().await
+        let (object_store_ready_tx, mut object_store_ready_rx) = watch::channel(false);
+        sim.host(OBJECT_STORE_HOST, {
+            let object_store_ready_tx = object_store_ready_tx.clone();
+            move || {
+                let object_store_ready_tx = object_store_ready_tx.clone();
+                async move { run_object_store_host(object_store_ready_tx).await }
+            }
         });
         for host in self.hosts.clone() {
             let name = host.name.clone();
@@ -2044,8 +2081,50 @@ impl SeededSimulationRunner {
             );
 
             context.record(TraceEvent::ScenarioStarted { seed });
+            if !*object_store_ready_rx.borrow() {
+                object_store_ready_rx.changed().await.map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "object-store host terminated before reporting readiness",
+                    )
+                })?;
+            }
+            context.checkpoint("object-store:ready", BTreeMap::new());
             let user_result = run(context.clone()).await;
+            context.checkpoint(
+                "object-store:shutdown:start",
+                BTreeMap::from([
+                    (
+                        "driver_tcp_streams".to_string(),
+                        turmoil::established_tcp_stream_count().to_string(),
+                    ),
+                    (
+                        "object_store_tcp_streams".to_string(),
+                        turmoil::established_tcp_stream_count_on(OBJECT_STORE_HOST).to_string(),
+                    ),
+                ]),
+            );
             let shutdown_result = context.object_store().shutdown().await;
+            context.checkpoint(
+                "object-store:shutdown:done",
+                BTreeMap::from([
+                    (
+                        "driver_tcp_streams".to_string(),
+                        turmoil::established_tcp_stream_count().to_string(),
+                    ),
+                    (
+                        "object_store_tcp_streams".to_string(),
+                        turmoil::established_tcp_stream_count_on(OBJECT_STORE_HOST).to_string(),
+                    ),
+                    (
+                        "shutdown_result".to_string(),
+                        shutdown_result
+                            .as_ref()
+                            .map(|_| "ok".to_string())
+                            .unwrap_or_else(|error| error.to_string()),
+                    ),
+                ]),
+            );
             *lock(&result_cell) = Some(match user_result {
                 Ok(value) => shutdown_result.map(|()| value).map_err(Into::into),
                 Err(error) => Err(error),
@@ -2053,10 +2132,7 @@ impl SeededSimulationRunner {
             Ok(())
         });
 
-        sim.run()?;
-        lock(&result)
-            .take()
-            .unwrap_or_else(|| Err("simulation client did not produce a result".into()))
+        SeededSimulationExecution { sim, result }
     }
 }
 
@@ -2962,8 +3038,9 @@ impl RemoteStorageError {
     }
 }
 
-async fn run_object_store_host() -> turmoil::Result {
+async fn run_object_store_host(ready_tx: watch::Sender<bool>) -> turmoil::Result {
     let listener = TcpListener::bind(("0.0.0.0", OBJECT_STORE_PORT)).await?;
+    let _ = ready_tx.send(true);
     let store = Arc::new(Mutex::new(RemoteObjectStoreState::default()));
 
     loop {

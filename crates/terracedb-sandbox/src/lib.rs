@@ -66,6 +66,7 @@ pub use pr::{
 pub use routing::{SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter};
 pub use runtime::{
     DeterministicRuntimeBackend, NodeDebugExecutionOptions, SandboxBatchedDomainMemoryBudget,
+    SandboxNodeRuntimeTraceSnapshot,
     SandboxExecutionKind, SandboxExecutionRequest, SandboxExecutionResult,
     SandboxJsRuntimeBoundaryState, SandboxRuntimeActor, SandboxRuntimeBackend,
     SandboxRuntimeHandle, SandboxRuntimeMemoryBudget, SandboxRuntimeState,

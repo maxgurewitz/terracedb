@@ -301,6 +301,230 @@ impl SimulationHarness {
         cases.sort_by(|left, right| left.case_id.cmp(&right.case_id));
         Ok(SimulationSuiteReport { cases })
     }
+
+    pub fn run_blocking_suite<S>(
+        &self,
+        suite: Arc<S>,
+    ) -> Result<SimulationSuiteReport, SimulationHarnessError>
+    where
+        S: BlockingSimulationSuiteDefinition,
+    {
+        if let Some(domain) = &self.domain {
+            domain
+                .resource_manager
+                .register_domain(domain.domain_spec.clone());
+        }
+        let fixture = suite.prepare_blocking()?;
+        let cases = suite.cases_blocking(fixture.clone())?;
+        if cases.is_empty() {
+            return Ok(SimulationSuiteReport::default());
+        }
+
+        let queue = Arc::new(StdMutex::new(VecDeque::from(cases)));
+        let results = Arc::new(StdMutex::new(Vec::new()));
+        let worker_count = self.config.max_workers.min(queue_len(&queue).max(1));
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for worker_index in 0..worker_count {
+            let suite = suite.clone();
+            let fixture = fixture.clone();
+            let queue = queue.clone();
+            let results = results.clone();
+            let domain = self.domain.clone();
+            workers.push(thread::spawn(move || loop {
+                let Some(case) = pop_case(&queue)? else {
+                    return Ok::<(), SimulationHarnessError>(());
+                };
+                let domain_usage = if let Some(domain) = &domain {
+                    Some(acquire_case_lease_blocking(
+                        domain,
+                        &case.case_id,
+                        case.requested_usage.unwrap_or(domain.default_case_usage),
+                    )?)
+                } else {
+                    None
+                };
+                let started = Instant::now();
+                let status = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    suite.run_case_blocking(
+                        fixture.clone(),
+                        case.clone(),
+                        SimulationCaseContext::with_domain_usage(domain_usage.clone()),
+                    )
+                })) {
+                    Ok(Ok(())) => SimulationCaseStatus::Passed,
+                    Ok(Err(error)) => SimulationCaseStatus::Failed {
+                        message: error.to_string(),
+                    },
+                    Err(payload) => SimulationCaseStatus::Panicked {
+                        message: panic_message(payload.as_ref()),
+                    },
+                };
+                let report = SimulationCaseReport {
+                    case_id: case.case_id,
+                    label: case.label,
+                    status,
+                    elapsed: started.elapsed(),
+                };
+                push_report(&results, report)?;
+                let _ = worker_index;
+            }));
+        }
+
+        for (worker_index, worker) in workers.into_iter().enumerate() {
+            let thread_result =
+                worker
+                    .join()
+                    .map_err(|payload| SimulationHarnessError::WorkerPanicked {
+                        worker_index,
+                        message: panic_message(payload.as_ref()),
+                    })?;
+            thread_result?;
+        }
+
+        let mut cases = results
+            .lock()
+            .map_err(|_| SimulationHarnessError::InternalState {
+                message: "simulation results mutex poisoned".to_string(),
+            })?
+            .clone();
+        cases.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+        Ok(SimulationSuiteReport { cases })
+    }
+
+    pub fn run_stepped_suite<S>(
+        &self,
+        suite: Arc<S>,
+    ) -> Result<SimulationSuiteReport, SimulationHarnessError>
+    where
+        S: SteppedSimulationSuiteDefinition,
+    {
+        if let Some(domain) = &self.domain {
+            domain
+                .resource_manager
+                .register_domain(domain.domain_spec.clone());
+        }
+        let fixture = suite.prepare_stepped()?;
+        let cases = suite.cases_stepped(fixture.clone())?;
+        if cases.is_empty() {
+            return Ok(SimulationSuiteReport::default());
+        }
+
+        let queue = Arc::new(StdMutex::new(VecDeque::from(cases)));
+        let results = Arc::new(StdMutex::new(Vec::new()));
+        let worker_count = self.config.max_workers.min(queue_len(&queue).max(1));
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for worker_index in 0..worker_count {
+            let suite = suite.clone();
+            let fixture = fixture.clone();
+            let queue = queue.clone();
+            let results = results.clone();
+            let domain = self.domain.clone();
+            workers.push(thread::spawn(move || loop {
+                let Some(case) = pop_case(&queue)? else {
+                    return Ok::<(), SimulationHarnessError>(());
+                };
+                let domain_usage = if let Some(domain) = &domain {
+                    Some(acquire_case_lease_blocking(
+                        domain,
+                        &case.case_id,
+                        case.requested_usage.unwrap_or(domain.default_case_usage),
+                    )?)
+                } else {
+                    None
+                };
+                let started = Instant::now();
+                let status = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    suite.start_case_stepped(
+                        fixture.clone(),
+                        case.clone(),
+                        SimulationCaseContext::with_domain_usage(domain_usage.clone()),
+                    )
+                })) {
+                    Ok(Ok(mut execution)) => loop {
+                        if started.elapsed() >= case.timeout {
+                            break SimulationCaseStatus::TimedOut {
+                                after: case.timeout,
+                            };
+                        }
+                        match std::panic::catch_unwind(AssertUnwindSafe(|| execution.step())) {
+                            Ok(Ok(false)) => {
+                                if started.elapsed() >= case.timeout {
+                                    break SimulationCaseStatus::TimedOut {
+                                        after: case.timeout,
+                                    };
+                                }
+                                continue;
+                            }
+                            Ok(Ok(true)) => {
+                                if started.elapsed() >= case.timeout {
+                                    break SimulationCaseStatus::TimedOut {
+                                        after: case.timeout,
+                                    };
+                                }
+                                break match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                    execution.finish()
+                                })) {
+                                    Ok(Ok(())) => SimulationCaseStatus::Passed,
+                                    Ok(Err(error)) => SimulationCaseStatus::Failed {
+                                        message: error.to_string(),
+                                    },
+                                    Err(payload) => SimulationCaseStatus::Panicked {
+                                        message: panic_message(payload.as_ref()),
+                                    },
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                break SimulationCaseStatus::Failed {
+                                    message: error.to_string(),
+                                }
+                            }
+                            Err(payload) => {
+                                break SimulationCaseStatus::Panicked {
+                                    message: panic_message(payload.as_ref()),
+                                }
+                            }
+                        }
+                    },
+                    Ok(Err(error)) => SimulationCaseStatus::Failed {
+                        message: error.to_string(),
+                    },
+                    Err(payload) => SimulationCaseStatus::Panicked {
+                        message: panic_message(payload.as_ref()),
+                    },
+                };
+                let report = SimulationCaseReport {
+                    case_id: case.case_id,
+                    label: case.label,
+                    status,
+                    elapsed: started.elapsed(),
+                };
+                push_report(&results, report)?;
+                let _ = worker_index;
+            }));
+        }
+
+        for (worker_index, worker) in workers.into_iter().enumerate() {
+            let thread_result =
+                worker
+                    .join()
+                    .map_err(|payload| SimulationHarnessError::WorkerPanicked {
+                        worker_index,
+                        message: panic_message(payload.as_ref()),
+                    })?;
+            thread_result?;
+        }
+
+        let mut cases = results
+            .lock()
+            .map_err(|_| SimulationHarnessError::InternalState {
+                message: "simulation results mutex poisoned".to_string(),
+            })?
+            .clone();
+        cases.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+        Ok(SimulationSuiteReport { cases })
+    }
 }
 
 #[async_trait(?Send)]
@@ -321,6 +545,51 @@ pub trait SimulationSuiteDefinition: Send + Sync + 'static {
         case: SimulationCaseSpec<Self::Case>,
         ctx: SimulationCaseContext,
     ) -> Result<(), SimulationHarnessError>;
+}
+
+pub trait BlockingSimulationSuiteDefinition: Send + Sync + 'static {
+    type Fixture: Send + Sync + 'static;
+    type Case: Clone + Send + Sync + 'static;
+
+    fn prepare_blocking(&self) -> Result<Arc<Self::Fixture>, SimulationHarnessError>;
+
+    fn cases_blocking(
+        &self,
+        fixture: Arc<Self::Fixture>,
+    ) -> Result<Vec<SimulationCaseSpec<Self::Case>>, SimulationHarnessError>;
+
+    fn run_case_blocking(
+        &self,
+        fixture: Arc<Self::Fixture>,
+        case: SimulationCaseSpec<Self::Case>,
+        ctx: SimulationCaseContext,
+    ) -> Result<(), SimulationHarnessError>;
+}
+
+pub trait SteppedSimulationCaseExecution: 'static {
+    fn step(&mut self) -> Result<bool, SimulationHarnessError>;
+
+    fn finish(self) -> Result<(), SimulationHarnessError>;
+}
+
+pub trait SteppedSimulationSuiteDefinition: Send + Sync + 'static {
+    type Fixture: Send + Sync + 'static;
+    type Case: Clone + Send + Sync + 'static;
+    type Execution: SteppedSimulationCaseExecution;
+
+    fn prepare_stepped(&self) -> Result<Arc<Self::Fixture>, SimulationHarnessError>;
+
+    fn cases_stepped(
+        &self,
+        fixture: Arc<Self::Fixture>,
+    ) -> Result<Vec<SimulationCaseSpec<Self::Case>>, SimulationHarnessError>;
+
+    fn start_case_stepped(
+        &self,
+        fixture: Arc<Self::Fixture>,
+        case: SimulationCaseSpec<Self::Case>,
+        ctx: SimulationCaseContext,
+    ) -> Result<Self::Execution, SimulationHarnessError>;
 }
 
 #[derive(Debug, Error)]
@@ -380,6 +649,20 @@ async fn acquire_case_lease(
                 ),
             })?;
     }
+}
+
+fn acquire_case_lease_blocking(
+    domain: &SimulationDomainConfig,
+    case_id: &str,
+    requested_usage: ExecutionResourceUsage,
+) -> Result<ExecutionUsageHandle, SimulationHarnessError> {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| SimulationHarnessError::Runtime {
+            message: error.to_string(),
+        })?
+        .block_on(acquire_case_lease(domain, case_id, requested_usage))
 }
 
 fn budget_can_fit(budget: &ExecutionDomainBudget, usage: ExecutionResourceUsage) -> bool {

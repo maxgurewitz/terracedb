@@ -550,6 +550,7 @@ async fn runtime_backend_waits_for_capability_calls_that_yield_once() {
                     ),
                 },
                 metadata: Default::default(),
+                wall_time_timeout_ms: None,
             },
             SandboxRuntimeStateHandle::new(),
         )
@@ -621,6 +622,7 @@ async fn runtime_backend_reuses_inline_eval_cache_for_stable_virtual_specifiers(
             virtual_specifier: Some("terrace:/workspace/.terrace/runtime/reused.mjs".to_string()),
         },
         metadata: Default::default(),
+        wall_time_timeout_ms: None,
     };
 
     let first = backend

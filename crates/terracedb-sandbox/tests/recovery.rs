@@ -1197,6 +1197,7 @@ async fn recovered_runtime_cache_preserves_inline_eval_and_host_service_entries(
             ),
         },
         metadata: Default::default(),
+        wall_time_timeout_ms: None,
     };
     backend
         .execute(&session, &handle, request, SandboxRuntimeStateHandle::new())
@@ -1246,6 +1247,7 @@ async fn recovered_runtime_cache_preserves_inline_eval_and_host_service_entries(
                     ),
                 },
                 metadata: Default::default(),
+                wall_time_timeout_ms: None,
             },
             SandboxRuntimeStateHandle::new(),
         )

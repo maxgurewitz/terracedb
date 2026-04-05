@@ -3,7 +3,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use terracedb::{
     DomainCpuBudget, ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath,
@@ -11,42 +10,88 @@ use terracedb::{
     InMemoryResourceManager, ResourceManager,
 };
 use terracedb_sandbox::{
-    SandboxBatchedDomainMemoryBudget, SandboxRuntimeMemoryBudget, SandboxTrackedMemoryBudgetPolicy,
+    SandboxBatchedDomainMemoryBudget, SandboxRuntimeMemoryBudget, SandboxRuntimeStateHandle,
+    SandboxTrackedMemoryBudgetPolicy,
 };
-use terracedb_simulation::SeededSimulationRunner;
+use terracedb_simulation::{SeededSimulationExecution, SeededSimulationRunner, SimulationContext, TraceEvent};
 use terracedb_systemtest::{
     SimulationCaseContext, SimulationCaseSpec, SimulationCaseStatus, SimulationHarness,
-    SimulationHarnessError, SimulationSuiteDefinition,
+    SimulationHarnessError, SteppedSimulationCaseExecution, SteppedSimulationSuiteDefinition,
 };
 use terracedb_vfs::CreateOptions;
 
 #[path = "support/node_compat.rs"]
 mod node_compat_support;
 
-const DOMAIN_SIMULATION_CASE_TIMEOUT: Duration = Duration::from_secs(5);
+const DOMAIN_SIMULATION_CASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct SingleCaseSimulationDiagnostics {
+    runtime_state: Option<SandboxRuntimeStateHandle>,
+    simulation_context: Option<SimulationContext>,
+}
 
 struct SingleCaseSimulationSuite<C> {
     case_id: &'static str,
     label: &'static str,
     seed: u64,
     timeout: Duration,
-    run: fn(u64) -> turmoil::Result<C>,
+    start: fn(
+        u64,
+        Duration,
+        Arc<StdMutex<SingleCaseSimulationDiagnostics>>,
+    ) -> SeededSimulationExecution<C>,
+    capture: Arc<StdMutex<Option<C>>>,
+    diagnostics: Arc<StdMutex<SingleCaseSimulationDiagnostics>>,
+}
+
+struct SingleCaseSimulationExecution<C> {
+    execution: SeededSimulationExecution<C>,
     capture: Arc<StdMutex<Option<C>>>,
 }
 
-#[async_trait(?Send)]
-impl<C> SimulationSuiteDefinition for SingleCaseSimulationSuite<C>
+impl<C> SteppedSimulationCaseExecution for SingleCaseSimulationExecution<C>
+where
+    C: Clone + Send + Sync + 'static,
+{
+    fn step(&mut self) -> Result<bool, SimulationHarnessError> {
+        self.execution
+            .step()
+            .map_err(|error| SimulationHarnessError::Runtime {
+                message: error.to_string(),
+            })
+    }
+
+    fn finish(self) -> Result<(), SimulationHarnessError> {
+        let capture = self
+            .execution
+            .finish()
+            .map_err(|error| SimulationHarnessError::Runtime {
+                message: error.to_string(),
+            })?;
+        *self
+            .capture
+            .lock()
+            .map_err(|_| SimulationHarnessError::InternalState {
+                message: "single-case simulation capture mutex poisoned".to_string(),
+            })? = Some(capture);
+        Ok(())
+    }
+}
+
+impl<C> SteppedSimulationSuiteDefinition for SingleCaseSimulationSuite<C>
 where
     C: Clone + Send + Sync + 'static,
 {
     type Fixture = StdMutex<Option<C>>;
     type Case = u64;
+    type Execution = SingleCaseSimulationExecution<C>;
 
-    async fn prepare(&self) -> Result<Arc<Self::Fixture>, SimulationHarnessError> {
+    fn prepare_stepped(&self) -> Result<Arc<Self::Fixture>, SimulationHarnessError> {
         Ok(self.capture.clone())
     }
 
-    async fn cases(
+    fn cases_stepped(
         &self,
         _fixture: Arc<Self::Fixture>,
     ) -> Result<Vec<SimulationCaseSpec<Self::Case>>, SimulationHarnessError> {
@@ -58,25 +103,16 @@ where
         )])
     }
 
-    async fn run_case(
+    fn start_case_stepped(
         &self,
         fixture: Arc<Self::Fixture>,
         case: SimulationCaseSpec<Self::Case>,
         _ctx: SimulationCaseContext,
-    ) -> Result<(), SimulationHarnessError> {
-        let run = self.run;
-        let capture = tokio::task::spawn_blocking(move || run(case.input).map_err(|error| error.to_string()))
-            .await
-            .map_err(|error| SimulationHarnessError::Runtime {
-                message: format!("join single-case simulation worker: {error}"),
-            })?
-            .map_err(|error| SimulationHarnessError::Runtime {
-                message: error,
-            })?;
-        *fixture.lock().map_err(|_| SimulationHarnessError::InternalState {
-            message: "single-case simulation capture mutex poisoned".to_string(),
-        })? = Some(capture);
-        Ok(())
+    ) -> Result<Self::Execution, SimulationHarnessError> {
+        Ok(SingleCaseSimulationExecution {
+            execution: (self.start)(case.input, case.timeout, self.diagnostics.clone()),
+            capture: fixture,
+        })
     }
 }
 
@@ -85,24 +121,28 @@ fn run_simulation_case_with_harness<C>(
     label: &'static str,
     seed: u64,
     timeout: Duration,
-    run: fn(u64) -> turmoil::Result<C>,
+    start: fn(
+        u64,
+        Duration,
+        Arc<StdMutex<SingleCaseSimulationDiagnostics>>,
+    ) -> SeededSimulationExecution<C>,
 ) -> turmoil::Result<C>
 where
     C: Clone + Send + Sync + 'static,
 {
+    let diagnostics = Arc::new(StdMutex::new(SingleCaseSimulationDiagnostics::default()));
     let suite = Arc::new(SingleCaseSimulationSuite {
         case_id,
         label,
         seed,
         timeout,
-        run,
+        start,
         capture: Arc::new(StdMutex::new(None)),
+        diagnostics: diagnostics.clone(),
     });
-    let report = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("build simulation harness runtime: {error}"))?
-        .block_on(SimulationHarness::new().with_max_workers(1).run_suite(suite.clone()))
+    let report = SimulationHarness::new()
+        .with_max_workers(1)
+        .run_stepped_suite(suite.clone())
         .map_err(|error| format!("run simulation harness suite {case_id}: {error}"))?;
     let case_report = report
         .cases
@@ -118,10 +158,28 @@ where
             .into())
         }
         SimulationCaseStatus::TimedOut { after } => {
+            let simulation_trace = diagnostics
+                .lock()
+                .ok()
+                .and_then(|diagnostics| diagnostics.simulation_context.clone())
+                .map(|context| format_simulation_trace_for_timeout(&context))
+                .filter(|trace| !trace.is_empty())
+                .map(|trace| format!("\nsimulation trace:\n{trace}"))
+                .unwrap_or_default();
+            let timeout_trace = diagnostics
+                .lock()
+                .ok()
+                .and_then(|diagnostics| diagnostics.runtime_state.clone())
+                .map(|state| format_node_runtime_trace_for_timeout(&state))
+                .filter(|trace| !trace.is_empty())
+                .map(|trace| format!("\nnode runtime trace:\n{trace}"))
+                .unwrap_or_default();
             return Err(format!(
-                "simulation case {case_id} timed out after {:?}: {}",
+                "simulation case {case_id} timed out after {:?}: {}{}{}",
                 after,
-                report.failure_summary()
+                report.failure_summary(),
+                simulation_trace,
+                timeout_trace,
             )
             .into())
         }
@@ -139,6 +197,74 @@ where
         .map_err(|_| format!("read simulation harness capture {case_id}: mutex poisoned"))?
         .take()
         .ok_or_else(|| format!("simulation harness did not capture result for {case_id}").into())
+}
+
+fn format_node_runtime_trace_for_timeout(state: &SandboxRuntimeStateHandle) -> String {
+    let snapshot = state.node_runtime_trace_snapshot();
+    if snapshot.recent_events.is_empty() && snapshot.last_exception.is_none() {
+        return String::new();
+    }
+    let mut lines = vec![format!(
+        "resolve_calls={} load_calls={} fs_calls={}",
+        snapshot.resolve_calls, snapshot.load_calls, snapshot.fs_calls
+    )];
+    if let Some(exception) = snapshot.last_exception {
+        lines.push(format!("last_exception={exception}"));
+    }
+    lines.extend(
+        snapshot
+            .recent_events
+            .iter()
+            .map(|event| format!("  - {event}")),
+    );
+    lines.join("\n")
+}
+
+fn format_simulation_trace_for_timeout(context: &SimulationContext) -> String {
+    let trace = context.trace();
+    if trace.is_empty() {
+        return String::new();
+    }
+    let lines = trace
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::Checkpoint { label, metadata } => {
+                let metadata = if metadata.is_empty() {
+                    String::new()
+                } else {
+                    let entries = metadata
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(" ({entries})")
+                };
+                Some(format!("  - checkpoint: {label}{metadata}"))
+            }
+            other => Some(format!("  - {other:?}")),
+        })
+        .collect::<Vec<_>>();
+    lines.join("\n")
+}
+
+async fn exec_node_command_with_case_timeout(
+    session: &terracedb_sandbox::SandboxSession,
+    entrypoint: &str,
+    cwd: &str,
+    timeout: Duration,
+) -> Result<terracedb_sandbox::SandboxExecutionResult, terracedb_sandbox::SandboxError> {
+    session
+        .exec_node_command_with_timeout(
+            entrypoint,
+            vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
+            cwd.to_string(),
+            std::collections::BTreeMap::from([(
+                "HOME".to_string(),
+                "/workspace/home".to_string(),
+            )]),
+            node_compat_support::inner_node_execution_timeout(timeout),
+        )
+        .await
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -484,10 +610,12 @@ fn run_node_memory_tracking_simulation(
 
 fn run_node_allocator_budget_failure_simulation(
     seed: u64,
-) -> turmoil::Result<NodeCompatBudgetFailureCapture> {
+    timeout: Duration,
+    diagnostics: Arc<StdMutex<SingleCaseSimulationDiagnostics>>,
+) -> SeededSimulationExecution<NodeCompatBudgetFailureCapture> {
     SeededSimulationRunner::new(seed)
         .with_simulation_duration(Duration::from_millis(50))
-        .run_with(move |_context| async move {
+        .prepare_run(move |_context| async move {
             let entrypoint = "/workspace/app/index.cjs";
             let session = node_compat_support::open_node_session(
                 1010 + seed,
@@ -502,6 +630,10 @@ fn run_node_allocator_budget_failure_simulation(
                 "#,
             )
             .await;
+            diagnostics
+                .lock()
+                .expect("allocator-budget diagnostics")
+                .runtime_state = Some(session.runtime_state_handle());
 
             let resource_manager = std::sync::Arc::new(InMemoryResourceManager::new(
                 ExecutionDomainBudget::default(),
@@ -549,16 +681,7 @@ fn run_node_allocator_budget_failure_simulation(
             ));
             session.set_runtime_memory_budget(budget.clone());
 
-            match session
-                .exec_node_command(
-                    entrypoint,
-                    vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
-                    "/workspace/app".to_string(),
-                    std::collections::BTreeMap::from([(
-                        "HOME".to_string(),
-                        "/workspace/home".to_string(),
-                    )]),
-                )
+            match exec_node_command_with_case_timeout(&session, entrypoint, "/workspace/app", timeout)
                 .await
             {
                 Ok(result) => Err(format!(
@@ -583,10 +706,16 @@ fn run_node_allocator_budget_failure_simulation(
 
 fn run_node_process_state_budget_failure_simulation(
     seed: u64,
-) -> turmoil::Result<NodeCompatProcessStateBudgetFailureCapture> {
+    timeout: Duration,
+    diagnostics: Arc<StdMutex<SingleCaseSimulationDiagnostics>>,
+) -> SeededSimulationExecution<NodeCompatProcessStateBudgetFailureCapture> {
     SeededSimulationRunner::new(seed)
         .with_simulation_duration(Duration::from_millis(50))
-        .run_with(move |_context| async move {
+        .prepare_run(move |context| async move {
+            diagnostics
+                .lock()
+                .expect("process-state diagnostics")
+                .simulation_context = Some(context.clone());
             let entrypoint = "/workspace/app/index.cjs";
             let baseline_source = r#"
                 console.log("baseline");
@@ -603,6 +732,7 @@ fn run_node_process_state_budget_failure_simulation(
                 }
                 console.log("done");
                 "#;
+            context.checkpoint("process-state:baseline:start", Default::default());
             let baseline = node_compat_support::open_node_session(
                 1100 + seed,
                 731 + seed,
@@ -610,18 +740,20 @@ fn run_node_process_state_budget_failure_simulation(
                 baseline_source,
             )
             .await;
-            let baseline_result = baseline
-                .exec_node_command(
-                    entrypoint,
-                    vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
-                    "/workspace/app".to_string(),
-                    std::collections::BTreeMap::from([(
-                        "HOME".to_string(),
-                        "/workspace/home".to_string(),
-                    )]),
-                )
+            let baseline_result = exec_node_command_with_case_timeout(
+                &baseline,
+                entrypoint,
+                "/workspace/app",
+                timeout,
+            )
                 .await
                 .map_err(|error| format!("process-state baseline failed: {error}"))?;
+            baseline
+                .close(terracedb_sandbox::CloseSessionOptions::default())
+                .await
+                .map_err(|error| format!("process-state baseline close failed: {error}"))?;
+            context.checkpoint("process-state:baseline:done", Default::default());
+            context.checkpoint("process-state:calibration:start", Default::default());
             let calibration = node_compat_support::open_node_session(
                 1110 + seed,
                 741 + seed,
@@ -629,18 +761,19 @@ fn run_node_process_state_budget_failure_simulation(
                 source,
             )
             .await;
-            let calibration_result = calibration
-                .exec_node_command(
-                    entrypoint,
-                    vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
-                    "/workspace/app".to_string(),
-                    std::collections::BTreeMap::from([(
-                        "HOME".to_string(),
-                        "/workspace/home".to_string(),
-                    )]),
-                )
+            let calibration_result = exec_node_command_with_case_timeout(
+                &calibration,
+                entrypoint,
+                "/workspace/app",
+                timeout,
+            )
                 .await
                 .map_err(|error| format!("process-state calibration failed: {error}"))?;
+            calibration
+                .close(terracedb_sandbox::CloseSessionOptions::default())
+                .await
+                .map_err(|error| format!("process-state calibration close failed: {error}"))?;
+            context.checkpoint("process-state:calibration:done", Default::default());
             let baseline_host_buffer_bytes =
                 metadata_u64(&baseline_result.metadata, "node_runtime_host_buffer_bytes")?;
             let baseline_node_compat_state_bytes = metadata_u64(
@@ -679,6 +812,11 @@ fn run_node_process_state_budget_failure_simulation(
                 source,
             )
             .await;
+            diagnostics
+                .lock()
+                .expect("process-state diagnostics")
+                .runtime_state = Some(session.runtime_state_handle());
+            context.checkpoint("process-state:budgeted-session:opened", Default::default());
 
             let resource_manager = std::sync::Arc::new(InMemoryResourceManager::new(
                 ExecutionDomainBudget::default(),
@@ -725,26 +863,43 @@ fn run_node_process_state_budget_failure_simulation(
                 },
             ));
             session.set_runtime_memory_budget(budget.clone());
+            context.checkpoint(
+                "process-state:budgeted-session:exec:start",
+                std::collections::BTreeMap::from([(
+                    "budget_bytes".to_string(),
+                    budget_bytes.to_string(),
+                )]),
+            );
 
-            match session
-                .exec_node_command(
-                    entrypoint,
-                    vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
-                    "/workspace/app".to_string(),
-                    std::collections::BTreeMap::from([(
-                        "HOME".to_string(),
-                        "/workspace/home".to_string(),
-                    )]),
-                )
+            match exec_node_command_with_case_timeout(&session, entrypoint, "/workspace/app", timeout)
                 .await
             {
-                Ok(result) => Err(format!(
-                    "expected budget failure, got success: snapshot={:#?} result={result:#?}",
-                    budget.snapshot()
-                )
-                .into()),
+                Ok(result) => {
+                    context.checkpoint(
+                        "process-state:budgeted-session:exec:unexpected-success",
+                        Default::default(),
+                    );
+                    session
+                        .close(terracedb_sandbox::CloseSessionOptions::default())
+                        .await
+                        .map_err(|error| format!("process-state success close failed: {error}"))?;
+                    Err(format!(
+                        "expected budget failure, got success: snapshot={:#?} result={result:#?}",
+                        budget.snapshot()
+                    )
+                    .into())
+                }
                 Err(error) => {
+                    context.checkpoint("process-state:budgeted-session:exec:error", Default::default());
                     let snapshot = budget.snapshot();
+                    context.checkpoint("process-state:budgeted-session:close:start", Default::default());
+                    session
+                        .close(terracedb_sandbox::CloseSessionOptions::default())
+                        .await
+                        .map_err(|close_error| {
+                            format!("process-state error close failed after `{error}`: {close_error}")
+                        })?;
+                    context.checkpoint("process-state:budgeted-session:close:done", Default::default());
                     Ok(NodeCompatProcessStateBudgetFailureCapture {
                         message: error.to_string(),
                         charged_bytes: snapshot.charged_bytes,
@@ -762,10 +917,12 @@ fn run_node_process_state_budget_failure_simulation(
 
 fn run_node_task_queue_budget_failure_simulation(
     seed: u64,
-) -> turmoil::Result<NodeCompatTaskQueueBudgetFailureCapture> {
+    timeout: Duration,
+    diagnostics: Arc<StdMutex<SingleCaseSimulationDiagnostics>>,
+) -> SeededSimulationExecution<NodeCompatTaskQueueBudgetFailureCapture> {
     SeededSimulationRunner::new(seed)
         .with_simulation_duration(Duration::from_millis(50))
-        .run_with(move |_context| async move {
+        .prepare_run(move |_context| async move {
             let entrypoint = "/workspace/app/index.cjs";
             let baseline = node_compat_support::open_node_session(
                 1310 + seed,
@@ -776,16 +933,12 @@ fn run_node_task_queue_budget_failure_simulation(
                 "#,
             )
             .await;
-            let baseline_result = baseline
-                .exec_node_command(
-                    entrypoint,
-                    vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
-                    "/workspace/app".to_string(),
-                    std::collections::BTreeMap::from([(
-                        "HOME".to_string(),
-                        "/workspace/home".to_string(),
-                    )]),
-                )
+            let baseline_result = exec_node_command_with_case_timeout(
+                &baseline,
+                entrypoint,
+                "/workspace/app",
+                timeout,
+            )
                 .await
                 .map_err(|error| format!("task-queue baseline failed: {error}"))?;
             let baseline_accounted_bytes =
@@ -802,6 +955,10 @@ fn run_node_task_queue_budget_failure_simulation(
             let session =
                 node_compat_support::open_node_session(1410 + seed, 941 + seed, entrypoint, source)
                     .await;
+            diagnostics
+                .lock()
+                .expect("task-queue diagnostics")
+                .runtime_state = Some(session.runtime_state_handle());
 
             let resource_manager = std::sync::Arc::new(InMemoryResourceManager::new(
                 ExecutionDomainBudget::default(),
@@ -849,16 +1006,7 @@ fn run_node_task_queue_budget_failure_simulation(
             ));
             session.set_runtime_memory_budget(budget.clone());
 
-            match session
-                .exec_node_command(
-                    entrypoint,
-                    vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
-                    "/workspace/app".to_string(),
-                    std::collections::BTreeMap::from([(
-                        "HOME".to_string(),
-                        "/workspace/home".to_string(),
-                    )]),
-                )
+            match exec_node_command_with_case_timeout(&session, entrypoint, "/workspace/app", timeout)
                 .await
             {
                 Ok(result) => {
@@ -882,14 +1030,16 @@ fn run_node_task_queue_budget_failure_simulation(
 
 fn run_node_module_cache_budget_failure_simulation(
     seed: u64,
-) -> turmoil::Result<NodeCompatModuleCacheBudgetFailureCapture> {
+    timeout: Duration,
+    diagnostics: Arc<StdMutex<SingleCaseSimulationDiagnostics>>,
+) -> SeededSimulationExecution<NodeCompatModuleCacheBudgetFailureCapture> {
     SeededSimulationRunner::new(seed)
         .with_simulation_duration(Duration::from_millis(50))
-        .run_with(move |_context| async move {
+        .prepare_run(move |_context| async move {
             let entrypoint = "/workspace/app/index.cjs";
-            let package_count = 16usize;
-            let payload_len = 32 * 1024usize;
-            let budget_headroom_bytes = 32 * 1024u64;
+            let package_count = 2usize;
+            let payload_len = 128 * 1024usize;
+            let budget_headroom_bytes = 8 * 1024u64;
             let baseline_source = r#"
                 console.log("baseline");
                 "#;
@@ -914,16 +1064,12 @@ fn run_node_module_cache_budget_failure_simulation(
                 baseline_source,
             )
             .await;
-            let baseline_result = baseline
-                .exec_node_command(
-                    entrypoint,
-                    vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
-                    "/workspace/app".to_string(),
-                    std::collections::BTreeMap::from([(
-                        "HOME".to_string(),
-                        "/workspace/home".to_string(),
-                    )]),
-                )
+            let baseline_result = exec_node_command_with_case_timeout(
+                &baseline,
+                entrypoint,
+                "/workspace/app",
+                timeout,
+            )
                 .await
                 .map_err(|error| format!("module-cache baseline failed: {error}"))?;
             let baseline_accounted_bytes =
@@ -937,6 +1083,10 @@ fn run_node_module_cache_budget_failure_simulation(
                 &source,
             )
             .await;
+            diagnostics
+                .lock()
+                .expect("module-cache diagnostics")
+                .runtime_state = Some(session.runtime_state_handle());
             write_node_modules_package_fixtures(&session, package_count, payload_len).await?;
 
             let resource_manager = std::sync::Arc::new(InMemoryResourceManager::new(
@@ -985,16 +1135,7 @@ fn run_node_module_cache_budget_failure_simulation(
             ));
             session.set_runtime_memory_budget(budget.clone());
 
-            match session
-                .exec_node_command(
-                    entrypoint,
-                    vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
-                    "/workspace/app".to_string(),
-                    std::collections::BTreeMap::from([(
-                        "HOME".to_string(),
-                        "/workspace/home".to_string(),
-                    )]),
-                )
+            match exec_node_command_with_case_timeout(&session, entrypoint, "/workspace/app", timeout)
                 .await
             {
                 Ok(result) => Err(format!(

@@ -37,6 +37,7 @@ const GENERATED_UPSTREAM_NODE_TOTAL_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024
 const GENERATED_UPSTREAM_NODE_MIN_CASE_MEMORY_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
 const GENERATED_UPSTREAM_NODE_CASE_MEMORY_HEADROOM_MULTIPLIER: u64 = 2;
 const GENERATED_UPSTREAM_NODE_ALLOCATION_BATCH_BYTES: u64 = 4 * 1024 * 1024;
+const NODE_EXECUTION_TIMEOUT_HEADROOM: Duration = Duration::from_millis(250);
 static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 static SHARED_UPSTREAM_NODE_HARNESS: OnceCell<SandboxHarness<InMemoryVfsStore>> =
     OnceCell::const_new();
@@ -120,6 +121,7 @@ async fn exec_upstream_node_test_in_harness(
     harness: &SandboxHarness<InMemoryVfsStore>,
     base_volume_id: VolumeId,
     entrypoint: &str,
+    wall_time_timeout: Option<Duration>,
     memory_budget: Option<Arc<dyn SandboxRuntimeMemoryBudget>>,
 ) -> Result<terracedb_sandbox::SandboxExecutionResult, SandboxError> {
     let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
@@ -144,17 +146,38 @@ async fn exec_upstream_node_test_in_harness(
     if let Some(memory_budget) = memory_budget {
         session.set_runtime_memory_budget(memory_budget);
     }
-    session
-        .exec_node_command(
-            &runtime_entrypoint,
-            vec!["/usr/bin/node".to_string(), runtime_entrypoint.clone()],
-            "/node/test/parallel".to_string(),
-            BTreeMap::from([
-                ("HOME".to_string(), "/workspace/home".to_string()),
-                ("NODE_SKIP_FLAG_CHECK".to_string(), "1".to_string()),
-            ]),
-        )
-        .await
+    let argv = vec!["/usr/bin/node".to_string(), runtime_entrypoint.clone()];
+    let env = BTreeMap::from([
+        ("HOME".to_string(), "/workspace/home".to_string()),
+        ("NODE_SKIP_FLAG_CHECK".to_string(), "1".to_string()),
+    ]);
+    if let Some(timeout) = wall_time_timeout.map(inner_node_execution_timeout) {
+        session
+            .exec_node_command_with_timeout(
+                &runtime_entrypoint,
+                argv,
+                "/node/test/parallel".to_string(),
+                env,
+                timeout,
+            )
+            .await
+    } else {
+        session
+            .exec_node_command(
+                &runtime_entrypoint,
+                argv,
+                "/node/test/parallel".to_string(),
+                env,
+            )
+            .await
+    }
+}
+
+pub fn inner_node_execution_timeout(timeout: Duration) -> Duration {
+    timeout
+        .checked_sub(NODE_EXECUTION_TIMEOUT_HEADROOM)
+        .filter(|timeout| !timeout.is_zero())
+        .unwrap_or(timeout)
 }
 
 pub async fn open_node_session(
@@ -240,7 +263,14 @@ pub async fn exec_upstream_node_test(
     entrypoint: &str,
 ) -> Result<terracedb_sandbox::SandboxExecutionResult, SandboxError> {
     let harness = shared_upstream_node_harness().await;
-    exec_upstream_node_test_in_harness(harness, CACHED_NODE_BASE_VOLUME_ID, entrypoint, None).await
+    exec_upstream_node_test_in_harness(
+        harness,
+        CACHED_NODE_BASE_VOLUME_ID,
+        entrypoint,
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn run_generated_upstream_node_suite(
@@ -307,6 +337,7 @@ async fn calibrate_generated_upstream_node_budget(
         &harness,
         CACHED_NODE_BASE_VOLUME_ID,
         calibration_case.path,
+        Some(Duration::from_secs(calibration_case.timeout_secs)),
         None,
     )
     .await
@@ -490,6 +521,7 @@ impl SimulationSuiteDefinition for GeneratedUpstreamNodeSuite {
             fixture.harness.as_ref(),
             fixture.base_volume_id,
             case.input.path,
+            Some(case.timeout),
             memory_budget,
         )
         .await

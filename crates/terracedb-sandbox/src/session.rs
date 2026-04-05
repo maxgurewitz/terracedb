@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -646,6 +647,22 @@ impl SandboxSession {
         .await
     }
 
+    pub async fn exec_node_command_with_timeout(
+        &self,
+        entrypoint: impl Into<String>,
+        argv: Vec<String>,
+        cwd: impl Into<String>,
+        env: BTreeMap<String, String>,
+        timeout: Duration,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        self.execute_runtime_logged(
+            "sandbox.runtime.exec_node_command",
+            SandboxExecutionRequest::node_command(entrypoint, argv, cwd, env)
+                .with_wall_time_timeout(timeout),
+        )
+        .await
+    }
+
     pub async fn exec_node_command_with_debug(
         &self,
         entrypoint: impl Into<String>,
@@ -673,6 +690,7 @@ impl SandboxSession {
                 virtual_specifier,
             },
             metadata: BTreeMap::new(),
+            wall_time_timeout_ms: None,
         })
         .await
     }

@@ -475,6 +475,7 @@ fn run_runtime_simulation(seed: u64) -> turmoil::Result<SandboxRuntimeSimulation
                     ),
                 },
                 metadata: Default::default(),
+                wall_time_timeout_ms: None,
             };
             let first_eval = backend
                 .execute(&session, &handle, eval_request.clone(), state.clone())

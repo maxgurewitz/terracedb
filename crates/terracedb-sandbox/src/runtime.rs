@@ -7,10 +7,15 @@ use std::{
     net::ToSocketAddrs,
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread_local,
+    time::{Duration, Instant},
 };
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use base64::{
     Engine as _,
@@ -240,6 +245,14 @@ struct NodeRuntimeHost {
     next_child_pid: Rc<RefCell<u32>>,
     zlib_streams: Rc<RefCell<NodeZlibStreamTable>>,
     bootstrap: Rc<RefCell<NodeBootstrapState>>,
+    execution_timeout: Option<NodeExecutionTimeout>,
+}
+
+#[derive(Clone, Debug)]
+struct NodeExecutionTimeout {
+    deadline: Instant,
+    timeout: Duration,
+    entrypoint: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -891,6 +904,17 @@ struct NodeRuntimeDebugTrace {
     structured_events: Vec<NodeRuntimeTraceEvent>,
     recent_events: Vec<String>,
     last_exception: Option<NodeRuntimeExceptionSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxNodeRuntimeTraceSnapshot {
+    pub resolve_calls: u64,
+    pub load_calls: u64,
+    pub fs_calls: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_events: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exception: Option<JsonValue>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -1792,6 +1816,8 @@ pub struct NodeDebugExecutionOptions {
 pub struct SandboxExecutionRequest {
     pub kind: SandboxExecutionKind,
     pub metadata: BTreeMap<String, JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_timeout_ms: Option<u64>,
 }
 
 impl SandboxExecutionRequest {
@@ -1801,6 +1827,7 @@ impl SandboxExecutionRequest {
                 specifier: specifier.into(),
             },
             metadata: BTreeMap::new(),
+            wall_time_timeout_ms: None,
         }
     }
 
@@ -1811,6 +1838,7 @@ impl SandboxExecutionRequest {
                 virtual_specifier: None,
             },
             metadata: BTreeMap::new(),
+            wall_time_timeout_ms: None,
         }
     }
 
@@ -1828,7 +1856,15 @@ impl SandboxExecutionRequest {
                 env,
             },
             metadata: BTreeMap::new(),
+            wall_time_timeout_ms: None,
         }
+    }
+
+    pub fn with_wall_time_timeout(mut self, timeout: Duration) -> Self {
+        self.wall_time_timeout_ms = Some(
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        );
+        self
     }
 
     pub fn with_node_debug(mut self, options: NodeDebugExecutionOptions) -> Self {
@@ -1952,9 +1988,9 @@ pub trait SandboxRuntimeMemoryBudget: Send + Sync {
     fn snapshot(&self) -> SandboxTrackedMemoryBudgetSnapshot;
 }
 
-#[derive(Debug)]
-struct SandboxBatchedDomainMemoryBudgetState {
-    snapshot: SandboxTrackedMemoryBudgetSnapshot,
+#[derive(Clone)]
+struct SandboxRuntimeMemoryBudgetHandle {
+    budget: Arc<dyn SandboxRuntimeMemoryBudget>,
 }
 
 #[derive(Clone)]
@@ -1962,7 +1998,7 @@ pub struct SandboxBatchedDomainMemoryBudget {
     domain_usage: ExecutionUsageHandle,
     base_usage: ExecutionResourceUsage,
     policy: SandboxTrackedMemoryBudgetPolicy,
-    state: Arc<StdMutex<SandboxBatchedDomainMemoryBudgetState>>,
+    snapshot: Arc<ArcSwap<SandboxTrackedMemoryBudgetSnapshot>>,
 }
 
 impl SandboxBatchedDomainMemoryBudget {
@@ -1976,16 +2012,14 @@ impl SandboxBatchedDomainMemoryBudget {
             domain_usage,
             base_usage,
             policy,
-            state: Arc::new(StdMutex::new(SandboxBatchedDomainMemoryBudgetState {
-                snapshot: SandboxTrackedMemoryBudgetSnapshot {
-                    current: SandboxTrackedMemoryUsage::default(),
-                    peak_bytes: 0,
-                    budget_bytes: policy.budget_bytes,
-                    charged_bytes: 0,
-                    allocation_batch_bytes: policy.allocation_batch_bytes,
-                    batch_requests: 0,
-                    terminated_for_budget: false,
-                },
+            snapshot: Arc::new(ArcSwap::from_pointee(SandboxTrackedMemoryBudgetSnapshot {
+                current: SandboxTrackedMemoryUsage::default(),
+                peak_bytes: 0,
+                budget_bytes: policy.budget_bytes,
+                charged_bytes: 0,
+                allocation_batch_bytes: policy.allocation_batch_bytes,
+                batch_requests: 0,
+                terminated_for_budget: false,
             })),
         }
     }
@@ -1994,11 +2028,11 @@ impl SandboxBatchedDomainMemoryBudget {
         self.policy
     }
 
-    fn sync_usage_locked(
+    fn sync_usage(
         &self,
-        state: &mut SandboxBatchedDomainMemoryBudgetState,
+        previous: &SandboxTrackedMemoryBudgetSnapshot,
         usage: SandboxTrackedMemoryUsage,
-    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+    ) -> Result<SandboxTrackedMemoryBudgetSnapshot, SandboxTrackedMemoryBudgetExceeded> {
         let batch = self.policy.allocation_batch_bytes.max(1);
         let required_charged_bytes = if usage.total_bytes == 0 {
             0
@@ -2012,59 +2046,64 @@ impl SandboxBatchedDomainMemoryBudget {
         let mut requested_usage = self.base_usage;
         requested_usage.memory_bytes = required_charged_bytes;
 
-        state.snapshot.current = usage.clone();
-        state.snapshot.peak_bytes = state.snapshot.peak_bytes.max(usage.total_bytes);
-        state.snapshot.budget_bytes = self.policy.budget_bytes;
-        state.snapshot.allocation_batch_bytes = batch;
+        let mut next = SandboxTrackedMemoryBudgetSnapshot {
+            current: usage.clone(),
+            peak_bytes: previous.peak_bytes.max(usage.total_bytes),
+            budget_bytes: self.policy.budget_bytes,
+            charged_bytes: previous.charged_bytes,
+            allocation_batch_bytes: batch,
+            batch_requests: previous.batch_requests,
+            terminated_for_budget: previous.terminated_for_budget,
+        };
 
         if let Some(budget_bytes) = self.policy.budget_bytes
             && usage.total_bytes > budget_bytes
         {
-            state.snapshot.terminated_for_budget = true;
+            next.terminated_for_budget = true;
             return Err(SandboxTrackedMemoryBudgetExceeded {
                 usage,
-                peak_bytes: state.snapshot.peak_bytes,
+                peak_bytes: next.peak_bytes,
                 budget_bytes: Some(budget_bytes),
                 message: format!(
                     "tracked memory budget exceeded: current_bytes={} budget_bytes={}",
-                    state.snapshot.current.total_bytes, budget_bytes
+                    next.current.total_bytes, budget_bytes
                 ),
             });
         }
 
-        let previous_charged_bytes = state.snapshot.charged_bytes;
+        let previous_charged_bytes = previous.charged_bytes;
         if required_charged_bytes == previous_charged_bytes {
-            return Ok(());
+            return Ok(next);
         }
 
         match self.domain_usage.checked_set_usage(requested_usage) {
             Ok(decision) if decision.admitted => {
-                state.snapshot.charged_bytes = required_charged_bytes;
+                next.charged_bytes = required_charged_bytes;
                 if required_charged_bytes > previous_charged_bytes {
-                    state.snapshot.batch_requests = state.snapshot.batch_requests.saturating_add(1);
+                    next.batch_requests = next.batch_requests.saturating_add(1);
                 }
-                Ok(())
+                Ok(next)
             }
             Ok(decision) => {
-                state.snapshot.terminated_for_budget = true;
+                next.terminated_for_budget = true;
                 Err(SandboxTrackedMemoryBudgetExceeded {
                     usage,
-                    peak_bytes: state.snapshot.peak_bytes,
+                    peak_bytes: next.peak_bytes,
                     budget_bytes: self.policy.budget_bytes,
                     message: format!(
                         "domain denied tracked memory batch at {}: current_bytes={} charged_bytes={} blocked_by={:?}",
                         self.domain_usage.path(),
-                        state.snapshot.current.total_bytes,
+                        next.current.total_bytes,
                         required_charged_bytes,
                         decision.blocked_by
                     ),
                 })
             }
             Err(error) => {
-                state.snapshot.terminated_for_budget = true;
+                next.terminated_for_budget = true;
                 Err(SandboxTrackedMemoryBudgetExceeded {
                     usage,
-                    peak_bytes: state.snapshot.peak_bytes,
+                    peak_bytes: next.peak_bytes,
                     budget_bytes: self.policy.budget_bytes,
                     message: format!(
                         "updating domain tracked memory usage failed at {}: {error}",
@@ -2081,48 +2120,74 @@ impl SandboxRuntimeMemoryBudget for SandboxBatchedDomainMemoryBudget {
         &self,
         usage: SandboxTrackedMemoryUsage,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        let mut state = self.state.lock().expect("sandbox batched memory budget");
-        self.sync_usage_locked(&mut state, usage)
+        let previous = self.snapshot.load_full();
+        match self.sync_usage(&previous, usage) {
+            Ok(next) => {
+                self.snapshot.store(Arc::new(next));
+                Ok(())
+            }
+            Err(error) => {
+                let mut failed = (*previous).clone();
+                failed.current = error.usage.clone();
+                failed.peak_bytes = failed.peak_bytes.max(error.usage.total_bytes);
+                failed.budget_bytes = self.policy.budget_bytes;
+                failed.allocation_batch_bytes = self.policy.allocation_batch_bytes.max(1);
+                failed.terminated_for_budget = true;
+                self.snapshot.store(Arc::new(failed));
+                Err(error)
+            }
+        }
     }
 
     fn reserve_gc_heap_bytes(&self, bytes: u64) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
         if bytes == 0 {
             return Ok(());
         }
-        let mut state = self.state.lock().expect("sandbox batched memory budget");
-        let non_gc_bytes = state
-            .snapshot
+        let previous = self.snapshot.load_full();
+        let non_gc_bytes = previous
             .current
             .total_bytes
-            .saturating_sub(state.snapshot.current.gc_heap_bytes);
-        let mut usage = state.snapshot.current.clone();
+            .saturating_sub(previous.current.gc_heap_bytes);
+        let mut usage = previous.current.clone();
         usage.gc_heap_bytes = usage.gc_heap_bytes.saturating_add(bytes);
         usage.total_bytes = non_gc_bytes.saturating_add(usage.gc_heap_bytes);
-        self.sync_usage_locked(&mut state, usage)
+        match self.sync_usage(&previous, usage) {
+            Ok(next) => {
+                self.snapshot.store(Arc::new(next));
+                Ok(())
+            }
+            Err(error) => {
+                let mut failed = (*previous).clone();
+                failed.current = error.usage.clone();
+                failed.peak_bytes = failed.peak_bytes.max(error.usage.total_bytes);
+                failed.budget_bytes = self.policy.budget_bytes;
+                failed.allocation_batch_bytes = self.policy.allocation_batch_bytes.max(1);
+                failed.terminated_for_budget = true;
+                self.snapshot.store(Arc::new(failed));
+                Err(error)
+            }
+        }
     }
 
     fn release_gc_heap_bytes(&self, bytes: u64) {
         if bytes == 0 {
             return;
         }
-        let mut state = self.state.lock().expect("sandbox batched memory budget");
-        let non_gc_bytes = state
-            .snapshot
+        let previous = self.snapshot.load_full();
+        let non_gc_bytes = previous
             .current
             .total_bytes
-            .saturating_sub(state.snapshot.current.gc_heap_bytes);
-        let mut usage = state.snapshot.current.clone();
+            .saturating_sub(previous.current.gc_heap_bytes);
+        let mut usage = previous.current.clone();
         usage.gc_heap_bytes = usage.gc_heap_bytes.saturating_sub(bytes);
         usage.total_bytes = non_gc_bytes.saturating_add(usage.gc_heap_bytes);
-        let _ = self.sync_usage_locked(&mut state, usage);
+        if let Ok(next) = self.sync_usage(&previous, usage) {
+            self.snapshot.store(Arc::new(next));
+        }
     }
 
     fn snapshot(&self) -> SandboxTrackedMemoryBudgetSnapshot {
-        self.state
-            .lock()
-            .expect("sandbox batched memory budget")
-            .snapshot
-            .clone()
+        (*self.snapshot.load_full()).clone()
     }
 }
 
@@ -2161,42 +2226,120 @@ struct SandboxRuntimeTrackedMemoryContributions {
 }
 
 #[derive(Default)]
+struct SandboxRuntimeTrackedMemoryCounters {
+    context_runtime_bytes: AtomicU64,
+    module_cache_host_bytes: AtomicU64,
+    module_cache_runtime_state_bytes: AtomicU64,
+    task_queue_bytes: AtomicU64,
+    compiled_code_bytes: AtomicU64,
+    parser_retained_bytes: AtomicU64,
+    host_buffer_static_bytes: AtomicU64,
+    process_stdio_bytes: AtomicU64,
+    node_compat_state_static_bytes: AtomicU64,
+    process_model_bytes: AtomicU64,
+}
+
+impl SandboxRuntimeTrackedMemoryCounters {
+    fn replace(&self, values: SandboxRuntimeTrackedMemoryContributions) {
+        self.context_runtime_bytes
+            .store(values.context_runtime_bytes, Ordering::Relaxed);
+        self.module_cache_host_bytes
+            .store(values.module_cache_host_bytes, Ordering::Relaxed);
+        self.module_cache_runtime_state_bytes
+            .store(values.module_cache_runtime_state_bytes, Ordering::Relaxed);
+        self.task_queue_bytes
+            .store(values.task_queue_bytes, Ordering::Relaxed);
+        self.compiled_code_bytes
+            .store(values.compiled_code_bytes, Ordering::Relaxed);
+        self.parser_retained_bytes
+            .store(values.parser_retained_bytes, Ordering::Relaxed);
+        self.host_buffer_static_bytes
+            .store(values.host_buffer_static_bytes, Ordering::Relaxed);
+        self.process_stdio_bytes
+            .store(values.process_stdio_bytes, Ordering::Relaxed);
+        self.node_compat_state_static_bytes
+            .store(values.node_compat_state_static_bytes, Ordering::Relaxed);
+        self.process_model_bytes
+            .store(values.process_model_bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> SandboxRuntimeTrackedMemoryContributions {
+        SandboxRuntimeTrackedMemoryContributions {
+            context_runtime_bytes: self.context_runtime_bytes.load(Ordering::Relaxed),
+            module_cache_host_bytes: self.module_cache_host_bytes.load(Ordering::Relaxed),
+            module_cache_runtime_state_bytes: self
+                .module_cache_runtime_state_bytes
+                .load(Ordering::Relaxed),
+            task_queue_bytes: self.task_queue_bytes.load(Ordering::Relaxed),
+            compiled_code_bytes: self.compiled_code_bytes.load(Ordering::Relaxed),
+            parser_retained_bytes: self.parser_retained_bytes.load(Ordering::Relaxed),
+            host_buffer_static_bytes: self.host_buffer_static_bytes.load(Ordering::Relaxed),
+            process_stdio_bytes: self.process_stdio_bytes.load(Ordering::Relaxed),
+            node_compat_state_static_bytes: self
+                .node_compat_state_static_bytes
+                .load(Ordering::Relaxed),
+            process_model_bytes: self.process_model_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
 struct SandboxRuntimeStateSidecar {
-    memory_budget: Option<Arc<dyn SandboxRuntimeMemoryBudget>>,
-    tracked_memory: SandboxRuntimeTrackedMemoryContributions,
+    memory_budget: ArcSwapOption<SandboxRuntimeMemoryBudgetHandle>,
+    tracked_memory: SandboxRuntimeTrackedMemoryCounters,
+    node_trace: ArcSwap<SandboxNodeRuntimeTraceSnapshot>,
+}
+
+impl Default for SandboxRuntimeStateSidecar {
+    fn default() -> Self {
+        Self {
+            memory_budget: ArcSwapOption::new(None),
+            tracked_memory: SandboxRuntimeTrackedMemoryCounters::default(),
+            node_trace: ArcSwap::from_pointee(SandboxNodeRuntimeTraceSnapshot::default()),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct SandboxRuntimeStateHandle {
     inner: Arc<Mutex<SandboxRuntimeState>>,
-    sidecar: Arc<StdMutex<SandboxRuntimeStateSidecar>>,
+    published_snapshot: Arc<ArcSwap<SandboxRuntimeState>>,
+    sidecar: Arc<SandboxRuntimeStateSidecar>,
 }
 
 impl SandboxRuntimeStateHandle {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(SandboxRuntimeState::default())),
-            sidecar: Arc::new(StdMutex::new(SandboxRuntimeStateSidecar::default())),
+            published_snapshot: Arc::new(ArcSwap::from_pointee(SandboxRuntimeState::default())),
+            sidecar: Arc::new(SandboxRuntimeStateSidecar::default()),
         }
     }
 
     pub async fn snapshot(&self) -> SandboxRuntimeState {
-        self.inner.lock().await.clone()
+        (*self.published_snapshot.load_full()).clone()
+    }
+
+    pub fn published_snapshot(&self) -> SandboxRuntimeState {
+        (*self.published_snapshot.load_full()).clone()
     }
 
     pub async fn next_eval_specifier(&self, workspace_root: &str) -> String {
-        let mut state = self.inner.lock().await;
-        state.next_eval_id = state.next_eval_id.saturating_add(1);
-        format!(
-            "terrace:{workspace_root}/.terrace/runtime/eval-{}.mjs",
-            state.next_eval_id
-        )
+        let (specifier, snapshot) = {
+            let mut state = self.inner.lock().await;
+            state.next_eval_id = state.next_eval_id.saturating_add(1);
+            let specifier = format!(
+                "terrace:{workspace_root}/.terrace/runtime/eval-{}.mjs",
+                state.next_eval_id
+            );
+            (specifier, state.clone())
+        };
+        self.published_snapshot.store(Arc::new(snapshot));
+        specifier
     }
 
     pub async fn is_module_cache_hit(&self, candidate: &SandboxModuleCacheEntry) -> bool {
-        self.inner
-            .lock()
-            .await
+        self.published_snapshot
+            .load()
             .module_cache
             .get(&candidate.specifier)
             .map(|existing| existing.cache_key == candidate.cache_key)
@@ -2207,11 +2350,12 @@ impl SandboxRuntimeStateHandle {
         &self,
         entry: SandboxModuleCacheEntry,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        let module_cache_bytes = {
+        let (module_cache_bytes, snapshot) = {
             let mut state = self.inner.lock().await;
             state.module_cache.insert(entry.specifier.clone(), entry);
-            node_runtime_state_module_cache_bytes(&state)
+            (node_runtime_state_module_cache_bytes(&state), state.clone())
         };
+        self.published_snapshot.store(Arc::new(snapshot));
         self.sync_live_module_cache_runtime_state_bytes(module_cache_bytes)
     }
 
@@ -2220,48 +2364,58 @@ impl SandboxRuntimeStateHandle {
         entries: Vec<SandboxModuleCacheEntry>,
         next_eval_id: u64,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        let module_cache_bytes = {
+        let (module_cache_bytes, snapshot) = {
             let mut state = self.inner.lock().await;
             for entry in entries {
                 state.module_cache.insert(entry.specifier.clone(), entry);
             }
             state.next_eval_id = state.next_eval_id.max(next_eval_id);
-            node_runtime_state_module_cache_bytes(&state)
+            (node_runtime_state_module_cache_bytes(&state), state.clone())
         };
+        self.published_snapshot.store(Arc::new(snapshot));
         self.sync_live_module_cache_runtime_state_bytes(module_cache_bytes)
     }
 
     pub async fn set_js_boundary(&self, boundary: SandboxJsRuntimeBoundaryState) {
-        self.inner.lock().await.js_boundary = Some(boundary);
+        let snapshot = {
+            let mut state = self.inner.lock().await;
+            state.js_boundary = Some(boundary);
+            state.clone()
+        };
+        self.published_snapshot.store(Arc::new(snapshot));
     }
 
     pub fn set_memory_budget(&self, memory_budget: Option<Arc<dyn SandboxRuntimeMemoryBudget>>) {
-        self.sidecar
-            .lock()
-            .expect("runtime state sidecar")
-            .memory_budget = memory_budget;
+        self.sidecar.memory_budget.store(
+            memory_budget.map(|budget| Arc::new(SandboxRuntimeMemoryBudgetHandle { budget })),
+        );
     }
 
     pub fn memory_budget(&self) -> Option<Arc<dyn SandboxRuntimeMemoryBudget>> {
         self.sidecar
-            .lock()
-            .expect("runtime state sidecar")
             .memory_budget
-            .clone()
+            .load_full()
+            .map(|handle| handle.budget.clone())
     }
 
-    fn sync_tracked_memory_contributions(
-        &self,
-        update: impl FnOnce(&mut SandboxRuntimeTrackedMemoryContributions),
-    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        let (budget, contributions) = {
-            let mut sidecar = self.sidecar.lock().expect("runtime state sidecar");
-            update(&mut sidecar.tracked_memory);
-            (sidecar.memory_budget.clone(), sidecar.tracked_memory)
-        };
-        let Some(budget) = budget else {
+    pub fn set_node_runtime_trace_snapshot(&self, snapshot: SandboxNodeRuntimeTraceSnapshot) {
+        self.sidecar.node_trace.store(Arc::new(snapshot));
+    }
+
+    pub fn node_runtime_trace_snapshot(&self) -> SandboxNodeRuntimeTraceSnapshot {
+        (*self.sidecar.node_trace.load_full()).clone()
+    }
+
+    fn sync_tracked_memory_contributions(&self) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        let Some(budget) = self
+            .sidecar
+            .memory_budget
+            .load_full()
+            .map(|handle| handle.budget.clone())
+        else {
             return Ok(());
         };
+        let contributions = self.sidecar.tracked_memory.snapshot();
         let mut usage = budget.snapshot().current;
         usage.context_runtime_bytes = contributions.context_runtime_bytes;
         usage.module_cache_bytes = contributions
@@ -2284,63 +2438,74 @@ impl SandboxRuntimeStateHandle {
         &self,
         contributions: SandboxRuntimeTrackedMemoryContributions,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        self.sync_tracked_memory_contributions(|tracked| {
-            *tracked = contributions;
-        })
+        self.sidecar.tracked_memory.replace(contributions);
+        self.sync_tracked_memory_contributions()
     }
 
     pub fn sync_live_module_cache_host_bytes(
         &self,
         bytes: u64,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        self.sync_tracked_memory_contributions(|tracked| {
-            tracked.module_cache_host_bytes = bytes;
-        })
+        self.sidecar
+            .tracked_memory
+            .module_cache_host_bytes
+            .store(bytes, Ordering::Relaxed);
+        self.sync_tracked_memory_contributions()
     }
 
     pub fn sync_live_module_cache_runtime_state_bytes(
         &self,
         bytes: u64,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        self.sync_tracked_memory_contributions(|tracked| {
-            tracked.module_cache_runtime_state_bytes = bytes;
-        })
+        self.sidecar
+            .tracked_memory
+            .module_cache_runtime_state_bytes
+            .store(bytes, Ordering::Relaxed);
+        self.sync_tracked_memory_contributions()
     }
 
     pub fn sync_live_task_queue_bytes(
         &self,
         bytes: u64,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        self.sync_tracked_memory_contributions(|tracked| {
-            tracked.task_queue_bytes = bytes;
-        })
+        self.sidecar
+            .tracked_memory
+            .task_queue_bytes
+            .store(bytes, Ordering::Relaxed);
+        self.sync_tracked_memory_contributions()
     }
 
     pub fn sync_live_compiled_code_bytes(
         &self,
         bytes: u64,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        self.sync_tracked_memory_contributions(|tracked| {
-            tracked.compiled_code_bytes = bytes;
-        })
+        self.sidecar
+            .tracked_memory
+            .compiled_code_bytes
+            .store(bytes, Ordering::Relaxed);
+        self.sync_tracked_memory_contributions()
     }
 
     pub fn sync_live_host_buffer_static_bytes(
         &self,
         bytes: u64,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        self.sync_tracked_memory_contributions(|tracked| {
-            tracked.host_buffer_static_bytes = bytes;
-        })
+        self.sidecar
+            .tracked_memory
+            .host_buffer_static_bytes
+            .store(bytes, Ordering::Relaxed);
+        self.sync_tracked_memory_contributions()
     }
 
     pub fn sync_live_node_compat_state_static_bytes(
         &self,
         bytes: u64,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        self.sync_tracked_memory_contributions(|tracked| {
-            tracked.node_compat_state_static_bytes = bytes;
-        })
+        self.sidecar
+            .tracked_memory
+            .node_compat_state_static_bytes
+            .store(bytes, Ordering::Relaxed);
+        self.sync_tracked_memory_contributions()
     }
 
     pub fn sync_live_process_state_bytes(
@@ -2348,10 +2513,15 @@ impl SandboxRuntimeStateHandle {
         model_bytes: u64,
         stdio_bytes: u64,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        self.sync_tracked_memory_contributions(|tracked| {
-            tracked.process_model_bytes = model_bytes;
-            tracked.process_stdio_bytes = stdio_bytes;
-        })
+        self.sidecar
+            .tracked_memory
+            .process_model_bytes
+            .store(model_bytes, Ordering::Relaxed);
+        self.sidecar
+            .tracked_memory
+            .process_stdio_bytes
+            .store(stdio_bytes, Ordering::Relaxed);
+        self.sync_tracked_memory_contributions()
     }
 }
 
@@ -2496,6 +2666,7 @@ impl SandboxRuntimeBackend for DeterministicRuntimeBackend {
                 cwd,
                 env,
                 &request.metadata,
+                request.wall_time_timeout_ms.map(Duration::from_millis),
             )
             .await;
         }
@@ -2991,6 +3162,7 @@ async fn execute_node_command(
     cwd: String,
     env: BTreeMap<String, String>,
     metadata: &BTreeMap<String, JsonValue>,
+    wall_time_timeout: Option<Duration>,
 ) -> Result<SandboxExecutionResult, SandboxError> {
     ensure_node_upstream_support_tree_present(session).await?;
     let normalized_entrypoint = resolve_node_path(&cwd, &entrypoint);
@@ -3026,6 +3198,11 @@ async fn execute_node_command(
         next_child_pid: Rc::new(RefCell::new(1000)),
         zlib_streams: Rc::new(RefCell::new(NodeZlibStreamTable::default())),
         bootstrap: Rc::new(RefCell::new(NodeBootstrapState::default())),
+        execution_timeout: wall_time_timeout.map(|timeout| NodeExecutionTimeout {
+            deadline: Instant::now() + timeout,
+            timeout,
+            entrypoint: normalized_entrypoint.clone(),
+        }),
     });
     let result = execute_node_command_inner(node_host, entrypoint, normalized_entrypoint)?;
     persist_runtime_cache(session, state).await?;
@@ -3067,6 +3244,7 @@ fn execute_node_command_inner(
     let _guard = span.enter();
 
     with_active_node_host(node_host.clone(), |node_host| {
+        node_check_execution_timeout(node_host)?;
         let gc_budget = node_host.runtime_state.memory_budget().map(|budget| {
             Arc::new(SandboxGcAllocationBudgetAdapter { budget }) as Arc<dyn GcAllocationBudget>
         });
@@ -3085,8 +3263,7 @@ fn execute_node_command_inner(
         node_debug_event(node_host, "stage", "host-bindings-installed".to_string())?;
         node_install_base_process_global(&mut context, node_host)?;
         node_debug_event(node_host, "stage", "base-process-installed".to_string())?;
-        let runtime_state_snapshot =
-            futures::executor::block_on(node_host.runtime_state.snapshot());
+        let runtime_state_snapshot = node_host.runtime_state.published_snapshot();
         node_seed_live_tracked_memory_budget(node_host, &runtime_state_snapshot)?;
         match node_execute_upstream_bootstrap_and_main(
             &mut context,
@@ -3114,8 +3291,7 @@ fn execute_node_command_inner(
             .filter(|path| path.contains("/node_modules/"))
             .count();
         let debug_trace = node_host.debug_trace.borrow().clone();
-        let runtime_state_snapshot =
-            futures::executor::block_on(node_host.runtime_state.snapshot());
+        let runtime_state_snapshot = node_host.runtime_state.published_snapshot();
         let managed_memory = node_runtime_managed_memory_stats(node_host, &runtime_state_snapshot);
         let gc_stats = boa_gc_runtime_stats();
         let accounted_bytes = managed_memory
@@ -3379,6 +3555,7 @@ fn node_execute_upstream_bootstrap_and_main(
     entrypoint: &str,
     normalized_entrypoint: &str,
 ) -> Result<(), SandboxError> {
+    node_check_execution_timeout(host)?;
     node_debug_event(host, "stage", "bootstrap-realm-start".to_string())?;
     let realm = node_initialize_bootstrap_realm(context, host)?;
     let realm_object = realm.as_object().ok_or_else(|| SandboxError::Execution {
@@ -3417,6 +3594,7 @@ fn node_execute_upstream_bootstrap_and_main(
         "internal/bootstrap/switches/does_own_process_state",
         "internal/main/run_main_module",
     ] {
+        node_check_execution_timeout(host)?;
         node_debug_event(host, "stage", format!("builtin-start {specifier}"))?;
         let result = node_call_builtin_with_node_runtime(
             context,
@@ -3431,6 +3609,7 @@ fn node_execute_upstream_bootstrap_and_main(
             entrypoint,
         )?;
         node_await_if_promise(context, host, entrypoint, result)?;
+        node_check_execution_timeout(host)?;
         node_debug_event(host, "stage", format!("builtin-done {specifier}"))?;
     }
 
@@ -3604,6 +3783,7 @@ fn node_call_builtin_with_node_runtime(
     args: &[JsValue],
     entrypoint: &str,
 ) -> Result<JsValue, SandboxError> {
+    node_check_execution_timeout(host)?;
     let function = node_compile_builtin_wrapper(
         context,
         host,
@@ -3617,9 +3797,17 @@ fn node_call_builtin_with_node_runtime(
             entrypoint: entrypoint.to_string(),
             message: format!("builtin `{specifier}` did not compile to a callable wrapper"),
         })?;
-    callable
-        .call(&JsValue::undefined(), args, context)
-        .map_err(sandbox_execution_error)
+    node_debug_event(host, "builtin", format!("call start {specifier}"))?;
+    match callable.call(&JsValue::undefined(), args, context) {
+        Ok(value) => {
+            node_debug_event(host, "builtin", format!("call ok {specifier}"))?;
+            Ok(value)
+        }
+        Err(error) => {
+            node_debug_event(host, "builtin", format!("call err {specifier}: {error}"))?;
+            Err(sandbox_execution_error(error))
+        }
+    }
 }
 
 fn node_await_if_promise(
@@ -3634,8 +3822,14 @@ fn node_await_if_promise(
     let Ok(promise) = JsPromise::from_object(object.clone()) else {
         return Ok(value);
     };
-    match promise.await_blocking(context) {
-        Ok(_) | Err(_) => {}
+    loop {
+        node_check_execution_timeout(host)?;
+        match promise.state() {
+            PromiseState::Pending => {
+                context.run_jobs().map_err(sandbox_execution_error)?;
+            }
+            PromiseState::Fulfilled(_) | PromiseState::Rejected(_) => break,
+        }
     }
     if let PromiseState::Rejected(reason) = promise.state() {
         return Err(node_execution_error(
@@ -3832,6 +4026,7 @@ fn node_with_host<T>(
     f: impl FnOnce(&NodeRuntimeHost) -> Result<T, SandboxError>,
 ) -> Result<T, SandboxError> {
     let host = active_node_host()?;
+    node_check_execution_timeout(&host)?;
     f(&host)
 }
 
@@ -3860,11 +4055,28 @@ fn node_with_host_js(
     node_with_host(|host| f(host, context)).map_err(js_error)
 }
 
+fn node_check_execution_timeout(host: &NodeRuntimeHost) -> Result<(), SandboxError> {
+    let Some(timeout) = host.execution_timeout.as_ref() else {
+        return Ok(());
+    };
+    if Instant::now() < timeout.deadline {
+        return Ok(());
+    }
+    Err(SandboxError::Execution {
+        entrypoint: timeout.entrypoint.clone(),
+        message: format!(
+            "wall-clock execution timed out after {}ms",
+            timeout.timeout.as_millis()
+        ),
+    })
+}
+
 fn node_debug_event(
     host: &NodeRuntimeHost,
     bucket: &str,
     detail: impl Into<String>,
 ) -> Result<(), SandboxError> {
+    node_check_execution_timeout(host)?;
     let detail = detail.into();
     trace!(target: "terracedb.sandbox.node_runtime", bucket, detail = %detail);
     if std::env::var_os("TERRACE_NODE_DEBUG_STDERR").is_some() {
@@ -3932,6 +4144,17 @@ fn node_debug_event(
         state.recent_events.remove(0);
     }
     state.recent_events.push(event.render());
+    host.runtime_state
+        .set_node_runtime_trace_snapshot(SandboxNodeRuntimeTraceSnapshot {
+            resolve_calls: state.resolve_calls,
+            load_calls: state.load_calls,
+            fs_calls: state.fs_calls,
+            recent_events: state.recent_events.clone(),
+            last_exception: state
+                .last_exception
+                .as_ref()
+                .and_then(|value| serde_json::to_value(value).ok()),
+        });
     Ok(())
 }
 
@@ -4008,6 +4231,7 @@ fn node_graph_invalidate(host: &NodeRuntimeHost) {
 fn node_readonly_fs(
     host: &NodeRuntimeHost,
 ) -> Result<Arc<dyn ReadOnlyVfsFileSystem>, SandboxError> {
+    node_check_execution_timeout(host)?;
     if let Some(fs) = host.read_snapshot_fs.borrow().clone() {
         return Ok(fs);
     }
@@ -4101,6 +4325,7 @@ impl NodeCommandModuleLoader {
         resolved: &NodeResolvedModule,
         context: &mut Context,
     ) -> Result<Module, SandboxError> {
+        node_check_execution_timeout(&self.host)?;
         if let Some(module) = self
             .host
             .materialized_modules
@@ -4150,6 +4375,7 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
         request: ModuleRequest,
         context: &RefCell<&mut Context>,
     ) -> JsResult<Module> {
+        node_check_execution_timeout(&self.host).map_err(js_error)?;
         let requested = request.specifier().to_std_string_escaped();
         let referrer = referrer
             .path()
@@ -5658,6 +5884,7 @@ fn drain_node_jobs_until_quiescent(
     let mut stable_rounds = 0usize;
     let mut previous = node_runtime_progress_snapshot(host);
     for _ in 0..NODE_RUNTIME_JOB_DRAIN_BUDGET {
+        node_check_execution_timeout(host)?;
         let drained_before = drain_node_next_ticks(context, host, entrypoint)?;
         let drained_timers = drain_node_timers(context, host, entrypoint)?;
         let drained_after = drain_node_next_ticks(context, host, entrypoint)?;
@@ -6157,6 +6384,7 @@ fn node_compile_builtin_wrapper(
     parameters: &[&str],
     suffix: Option<&str>,
 ) -> Result<JsValue, SandboxError> {
+    node_check_execution_timeout(host)?;
     let source = node_read_builtin_source_text(host, specifier)?;
     let mut wrapped = format!("(function({}) {{\n{}", parameters.join(", "), source);
     if !wrapped.ends_with('\n') {
@@ -6490,6 +6718,16 @@ fn node_stream_handle_write_bytes(
         state.bytes_written = state.bytes_written.saturating_add(bytes.len() as u64);
         (state.fd, state.bytes_written)
     })?;
+    node_debug_event(
+        host,
+        "stream",
+        format!(
+            "write fd={} len={} total_bytes={total_bytes}",
+            fd.map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            bytes.len()
+        ),
+    )?;
     object
         .set(
             js_string!("bytesWritten"),
@@ -6513,14 +6751,38 @@ fn node_stream_handle_write_bytes(
                 .borrow_mut()
                 .stdout
                 .push_str(&String::from_utf8_lossy(bytes));
-            node_sync_live_process_state_budget(host)?;
+            match node_sync_live_process_state_budget(host) {
+                Ok(()) => {
+                    node_debug_event(host, "process", "stdout_budget_sync ok".to_string())?;
+                }
+                Err(error) => {
+                    node_debug_event(
+                        host,
+                        "process",
+                        format!("stdout_budget_sync err={error}"),
+                    )?;
+                    return Err(error);
+                }
+            }
         }
         Some(2) => {
             host.process
                 .borrow_mut()
                 .stderr
                 .push_str(&String::from_utf8_lossy(bytes));
-            node_sync_live_process_state_budget(host)?;
+            match node_sync_live_process_state_budget(host) {
+                Ok(()) => {
+                    node_debug_event(host, "process", "stderr_budget_sync ok".to_string())?;
+                }
+                Err(error) => {
+                    node_debug_event(
+                        host,
+                        "process",
+                        format!("stderr_budget_sync err={error}"),
+                    )?;
+                    return Err(error);
+                }
+            }
         }
         _ => {}
     }
@@ -6627,6 +6889,11 @@ fn node_pipe_construct(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
+    let kind_code = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| JsValue::from(0))
+        .to_i32(context)?;
     let kind = match args
         .first()
         .cloned()
@@ -6637,6 +6904,11 @@ fn node_pipe_construct(
         2 => NodeStreamHandleKind::PipeIpc,
         _ => NodeStreamHandleKind::PipeSocket,
     };
+    node_with_host(|host| {
+        node_debug_event(host, "stream", format!("pipe_construct kind_code={kind_code}"))?;
+        Ok(())
+    })
+    .map_err(js_error)?;
     node_stream_handle_construct_with_kind(this, kind, context)
 }
 
@@ -6700,10 +6972,12 @@ fn node_stream_handle_open(
         .unwrap_or_else(JsValue::undefined)
         .to_i32(context)?;
     node_with_host_js(context, |host, context| {
+        node_debug_event(host, "stream", format!("open fd={fd}"))?;
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
             Ok(kind) => kind,
             Err(code) => return Ok(JsValue::from(code)),
         };
+        node_debug_event(host, "stream", format!("open resolved_kind={kind:?} fd={fd}"))?;
         if fd < 0 {
             return Ok(JsValue::from(NODE_UV_EBADF));
         }
@@ -6717,6 +6991,7 @@ fn node_stream_handle_open(
             state.fd = Some(fd);
             state.closed = false;
         })?;
+        node_debug_event(host, "stream", format!("open success fd={fd}"))?;
         Ok(JsValue::from(0))
     })
 }
@@ -15710,8 +15985,15 @@ fn node_process_title_setter(
         .to_string(context)?
         .to_std_string_escaped();
     node_with_host(|host| {
+        node_debug_event(host, "process", format!("set_title len={}", title.len()))?;
         host.process.borrow_mut().title = title;
-        node_sync_live_process_state_budget(host)?;
+        match node_sync_live_process_state_budget(host) {
+            Ok(()) => node_debug_event(host, "process", "title_budget_sync ok".to_string())?,
+            Err(error) => {
+                node_debug_event(host, "process", format!("title_budget_sync err={error}"))?;
+                return Err(error);
+            }
+        }
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -22155,6 +22437,7 @@ fn node_util_guess_handle_type(
             _ if host.open_files.borrow().entries.contains_key(&fd) => 3, // FILE
             _ => 5,     // UNKNOWN
         };
+        node_debug_event(host, "stream", format!("guess_handle_type fd={fd} code={code}"))?;
         let _ = &process;
         Ok(JsValue::from(code))
     })
@@ -25497,6 +25780,7 @@ fn execute_node_child_process(
             monotonic_now_ms: node_monotonic_now_ms(host),
             ..Default::default()
         })),
+        execution_timeout: host.execution_timeout.clone(),
     });
     let child_result = execute_node_command_inner(
         child_host,
