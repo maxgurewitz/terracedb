@@ -259,6 +259,20 @@ dependencies = [
 [[package]]
 name = "boa_ast"
 version = "1.0.0-dev"
+dependencies = [
+ "bitflags",
+ "boa_interner 1.0.0-dev",
+ "boa_macros 1.0.0-dev",
+ "boa_string 1.0.0-dev",
+ "indexmap",
+ "num-bigint",
+ "rustc-hash",
+ "strum",
+]
+
+[[package]]
+name = "boa_ast"
+version = "1.0.0-dev"
 source = "git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4#8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4"
 dependencies = [
  "bitflags",
@@ -272,18 +286,57 @@ dependencies = [
 ]
 
 [[package]]
-name = "boa_ast"
+name = "boa_engine"
 version = "1.0.0-dev"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
 dependencies = [
+ "aligned-vec",
+ "arrayvec",
+ "async-channel",
  "bitflags",
- "boa_interner 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_macros 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_string 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
+ "boa_ast 1.0.0-dev",
+ "boa_gc 1.0.0-dev",
+ "boa_interner 1.0.0-dev",
+ "boa_macros 1.0.0-dev",
+ "boa_parser 1.0.0-dev",
+ "boa_string 1.0.0-dev",
+ "bytemuck",
+ "cfg-if",
+ "cow-utils",
+ "dashmap",
+ "dynify",
+ "fast-float2",
+ "float16",
+ "futures-concurrency",
+ "futures-lite",
+ "hashbrown 0.16.1",
+ "icu_calendar",
+ "icu_normalizer",
  "indexmap",
+ "intrusive-collections",
+ "itertools",
  "num-bigint",
+ "num-integer",
+ "num-traits",
+ "num_enum",
+ "oneshot",
+ "paste",
+ "portable-atomic",
+ "rand 0.10.0",
+ "regress",
  "rustc-hash",
- "strum",
+ "ryu-js",
+ "serde",
+ "serde_json",
+ "small_btree 0.1.0",
+ "static_assertions",
+ "tag_ptr 0.1.0",
+ "tap",
+ "temporal_rs",
+ "thin-vec",
+ "thiserror 2.0.18",
+ "time",
+ "timezone_provider",
+ "xsum",
 ]
 
 [[package]]
@@ -342,58 +395,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "boa_engine"
+name = "boa_gc"
 version = "1.0.0-dev"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
 dependencies = [
- "aligned-vec",
  "arrayvec",
- "async-channel",
- "bitflags",
- "boa_ast 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_gc 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_interner 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_macros 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_parser 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_string 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "bytemuck",
- "cfg-if",
- "cow-utils",
- "dashmap",
- "dynify",
- "fast-float2",
- "float16",
- "futures-concurrency",
- "futures-lite",
+ "boa_macros 1.0.0-dev",
+ "boa_string 1.0.0-dev",
  "hashbrown 0.16.1",
- "icu_calendar",
- "icu_normalizer",
- "indexmap",
- "intrusive-collections",
- "itertools",
- "num-bigint",
- "num-integer",
- "num-traits",
- "num_enum",
- "oneshot",
- "paste",
- "portable-atomic",
- "rand 0.10.0",
- "regress",
- "rustc-hash",
- "ryu-js",
- "serde",
- "serde_json",
- "small_btree 0.1.0 (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "static_assertions",
- "tag_ptr 0.1.0 (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "tap",
- "temporal_rs",
  "thin-vec",
- "thiserror 2.0.18",
- "time",
- "timezone_provider",
- "xsum",
 ]
 
 [[package]]
@@ -409,15 +418,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "boa_gc"
+name = "boa_interner"
 version = "1.0.0-dev"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
 dependencies = [
- "arrayvec",
- "boa_macros 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_string 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
+ "boa_gc 1.0.0-dev",
+ "boa_macros 1.0.0-dev",
  "hashbrown 0.16.1",
- "thin-vec",
+ "indexmap",
+ "once_cell",
+ "phf",
+ "rustc-hash",
+ "static_assertions",
 ]
 
 [[package]]
@@ -436,18 +447,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "boa_interner"
+name = "boa_macros"
 version = "1.0.0-dev"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
 dependencies = [
- "boa_gc 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_macros 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "hashbrown 0.16.1",
- "indexmap",
- "once_cell",
- "phf",
- "rustc-hash",
- "static_assertions",
+ "cfg-if",
+ "cow-utils",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
 ]
 
 [[package]]
@@ -464,16 +472,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "boa_macros"
+name = "boa_parser"
 version = "1.0.0-dev"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
 dependencies = [
- "cfg-if",
- "cow-utils",
- "proc-macro2",
- "quote",
- "syn",
- "synstructure",
+ "bitflags",
+ "boa_ast 1.0.0-dev",
+ "boa_interner 1.0.0-dev",
+ "boa_macros 1.0.0-dev",
+ "fast-float2",
+ "icu_properties",
+ "num-bigint",
+ "num-traits",
+ "regress",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -494,26 +505,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "boa_parser"
-version = "1.0.0-dev"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
-dependencies = [
- "bitflags",
- "boa_ast 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_interner 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_macros 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "fast-float2",
- "icu_properties",
- "num-bigint",
- "num-traits",
- "regress",
- "rustc-hash",
-]
-
-[[package]]
 name = "boa_string"
 version = "1.0.0-dev"
-source = "git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4#8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4"
 dependencies = [
  "fast-float2",
  "itoa",
@@ -526,7 +519,7 @@ dependencies = [
 [[package]]
 name = "boa_string"
 version = "1.0.0-dev"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
+source = "git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4#8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4"
 dependencies = [
  "fast-float2",
  "itoa",
@@ -3024,7 +3017,6 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "small_btree"
 version = "0.1.0"
-source = "git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4#8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4"
 dependencies = [
  "arrayvec",
 ]
@@ -3032,7 +3024,7 @@ dependencies = [
 [[package]]
 name = "small_btree"
 version = "0.1.0"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
+source = "git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4#8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4"
 dependencies = [
  "arrayvec",
 ]
@@ -3143,12 +3135,11 @@ dependencies = [
 [[package]]
 name = "tag_ptr"
 version = "0.1.0"
-source = "git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4#8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4"
 
 [[package]]
 name = "tag_ptr"
 version = "0.1.0"
-source = "git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6#f5e88de558e038f0ae675a012d59917a098f44b6"
+source = "git+https://github.com/boa-dev/boa?rev=8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4#8a3ca7d0978ffadf165989ad0a9a93a6cafd61b4"
 
 [[package]]
 name = "tap"
@@ -3649,11 +3640,11 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
- "boa_ast 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_engine 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_gc 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_interner 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
- "boa_parser 1.0.0-dev (git+https://github.com/boa-dev/boa?rev=f5e88de558e038f0ae675a012d59917a098f44b6)",
+ "boa_ast 1.0.0-dev",
+ "boa_engine 1.0.0-dev",
+ "boa_gc 1.0.0-dev",
+ "boa_interner 1.0.0-dev",
+ "boa_parser 1.0.0-dev",
  "brotli",
  "clap",
  "clap_lex 0.7.7",

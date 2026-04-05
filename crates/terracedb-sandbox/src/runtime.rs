@@ -7,7 +7,7 @@ use std::{
     net::ToSocketAddrs,
     path::PathBuf,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     thread_local,
 };
 
@@ -892,11 +892,24 @@ struct NodeRuntimeDebugTrace {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 struct NodeRuntimeManagedMemoryStats {
     total_bytes: u64,
+    gc_heap_bytes: u64,
+    context_runtime_bytes: u64,
+    task_queue_bytes: u64,
+    compiled_code_bytes: u64,
+    parser_retained_bytes: u64,
+    module_cache_bytes: u64,
+    host_buffer_bytes: u64,
+    node_compat_state_bytes: u64,
     loaded_module_count: usize,
     loaded_module_bytes: u64,
     materialized_module_count: usize,
+    materialized_module_key_bytes: u64,
     open_file_count: usize,
     open_file_bytes: u64,
+    blob_count: usize,
+    blob_bytes: u64,
+    process_stdio_bytes: u64,
+    process_model_bytes: u64,
     process_dynamic_bytes: u64,
     module_graph_file_cache_entries: usize,
     module_graph_file_cache_bytes: u64,
@@ -905,6 +918,23 @@ struct NodeRuntimeManagedMemoryStats {
     module_graph_lookup_bytes: u64,
     runtime_module_cache_entries: usize,
     runtime_module_cache_bytes: u64,
+    builtin_id_bytes: u64,
+    js_boundary_bytes: u64,
+    bootstrap_state_bytes: u64,
+    bootstrap_queue_bytes: u64,
+    compile_cache_entry_bytes: u64,
+    module_wrap_state_bytes: u64,
+    url_pattern_state_bytes: u64,
+    inspector_state_bytes: u64,
+    stream_handle_state_bytes: u64,
+    udp_handle_state_bytes: u64,
+    process_handle_state_bytes: u64,
+    message_port_state_bytes: u64,
+    message_port_queue_bytes: u64,
+    lock_state_bytes: u64,
+    report_state_bytes: u64,
+    sea_state_bytes: u64,
+    zlib_state_bytes: u64,
     debug_trace_bytes: u64,
 }
 
@@ -1836,14 +1866,69 @@ pub struct SandboxRuntimeState {
     pub js_boundary: Option<SandboxJsRuntimeBoundaryState>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxTrackedMemoryUsage {
+    pub total_bytes: u64,
+    pub gc_heap_bytes: u64,
+    pub context_runtime_bytes: u64,
+    pub task_queue_bytes: u64,
+    pub compiled_code_bytes: u64,
+    pub parser_retained_bytes: u64,
+    pub module_cache_bytes: u64,
+    pub host_buffer_bytes: u64,
+    pub node_compat_state_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxTrackedMemoryBudgetSnapshot {
+    pub current: SandboxTrackedMemoryUsage,
+    pub peak_bytes: u64,
+    pub budget_bytes: Option<u64>,
+    pub terminated_for_budget: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxTrackedMemoryBudgetExceeded {
+    pub usage: SandboxTrackedMemoryUsage,
+    pub peak_bytes: u64,
+    pub budget_bytes: Option<u64>,
+    pub message: String,
+}
+
+impl std::fmt::Display for SandboxTrackedMemoryBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SandboxTrackedMemoryBudgetExceeded {}
+
+pub trait SandboxRuntimeMemoryBudget: Send + Sync {
+    fn update_tracked_memory_usage(
+        &self,
+        usage: SandboxTrackedMemoryUsage,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded>;
+
+    fn snapshot(&self) -> SandboxTrackedMemoryBudgetSnapshot;
+}
+
+#[derive(Default)]
+struct SandboxRuntimeStateSidecar {
+    memory_budget: Option<Arc<dyn SandboxRuntimeMemoryBudget>>,
+}
+
+#[derive(Clone)]
 pub struct SandboxRuntimeStateHandle {
     inner: Arc<Mutex<SandboxRuntimeState>>,
+    sidecar: Arc<StdMutex<SandboxRuntimeStateSidecar>>,
 }
 
 impl SandboxRuntimeStateHandle {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Arc::new(Mutex::new(SandboxRuntimeState::default())),
+            sidecar: Arc::new(StdMutex::new(SandboxRuntimeStateSidecar::default())),
+        }
     }
 
     pub async fn snapshot(&self) -> SandboxRuntimeState {
@@ -1891,6 +1976,18 @@ impl SandboxRuntimeStateHandle {
 
     pub async fn set_js_boundary(&self, boundary: SandboxJsRuntimeBoundaryState) {
         self.inner.lock().await.js_boundary = Some(boundary);
+    }
+
+    pub fn set_memory_budget(&self, memory_budget: Option<Arc<dyn SandboxRuntimeMemoryBudget>>) {
+        self.sidecar.lock().expect("runtime state sidecar").memory_budget = memory_budget;
+    }
+
+    pub fn memory_budget(&self) -> Option<Arc<dyn SandboxRuntimeMemoryBudget>> {
+        self.sidecar
+            .lock()
+            .expect("runtime state sidecar")
+            .memory_budget
+            .clone()
     }
 }
 
@@ -2616,10 +2713,13 @@ fn execute_node_command_inner(
                 message: error.to_string(),
             })?;
         node_debug_event(node_host, "stage", "context-built".to_string())?;
+        node_enforce_runtime_memory_budget(node_host, "context-built")?;
         install_node_host_bindings(&mut context)?;
         node_debug_event(node_host, "stage", "host-bindings-installed".to_string())?;
+        node_enforce_runtime_memory_budget(node_host, "host-bindings-installed")?;
         node_install_base_process_global(&mut context, node_host)?;
         node_debug_event(node_host, "stage", "base-process-installed".to_string())?;
+        node_enforce_runtime_memory_budget(node_host, "base-process-installed")?;
         match node_execute_upstream_bootstrap_and_main(
             &mut context,
             node_host,
@@ -2627,7 +2727,9 @@ fn execute_node_command_inner(
             &normalized_entrypoint,
         ) {
             Ok(()) => {
+                node_enforce_runtime_memory_budget(node_host, "bootstrap-complete")?;
                 drain_node_jobs_until_quiescent(&mut context, node_host, &entrypoint)?;
+                node_enforce_runtime_memory_budget(node_host, "job-drain-complete")?;
             }
             Err(SandboxError::ProcessExited) => {}
             Err(SandboxError::ExecveReplaced) => {}
@@ -2722,6 +2824,34 @@ fn execute_node_command_inner(
                 (
                     "node_runtime_managed_memory".to_string(),
                     serde_json::to_value(&managed_memory).map_err(sandbox_execution_error)?,
+                ),
+                (
+                    "node_runtime_context_runtime_bytes".to_string(),
+                    JsonValue::from(managed_memory.context_runtime_bytes),
+                ),
+                (
+                    "node_runtime_task_queue_bytes".to_string(),
+                    JsonValue::from(managed_memory.task_queue_bytes),
+                ),
+                (
+                    "node_runtime_compiled_code_bytes".to_string(),
+                    JsonValue::from(managed_memory.compiled_code_bytes),
+                ),
+                (
+                    "node_runtime_parser_retained_bytes".to_string(),
+                    JsonValue::from(managed_memory.parser_retained_bytes),
+                ),
+                (
+                    "node_runtime_module_cache_bytes".to_string(),
+                    JsonValue::from(managed_memory.module_cache_bytes),
+                ),
+                (
+                    "node_runtime_host_buffer_bytes".to_string(),
+                    JsonValue::from(managed_memory.host_buffer_bytes),
+                ),
+                (
+                    "node_runtime_node_compat_state_bytes".to_string(),
+                    JsonValue::from(managed_memory.node_compat_state_bytes),
                 ),
                 (
                     "node_runtime_gc_bytes_allocated".to_string(),
@@ -2912,6 +3042,7 @@ fn node_execute_upstream_bootstrap_and_main(
 
     node_prepare_process_for_bootstrap(context, host, &process, &internal_binding)?;
     node_debug_event(host, "stage", "bootstrap-realm-done".to_string())?;
+    node_enforce_runtime_memory_budget(host, "bootstrap-realm-ready")?;
 
     for specifier in [
         "internal/bootstrap/node",
@@ -2936,6 +3067,7 @@ fn node_execute_upstream_bootstrap_and_main(
         )?;
         node_await_if_promise(context, host, entrypoint, result)?;
         node_debug_event(host, "stage", format!("builtin-done {specifier}"))?;
+        node_enforce_runtime_memory_budget(host, &format!("builtin-done {specifier}"))?;
     }
 
     Ok(())
@@ -3631,6 +3763,7 @@ impl NodeCommandModuleLoader {
                 .map_err(sandbox_execution_error)?
             }
         };
+        node_enforce_runtime_memory_budget(&self.host, "module-materialize")?;
         self.host
             .materialized_modules
             .borrow_mut()
@@ -4003,6 +4136,45 @@ fn node_runtime_progress_snapshot(
     )
 }
 
+fn node_runtime_tracked_memory_usage(
+    host: &NodeRuntimeHost,
+    runtime_state: &SandboxRuntimeState,
+) -> SandboxTrackedMemoryUsage {
+    let managed = node_runtime_managed_memory_stats(host, runtime_state);
+    let gc_heap_bytes = boa_gc_runtime_stats().bytes_allocated as u64;
+    SandboxTrackedMemoryUsage {
+        total_bytes: managed.total_bytes.saturating_add(gc_heap_bytes),
+        gc_heap_bytes,
+        context_runtime_bytes: managed.context_runtime_bytes,
+        task_queue_bytes: managed.task_queue_bytes,
+        compiled_code_bytes: managed.compiled_code_bytes,
+        parser_retained_bytes: managed.parser_retained_bytes,
+        module_cache_bytes: managed.module_cache_bytes,
+        host_buffer_bytes: managed.host_buffer_bytes,
+        node_compat_state_bytes: managed.node_compat_state_bytes,
+    }
+}
+
+fn node_enforce_runtime_memory_budget(
+    host: &NodeRuntimeHost,
+    stage: &str,
+) -> Result<(), SandboxError> {
+    let Some(memory_budget) = host.runtime_state.memory_budget() else {
+        return Ok(());
+    };
+    let runtime_state = futures::executor::block_on(host.runtime_state.snapshot());
+    let usage = node_runtime_tracked_memory_usage(host, &runtime_state);
+    memory_budget
+        .update_tracked_memory_usage(usage.clone())
+        .map_err(|error| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: format!(
+                "tracked runtime memory budget exceeded at {stage}: {} (total_bytes={}, peak_bytes={}, budget_bytes={:?})",
+                error.message, error.usage.total_bytes, error.peak_bytes, error.budget_bytes
+            ),
+        })
+}
+
 fn node_runtime_managed_memory_stats(
     host: &NodeRuntimeHost,
     runtime_state: &SandboxRuntimeState,
@@ -4016,7 +4188,13 @@ fn node_runtime_managed_memory_stats(
         })
         .sum::<u64>();
 
-    let materialized_module_count = host.materialized_modules.borrow().len();
+    let materialized_modules = host.materialized_modules.borrow();
+    let materialized_module_count = materialized_modules.len();
+    let materialized_module_key_bytes = materialized_modules
+        .keys()
+        .map(|value| value.len() as u64)
+        .sum::<u64>();
+    drop(materialized_modules);
 
     let open_files = host.open_files.borrow();
     let open_file_bytes = open_files
@@ -4026,8 +4204,25 @@ fn node_runtime_managed_memory_stats(
         .sum::<u64>();
 
     let process = host.process.borrow();
-    let process_dynamic_bytes = (process.cwd.len() + process.stdout.len() + process.stderr.len())
-        as u64
+    let process_stdio_bytes = (process.stdout.len() + process.stderr.len()) as u64;
+    let process_model_bytes = (process.cwd.len()
+        + process.version.len()
+        + process.exec_path.len()
+        + process.platform.len()
+        + process.arch.len()
+        + process.locale.len()
+        + process.timezone.len()
+        + process.title.len()
+        + process.home_dir.len()
+        + process.temp_dir.len()
+        + process.hostname.len()
+        + process.os_name.len()
+        + process.os_version.len()
+        + process.os_release.len()
+        + process.release_name.len()
+        + process.release_lts.len()
+        + process.username.len()
+        + process.shell.len()) as u64
         + process
             .argv
             .iter()
@@ -4043,6 +4238,7 @@ fn node_runtime_managed_memory_stats(
             .iter()
             .map(|(key, value)| (key.len() + value.len()) as u64)
             .sum::<u64>();
+    let process_dynamic_bytes = process_model_bytes + process_stdio_bytes;
     drop(process);
 
     let module_graph = host.module_graph.borrow();
@@ -4178,12 +4374,112 @@ fn node_runtime_managed_memory_stats(
         })
         .sum::<u64>();
 
-    let debug_trace = host.debug_trace.borrow();
-    let debug_trace_bytes = debug_trace
-        .recent_events
-        .iter()
+    let builtin_id_bytes = host
+        .builtin_ids
+        .borrow()
+        .as_ref()
+        .map(|values| values.iter().map(|value| value.len() as u64).sum::<u64>())
+        .unwrap_or_default();
+
+    let js_boundary_bytes = runtime_state
+        .js_boundary
+        .as_ref()
+        .and_then(|value| serde_json::to_vec(value).ok())
         .map(|value| value.len() as u64)
+        .unwrap_or_default();
+
+    let bootstrap = host.bootstrap.borrow();
+    let blob_bytes = bootstrap
+        .blobs
+        .blobs
+        .iter()
+        .map(|(_, value)| value.len() as u64)
         .sum::<u64>()
+        + bootstrap
+            .blobs
+            .data_objects
+            .iter()
+            .map(|(key, value)| {
+                key.len() as u64 + value.mime_type.len() as u64 + u64::from(value.length)
+            })
+            .sum::<u64>();
+    let blob_count = bootstrap.blobs.blobs.len() + bootstrap.blobs.data_objects.len();
+    let bootstrap_state_bytes = node_bootstrap_state_bytes(&bootstrap);
+    let bootstrap_queue_bytes = node_bootstrap_queue_bytes(&bootstrap);
+    let compile_cache_entry_bytes = bootstrap
+        .compile_cache_entries
+        .values()
+        .map(|entry| {
+            std::mem::size_of::<NodeCompileCacheEntryState>() as u64
+                + entry.key.len() as u64
+                + entry
+                    .transpiled
+                    .as_ref()
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default()
+        })
+        .sum::<u64>();
+    let module_wrap_state_bytes = bootstrap
+        .module_wraps
+        .values()
+        .map(node_module_wrap_state_bytes)
+        .sum::<u64>();
+    let url_pattern_state_bytes = bootstrap
+        .url_patterns
+        .values()
+        .map(node_url_pattern_state_bytes)
+        .sum::<u64>();
+    let inspector_state_bytes = node_inspector_state_bytes(&bootstrap.inspector);
+    let stream_handle_state_bytes = bootstrap
+        .stream_handles
+        .values()
+        .map(node_stream_handle_state_bytes)
+        .sum::<u64>();
+    let udp_handle_state_bytes = bootstrap
+        .udp_handles
+        .values()
+        .map(node_udp_handle_state_bytes)
+        .sum::<u64>();
+    let process_handle_state_bytes = bootstrap
+        .process_handles
+        .values()
+        .map(node_process_handle_state_bytes)
+        .sum::<u64>();
+    let message_port_state_bytes = bootstrap
+        .message_ports
+        .values()
+        .map(node_message_port_state_bytes)
+        .sum::<u64>();
+    let message_port_queue_bytes = bootstrap
+        .message_ports
+        .values()
+        .map(|state| state.queue.len() as u64 * std::mem::size_of::<JsValue>() as u64)
+        .sum::<u64>();
+    let lock_state_bytes = bootstrap
+        .held_locks
+        .values()
+        .flatten()
+        .map(node_held_lock_state_bytes)
+        .sum::<u64>();
+    let report_state_bytes = node_report_state_bytes(&bootstrap.report);
+    let sea_state_bytes = node_sea_state_bytes(&bootstrap.sea);
+    drop(bootstrap);
+
+    let zlib_streams = host.zlib_streams.borrow();
+    let zlib_state_bytes = zlib_streams
+        .entries
+        .values()
+        .map(node_zlib_stream_bytes)
+        .sum::<u64>();
+    drop(zlib_streams);
+
+    let debug_trace = host.debug_trace.borrow();
+    let debug_trace_bytes = std::mem::size_of::<NodeRuntimeDebugTrace>() as u64
+        + debug_trace
+            .recent_events
+            .iter()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
         + debug_trace
             .structured_events
             .iter()
@@ -4197,22 +4493,60 @@ fn node_runtime_managed_memory_stats(
             .map(|value| value.len() as u64)
             .unwrap_or_default();
 
-    let total_bytes = loaded_module_bytes
-        + open_file_bytes
-        + process_dynamic_bytes
+    let context_runtime_bytes = materialized_module_key_bytes + js_boundary_bytes;
+    let task_queue_bytes = bootstrap_queue_bytes + message_port_queue_bytes;
+    let compiled_code_bytes =
+        compile_cache_entry_bytes + module_wrap_state_bytes + url_pattern_state_bytes;
+    let parser_retained_bytes = 0;
+    let module_cache_bytes = loaded_module_bytes
         + module_graph_file_cache_bytes
         + module_graph_package_json_bytes
         + module_graph_lookup_bytes
-        + runtime_module_cache_bytes
+        + runtime_module_cache_bytes;
+    let host_buffer_bytes = open_file_bytes + process_stdio_bytes + blob_bytes;
+    let node_compat_state_bytes = process_model_bytes
+        + builtin_id_bytes
+        + bootstrap_state_bytes
+        + inspector_state_bytes
+        + stream_handle_state_bytes
+        + udp_handle_state_bytes
+        + process_handle_state_bytes
+        + message_port_state_bytes
+        + lock_state_bytes
+        + report_state_bytes
+        + sea_state_bytes
+        + zlib_state_bytes
         + debug_trace_bytes;
+    let gc_heap_bytes = boa_gc_runtime_stats().bytes_allocated as u64;
+
+    let total_bytes = context_runtime_bytes
+        + task_queue_bytes
+        + compiled_code_bytes
+        + parser_retained_bytes
+        + module_cache_bytes
+        + host_buffer_bytes
+        + node_compat_state_bytes;
 
     NodeRuntimeManagedMemoryStats {
         total_bytes,
+        gc_heap_bytes,
+        context_runtime_bytes,
+        task_queue_bytes,
+        compiled_code_bytes,
+        parser_retained_bytes,
+        module_cache_bytes,
+        host_buffer_bytes,
+        node_compat_state_bytes,
         loaded_module_count: loaded_modules.len(),
         loaded_module_bytes,
         materialized_module_count,
+        materialized_module_key_bytes,
         open_file_count: open_files.entries.len(),
         open_file_bytes,
+        blob_count,
+        blob_bytes,
+        process_stdio_bytes,
+        process_model_bytes,
         process_dynamic_bytes,
         module_graph_file_cache_entries,
         module_graph_file_cache_bytes,
@@ -4221,7 +4555,342 @@ fn node_runtime_managed_memory_stats(
         module_graph_lookup_bytes,
         runtime_module_cache_entries,
         runtime_module_cache_bytes,
+        builtin_id_bytes,
+        js_boundary_bytes,
+        bootstrap_state_bytes,
+        bootstrap_queue_bytes,
+        compile_cache_entry_bytes,
+        module_wrap_state_bytes,
+        url_pattern_state_bytes,
+        inspector_state_bytes,
+        stream_handle_state_bytes,
+        udp_handle_state_bytes,
+        process_handle_state_bytes,
+        message_port_state_bytes,
+        message_port_queue_bytes,
+        lock_state_bytes,
+        report_state_bytes,
+        sea_state_bytes,
+        zlib_state_bytes,
         debug_trace_bytes,
+    }
+}
+
+fn node_bootstrap_state_bytes(state: &NodeBootstrapState) -> u64 {
+    let object_slot_bytes = ([
+        state.per_context_exports.is_some(),
+        state.primordials.is_some(),
+        state.tick_info.is_some(),
+        state.immediate_info.is_some(),
+        state.timeout_info.is_some(),
+        state.hrtime_buffer.is_some(),
+        state.stream_base_state.is_some(),
+        state.promise_reject_callback.is_some(),
+        state.tick_callback.is_some(),
+        state.process_immediate_callback.is_some(),
+        state.process_timers_callback.is_some(),
+        state.emit_warning_sync.is_some(),
+        state.async_callback_trampoline.is_some(),
+        state.async_hooks_object.is_some(),
+        state.promise_hook_init.is_some(),
+        state.promise_hook_before.is_some(),
+        state.promise_hook_after.is_some(),
+        state.promise_hook_settled.is_some(),
+        state.trace_category_state_update_handler.is_some(),
+        state.buffer_prototype.is_some(),
+        state.prepare_stack_trace_callback.is_some(),
+        state.maybe_cache_generated_source_map_callback.is_some(),
+        state.enhance_stack_before_inspector.is_some(),
+        state.enhance_stack_after_inspector.is_some(),
+        state.profiler_source_map_cache_getter.is_some(),
+        state.performance_observer_callback.is_some(),
+        state.performance_milestones.is_some(),
+        state.performance_observer_counts.is_some(),
+        state.messaging_deserialize_create_object_callback.is_some(),
+        state.should_abort_on_uncaught_toggle.is_some(),
+        state
+            .module_wrap_import_module_dynamically_callback
+            .is_some(),
+        state
+            .module_wrap_initialize_import_meta_object_callback
+            .is_some(),
+        state.snapshot_serialize_callback.is_some(),
+        state.snapshot_deserialize_callback.is_some(),
+        state.snapshot_deserialize_main_function.is_some(),
+        state.wasm_web_api_callback.is_some(),
+    ]
+    .iter()
+    .filter(|present| **present)
+    .count() as u64)
+        * std::mem::size_of::<JsObject>() as u64;
+
+    let value_slot_bytes =
+        u64::from(state.async_context_frame.is_some()) * std::mem::size_of::<JsValue>() as u64;
+
+    object_slot_bytes
+        + value_slot_bytes
+        + state
+            .trace_categories
+            .iter()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + state
+            .trace_category_buffers
+            .iter()
+            .map(|(key, _)| key.len() as u64 + std::mem::size_of::<JsObject>() as u64)
+            .sum::<u64>()
+        + state
+            .profiler_coverage_directory
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .compile_cache_dir
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .host_private_symbols
+            .keys()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + state.registered_destroy_async_ids.len() as u64 * std::mem::size_of::<u64>() as u64
+        + state
+            .broadcast_channels
+            .iter()
+            .map(|(name, ports)| {
+                name.len() as u64 + ports.len() as u64 * std::mem::size_of::<u64>() as u64
+            })
+            .sum::<u64>()
+}
+
+fn node_bootstrap_queue_bytes(state: &NodeBootstrapState) -> u64 {
+    let microtask_queue_bytes =
+        state.microtask_queue.len() as u64 * std::mem::size_of::<JsObject>() as u64;
+    let async_context_bytes =
+        state.execution_async_resources.len() as u64 * std::mem::size_of::<JsValue>() as u64;
+    let pending_lock_queue_bytes = state
+        .pending_locks
+        .iter()
+        .map(node_pending_lock_state_bytes)
+        .sum::<u64>();
+
+    microtask_queue_bytes + async_context_bytes + pending_lock_queue_bytes
+}
+
+fn node_module_wrap_state_bytes(state: &NodeModuleWrapState) -> u64 {
+    std::mem::size_of::<NodeModuleWrapState>() as u64
+        + state.url.len() as u64
+        + state
+            .source_text
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .source_url
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .source_map_url
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .synthetic_export_names
+            .iter()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + state.linked_request_ids.len() as u64 * std::mem::size_of::<u64>() as u64
+        + state
+            .synthetic_exports
+            .keys()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + state.synthetic_exports.len() as u64 * std::mem::size_of::<JsValue>() as u64
+        + u64::from(state.host_defined_option_id.is_some()) * std::mem::size_of::<JsValue>() as u64
+        + u64::from(state.synthetic_evaluation_steps.is_some())
+            * std::mem::size_of::<JsObject>() as u64
+        + u64::from(state.imported_cjs.is_some()) * std::mem::size_of::<JsObject>() as u64
+        + u64::from(state.module.is_some()) * std::mem::size_of::<Module>() as u64
+        + u64::from(state.module_source_object.is_some()) * std::mem::size_of::<JsObject>() as u64
+        + u64::from(state.error.is_some()) * std::mem::size_of::<JsValue>() as u64
+}
+
+fn node_url_pattern_state_bytes(state: &NodeUrlPatternState) -> u64 {
+    std::mem::size_of::<NodeUrlPatternState>() as u64
+        + std::mem::size_of::<RustUrlPattern>() as u64
+        + state.protocol.len() as u64
+        + state.username.len() as u64
+        + state.password.len() as u64
+        + state.hostname.len() as u64
+        + state.port.len() as u64
+        + state.pathname.len() as u64
+        + state.search.len() as u64
+        + state.hash.len() as u64
+}
+
+fn node_inspector_state_bytes(state: &NodeInspectorState) -> u64 {
+    let object_slot_bytes = ([
+        state.console.is_some(),
+        state.console_extension_installer.is_some(),
+        state.async_hook_enable.is_some(),
+        state.async_hook_disable.is_some(),
+        state.network_tracking_enable.is_some(),
+        state.network_tracking_disable.is_some(),
+    ]
+    .iter()
+    .filter(|present| **present)
+    .count() as u64)
+        * std::mem::size_of::<JsObject>() as u64;
+
+    std::mem::size_of::<NodeInspectorState>() as u64
+        + object_slot_bytes
+        + state.host.len() as u64
+        + state
+            .async_tasks
+            .values()
+            .map(|(label, _)| label.len() as u64)
+            .sum::<u64>()
+        + state
+            .network_resources
+            .iter()
+            .map(|(key, value)| (key.len() + value.len()) as u64)
+            .sum::<u64>()
+        + state
+            .protocol_events
+            .iter()
+            .map(|(name, value)| {
+                name.len() as u64
+                    + serde_json::to_vec(value)
+                        .map(|encoded| encoded.len() as u64)
+                        .unwrap_or_default()
+            })
+            .sum::<u64>()
+}
+
+fn node_stream_handle_state_bytes(state: &NodeStreamHandleState) -> u64 {
+    std::mem::size_of::<NodeStreamHandleState>() as u64
+        + state
+            .bound_address
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .bound_family
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .peer_address
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .peer_family
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+}
+
+fn node_udp_handle_state_bytes(state: &NodeUdpHandleState) -> u64 {
+    std::mem::size_of::<NodeUdpHandleState>() as u64
+        + u64::from(state.object.is_some()) * std::mem::size_of::<JsObject>() as u64
+        + state
+            .bound_address
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .bound_family
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .peer_address
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .peer_family
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .multicast_interface
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+}
+
+fn node_process_handle_state_bytes(state: &NodeProcessHandleState) -> u64 {
+    std::mem::size_of::<NodeProcessHandleState>() as u64
+        + u64::from(state.object.is_some()) * std::mem::size_of::<JsObject>() as u64
+        + state
+            .term_signal
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+        + state
+            .result
+            .as_ref()
+            .and_then(|value| serde_json::to_vec(value).ok())
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+}
+
+fn node_message_port_state_bytes(state: &NodeMessagePortState) -> u64 {
+    std::mem::size_of::<NodeMessagePortState>() as u64
+        + u64::from(state.object.is_some()) * std::mem::size_of::<JsObject>() as u64
+        + state
+            .broadcast_name
+            .as_ref()
+            .map(|value| value.len() as u64)
+            .unwrap_or_default()
+}
+
+fn node_held_lock_state_bytes(state: &NodeHeldLockState) -> u64 {
+    std::mem::size_of::<NodeHeldLockState>() as u64
+        + state.name.len() as u64
+        + state.client_id.len() as u64
+        + state.mode.len() as u64
+}
+
+fn node_pending_lock_state_bytes(state: &NodePendingLockState) -> u64 {
+    std::mem::size_of::<NodePendingLockState>() as u64
+        + state.name.len() as u64
+        + state.client_id.len() as u64
+        + state.mode.len() as u64
+}
+
+fn node_report_state_bytes(state: &NodeReportState) -> u64 {
+    std::mem::size_of::<NodeReportState>() as u64
+        + state.directory.len() as u64
+        + state.filename.len() as u64
+        + state.signal.len() as u64
+}
+
+fn node_sea_state_bytes(state: &NodeSeaState) -> u64 {
+    std::mem::size_of::<NodeSeaState>() as u64
+        + state
+            .assets
+            .keys()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+}
+
+fn node_zlib_stream_bytes(stream: &NodeZlibStream) -> u64 {
+    match stream {
+        NodeZlibStream::Compress(value) => {
+            std::mem::size_of::<NodeZlibCompressStream>() as u64
+                + std::mem::size_of::<Compress>() as u64
+                + value.mode.len() as u64
+        }
+        NodeZlibStream::Decompress(value) => {
+            std::mem::size_of::<NodeZlibDecompressStream>() as u64
+                + std::mem::size_of::<Decompress>() as u64
+                + value.mode.len() as u64
+        }
     }
 }
 
@@ -4377,6 +5046,7 @@ fn drain_node_jobs_until_quiescent(
         let drained_before = drain_node_next_ticks(context, host, entrypoint)?;
         let drained_timers = drain_node_timers(context, host, entrypoint)?;
         let drained_after = drain_node_next_ticks(context, host, entrypoint)?;
+        node_enforce_runtime_memory_budget(host, "job-drain-iteration")?;
         if drained_before == 0 && drained_after == 0 && drained_timers == 0 {
             let now_ms = node_monotonic_now_ms(host);
             let bootstrap = host.bootstrap.borrow();

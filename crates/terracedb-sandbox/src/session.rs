@@ -51,13 +51,14 @@ use crate::{
     ReadonlyViewProvider, ReadonlyViewRequest, SANDBOX_EXECUTION_POLICY_STATE_FORMAT_VERSION,
     SandboxConfig, SandboxError, SandboxExecutionKind, SandboxExecutionRequest,
     SandboxExecutionResult, SandboxFilesystemShim, SandboxModuleLoader, SandboxRuntimeActor,
-    SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeStateHandle, SandboxServiceBindings,
-    SandboxSessionInfo, SandboxSessionProvenance, SandboxSessionState, StaticCapabilityRegistry,
+    SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeMemoryBudget,
+    SandboxRuntimeStateHandle, SandboxServiceBindings, SandboxSessionInfo,
+    SandboxSessionProvenance, SandboxSessionState, StaticCapabilityRegistry,
     TERRACE_EXECUTION_POLICY_STATE_PATH, TERRACE_METADATA_DIR, TERRACE_NPM_COMPATIBILITY_ROOT,
     TERRACE_NPM_DIR, TERRACE_NPM_SESSION_CACHE_DIR, TERRACE_RUNTIME_CACHE_DIR,
-    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TypeCheckReport, TypeCheckRequest,
-    TypeScriptEmitReport, TypeScriptService, TypeScriptTranspileReport, TypeScriptTranspileRequest,
-    VfsSandboxFilesystemShim,
+    TERRACE_SESSION_INFO_KV_KEY, TERRACE_SESSION_METADATA_PATH, TypeCheckReport,
+    TypeCheckRequest, TypeScriptEmitReport, TypeScriptService, TypeScriptTranspileReport,
+    TypeScriptTranspileRequest, VfsSandboxFilesystemShim,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,6 +469,20 @@ impl SandboxSession {
 
     pub fn runtime_handle(&self) -> SandboxRuntimeHandle {
         self.runtime.clone()
+    }
+
+    pub fn runtime_state_handle(&self) -> SandboxRuntimeStateHandle {
+        self.runtime_actor.state()
+    }
+
+    pub fn set_runtime_memory_budget(&self, memory_budget: Arc<dyn SandboxRuntimeMemoryBudget>) {
+        self.runtime_actor
+            .state()
+            .set_memory_budget(Some(memory_budget));
+    }
+
+    pub fn clear_runtime_memory_budget(&self) {
+        self.runtime_actor.state().set_memory_budget(None);
     }
 
     pub(crate) fn operation_lock(&self) -> Arc<Mutex<()>> {

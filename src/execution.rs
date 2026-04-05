@@ -308,6 +308,25 @@ impl ExecutionResourceUsage {
             .saturating_sub(other.background_in_flight_bytes);
     }
 
+    fn max_assign(&mut self, other: ExecutionResourceUsage) {
+        self.cpu_workers = self.cpu_workers.max(other.cpu_workers);
+        self.memory_bytes = self.memory_bytes.max(other.memory_bytes);
+        self.cache_bytes = self.cache_bytes.max(other.cache_bytes);
+        self.mutable_bytes = self.mutable_bytes.max(other.mutable_bytes);
+        self.local_io_concurrency = self.local_io_concurrency.max(other.local_io_concurrency);
+        self.local_io_bytes_per_second = self
+            .local_io_bytes_per_second
+            .max(other.local_io_bytes_per_second);
+        self.remote_io_concurrency = self.remote_io_concurrency.max(other.remote_io_concurrency);
+        self.remote_io_bytes_per_second = self
+            .remote_io_bytes_per_second
+            .max(other.remote_io_bytes_per_second);
+        self.background_tasks = self.background_tasks.max(other.background_tasks);
+        self.background_in_flight_bytes = self
+            .background_in_flight_bytes
+            .max(other.background_in_flight_bytes);
+    }
+
     fn is_non_zero(&self) -> bool {
         Self::metric_is_non_zero(self.cpu_workers as u64)
             || Self::metric_is_non_zero(self.memory_bytes)
@@ -2009,6 +2028,42 @@ impl ExecutionUsageLease {
         self.usage
     }
 
+    /// Attempts to grow the held usage by `additional`.
+    ///
+    /// If the additional charge is admitted, the lease now owns the expanded
+    /// usage and the returned decision reflects that admission.
+    pub fn try_grow(&mut self, additional: ExecutionResourceUsage) -> ResourceAdmissionDecision {
+        if !self.decision.admitted || self.released || !additional.is_non_zero() {
+            return self.decision.clone();
+        }
+        let decision = self.manager.try_acquire(&self.path, additional);
+        if decision.admitted {
+            self.usage.saturating_add_assign(additional);
+        }
+        self.decision = decision.clone();
+        decision
+    }
+
+    /// Shrinks the held usage by `reduction`.
+    pub fn checked_shrink(
+        &mut self,
+        reduction: ExecutionResourceUsage,
+    ) -> Result<ExecutionDomainSnapshot, ExecutionUsageReleaseError> {
+        if !self.decision.admitted || self.released || !reduction.is_non_zero() {
+            return Ok(self.decision.snapshot.clone());
+        }
+        let snapshot = self.manager.checked_release(&self.path, reduction)?;
+        self.usage.saturating_sub_assign(reduction);
+        self.decision = ResourceAdmissionDecision {
+            admitted: true,
+            borrowed_shared_capacity: self.decision.borrowed_shared_capacity,
+            blocked_by: Vec::new(),
+            effective_budget: snapshot.effective_budget,
+            snapshot: snapshot.clone(),
+        };
+        Ok(snapshot)
+    }
+
     /// Releases the lease immediately and returns the updated snapshot if admitted.
     pub fn release(mut self) -> Option<ExecutionDomainSnapshot> {
         self.release_inner()
@@ -2020,6 +2075,157 @@ impl ExecutionUsageLease {
         }
         self.released = true;
         Some(self.manager.release(&self.path, self.usage))
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionUsageHandleState {
+    held_usage: ExecutionResourceUsage,
+    peak_usage: ExecutionResourceUsage,
+    last_decision: ResourceAdmissionDecision,
+    released: bool,
+}
+
+/// Cloneable live usage handle for domain-backed workloads that need to grow and
+/// shrink their direct charges over time.
+#[derive(Clone)]
+#[must_use = "execution usage is released when the last handle is dropped"]
+pub struct ExecutionUsageHandle {
+    inner: Arc<ExecutionUsageHandleInner>,
+}
+
+struct ExecutionUsageHandleInner {
+    manager: Arc<dyn ResourceManager>,
+    path: ExecutionDomainPath,
+    state: Mutex<ExecutionUsageHandleState>,
+}
+
+impl ExecutionUsageHandle {
+    /// Acquires an initial direct-usage handle against a specific domain path.
+    pub fn acquire(
+        manager: Arc<dyn ResourceManager>,
+        path: ExecutionDomainPath,
+        usage: ExecutionResourceUsage,
+    ) -> Self {
+        let decision = manager.try_acquire(&path, usage);
+        let held_usage = if decision.admitted {
+            usage
+        } else {
+            ExecutionResourceUsage::default()
+        };
+        Self {
+            inner: Arc::new(ExecutionUsageHandleInner {
+                manager,
+                path,
+                state: Mutex::new(ExecutionUsageHandleState {
+                    held_usage,
+                    peak_usage: held_usage,
+                    last_decision: decision,
+                    released: false,
+                }),
+            }),
+        }
+    }
+
+    /// Returns whether the initial request was admitted.
+    pub fn admitted(&self) -> bool {
+        self.inner.state.lock().last_decision.admitted
+    }
+
+    /// Returns the last admission decision observed by this handle.
+    pub fn decision(&self) -> ResourceAdmissionDecision {
+        self.inner.state.lock().last_decision.clone()
+    }
+
+    /// Returns the domain path this handle charges against.
+    pub fn path(&self) -> &ExecutionDomainPath {
+        &self.inner.path
+    }
+
+    /// Returns the currently held usage.
+    pub fn held_usage(&self) -> ExecutionResourceUsage {
+        self.inner.state.lock().held_usage
+    }
+
+    /// Returns the peak usage observed through this handle.
+    pub fn peak_usage(&self) -> ExecutionResourceUsage {
+        self.inner.state.lock().peak_usage
+    }
+
+    /// Attempts to grow the held usage by `additional`.
+    pub fn try_grow(&self, additional: ExecutionResourceUsage) -> ResourceAdmissionDecision {
+        let mut state = self.inner.state.lock();
+        if state.released || !state.last_decision.admitted || !additional.is_non_zero() {
+            return state.last_decision.clone();
+        }
+        let decision = self.inner.manager.try_acquire(&self.inner.path, additional);
+        if decision.admitted {
+            state.held_usage.saturating_add_assign(additional);
+            let held_usage = state.held_usage;
+            state.peak_usage.max_assign(held_usage);
+        }
+        state.last_decision = decision.clone();
+        decision
+    }
+
+    /// Shrinks the held usage by `reduction`.
+    pub fn checked_shrink(
+        &self,
+        reduction: ExecutionResourceUsage,
+    ) -> Result<ExecutionDomainSnapshot, ExecutionUsageReleaseError> {
+        let mut state = self.inner.state.lock();
+        if state.released || !state.last_decision.admitted || !reduction.is_non_zero() {
+            return Ok(state.last_decision.snapshot.clone());
+        }
+        let snapshot = self.inner.manager.checked_release(&self.inner.path, reduction)?;
+        state.held_usage.saturating_sub_assign(reduction);
+        state.last_decision = ResourceAdmissionDecision {
+            admitted: true,
+            borrowed_shared_capacity: state.last_decision.borrowed_shared_capacity,
+            blocked_by: Vec::new(),
+            effective_budget: snapshot.effective_budget,
+            snapshot: snapshot.clone(),
+        };
+        Ok(snapshot)
+    }
+
+    /// Sets the held usage to `new_usage`, growing or shrinking as needed.
+    pub fn checked_set_usage(
+        &self,
+        new_usage: ExecutionResourceUsage,
+    ) -> Result<ResourceAdmissionDecision, ExecutionUsageReleaseError> {
+        let current = self.held_usage();
+        if new_usage.contains(current) {
+            let mut delta = new_usage;
+            delta.saturating_sub_assign(current);
+            return Ok(self.try_grow(delta));
+        }
+
+        let mut reduction = current;
+        reduction.saturating_sub_assign(new_usage);
+        let snapshot = self.checked_shrink(reduction)?;
+        Ok(ResourceAdmissionDecision {
+            admitted: true,
+            borrowed_shared_capacity: false,
+            blocked_by: Vec::new(),
+            effective_budget: snapshot.effective_budget,
+            snapshot,
+        })
+    }
+}
+
+impl Drop for ExecutionUsageHandleInner {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if state.released || !state.last_decision.admitted || !state.held_usage.is_non_zero() {
+            state.released = true;
+            return;
+        }
+        let usage = state.held_usage;
+        state.held_usage = ExecutionResourceUsage::default();
+        state.released = true;
+        drop(state);
+        let _ = self.manager.release(&self.path, usage);
     }
 }
 

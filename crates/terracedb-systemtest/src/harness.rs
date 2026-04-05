@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use futures::FutureExt as _;
 use terracedb::{
     ExecutionDomainBudget, ExecutionDomainPath, ExecutionDomainSpec, ExecutionResourceKind,
-    ExecutionResourceUsage, ExecutionUsageLease, ResourceManager,
+    ExecutionResourceUsage, ExecutionUsageHandle, ResourceManager,
 };
 use thiserror::Error;
 use tokio::{runtime::Builder, time::timeout};
@@ -142,6 +142,21 @@ pub struct SimulationDomainConfig {
     pub default_case_usage: ExecutionResourceUsage,
 }
 
+#[derive(Clone, Default)]
+pub struct SimulationCaseContext {
+    domain_usage: Option<ExecutionUsageHandle>,
+}
+
+impl SimulationCaseContext {
+    fn with_domain_usage(domain_usage: Option<ExecutionUsageHandle>) -> Self {
+        Self { domain_usage }
+    }
+
+    pub fn domain_usage(&self) -> Option<ExecutionUsageHandle> {
+        self.domain_usage.clone()
+    }
+}
+
 impl std::fmt::Debug for SimulationDomainConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimulationDomainConfig")
@@ -218,7 +233,7 @@ impl SimulationHarness {
                         let Some(case) = pop_case(&queue)? else {
                             return Ok::<(), SimulationHarnessError>(());
                         };
-                        let _lease = if let Some(domain) = &domain {
+                        let domain_usage = if let Some(domain) = &domain {
                             Some(
                                 acquire_case_lease(
                                     domain,
@@ -233,7 +248,11 @@ impl SimulationHarness {
                         let started = Instant::now();
                         let status = match timeout(
                             case.timeout,
-                            AssertUnwindSafe(suite.run_case(fixture.clone(), case.clone()))
+                            AssertUnwindSafe(suite.run_case(
+                                fixture.clone(),
+                                case.clone(),
+                                SimulationCaseContext::with_domain_usage(domain_usage.clone()),
+                            ))
                                 .catch_unwind(),
                         )
                         .await
@@ -300,6 +319,7 @@ pub trait SimulationSuiteDefinition: Send + Sync + 'static {
         &self,
         fixture: Arc<Self::Fixture>,
         case: SimulationCaseSpec<Self::Case>,
+        ctx: SimulationCaseContext,
     ) -> Result<(), SimulationHarnessError>;
 }
 
@@ -331,10 +351,10 @@ async fn acquire_case_lease(
     domain: &SimulationDomainConfig,
     case_id: &str,
     requested_usage: ExecutionResourceUsage,
-) -> Result<ExecutionUsageLease, SimulationHarnessError> {
+) -> Result<ExecutionUsageHandle, SimulationHarnessError> {
     let mut subscription = domain.resource_manager.subscribe();
     loop {
-        let lease = ExecutionUsageLease::acquire(
+        let lease = ExecutionUsageHandle::acquire(
             domain.resource_manager.clone(),
             domain.domain_spec.path.clone(),
             requested_usage,
@@ -452,8 +472,8 @@ mod tests {
     };
 
     use super::{
-        SimulationCaseSpec, SimulationCaseStatus, SimulationDomainConfig, SimulationHarness,
-        SimulationHarnessError, SimulationSuiteDefinition,
+        SimulationCaseContext, SimulationCaseSpec, SimulationCaseStatus, SimulationDomainConfig,
+        SimulationHarness, SimulationHarnessError, SimulationSuiteDefinition,
     };
 
     #[derive(Clone)]
@@ -494,6 +514,7 @@ mod tests {
             &self,
             fixture: Arc<Self::Fixture>,
             case: SimulationCaseSpec<Self::Case>,
+            _ctx: SimulationCaseContext,
         ) -> Result<(), SimulationHarnessError> {
             assert_eq!(fixture.prepare_calls.load(Ordering::SeqCst), 1);
             if case.input == "alpha" || case.input == "beta" {
@@ -546,6 +567,7 @@ mod tests {
             &self,
             _fixture: Arc<Self::Fixture>,
             _case: SimulationCaseSpec<Self::Case>,
+            _ctx: SimulationCaseContext,
         ) -> Result<(), SimulationHarnessError> {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(())
@@ -604,6 +626,7 @@ mod tests {
             &self,
             fixture: Arc<Self::Fixture>,
             _case: SimulationCaseSpec<Self::Case>,
+            _ctx: SimulationCaseContext,
         ) -> Result<(), SimulationHarnessError> {
             let current = fixture.active.fetch_add(1, Ordering::SeqCst) + 1;
             loop {
@@ -696,6 +719,7 @@ mod tests {
             &self,
             _fixture: Arc<Self::Fixture>,
             _case: SimulationCaseSpec<Self::Case>,
+            _ctx: SimulationCaseContext,
         ) -> Result<(), SimulationHarnessError> {
             Ok(())
         }

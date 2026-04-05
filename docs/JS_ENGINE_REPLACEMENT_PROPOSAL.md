@@ -1262,13 +1262,43 @@ Deliverables:
   - production Rust code
   - injected host APIs inside sandboxes
 
-The JavaScript runtime must report at least these allocation classes:
+The JavaScript runtime must report a tracked-memory snapshot that is detailed enough for domain
+enforcement and deterministic test assertions.
 
-- heap bytes
-- compiled artifact and code-block bytes
-- module cache bytes
-- external JavaScript-visible buffers and host-owned blobs
-- other runtime-owned structures that materially affect admission and memory pressure
+At minimum, that tracked-memory model must include:
+
+- JavaScript heap / GC bytes
+  - Boa GC managed objects while the Boa-backed path still exists
+- context and runtime state
+  - runtime struct state
+  - realm and context records
+  - environment records
+  - module tables
+  - callback, promise, and task id maps
+- task-queue state
+  - pending task storage
+  - pending microtask queue storage, not only a count
+  - pending host-completion storage
+  - timer table storage
+- compiled-code state
+  - bytecode and code-block storage
+  - constants pools
+  - module artifacts
+  - retained source-map or compile metadata when present
+- parser and compiler retained state
+  - retained compiler-owned artifacts that survive across turns
+  - not every short-lived stack-local allocation unless it is cheap to track precisely
+- module and cache state
+  - module cache entries
+  - resolved-specifier caches
+  - retained source text when the runtime keeps it
+  - package-resolution caches
+- host-visible buffers owned by the runtime
+  - strings
+  - blobs
+  - buffer backing stores
+  - process stdio buffers when they are runtime-owned
+- any other runtime-owned structures that materially affect admission and memory pressure
 
 The Node compatibility layer in `terracedb-sandbox` must then map its own resource usage onto the
 same accounting model, including:
@@ -1277,6 +1307,11 @@ same accounting model, including:
 - CommonJS and ESM module caches
 - `Buffer` / `ArrayBuffer`-backed external storage
 - child Node runtimes created through Node-compatible process spawning
+- process model data
+- `async_wrap`, `task_queue`, and timer state
+- stream and socket handle state
+- inspector, performance, `module_wrap`, and `contextify` state tables
+- Rust-side maps keyed by JavaScript object identity or runtime-owned ids
 
 The simulation harness must evolve from:
 
@@ -1292,6 +1327,10 @@ to:
 Per-case assertions should be expressed in Terrace-owned terms, for example:
 
 - maximum heap bytes
+- maximum context/runtime-state bytes
+- maximum queue bytes
+- maximum compiled-code bytes
+- maximum module/cache bytes
 - maximum external-buffer bytes
 - maximum total runtime bytes
 - maximum aggregate bytes across the suite

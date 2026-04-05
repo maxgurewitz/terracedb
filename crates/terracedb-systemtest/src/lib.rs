@@ -25,9 +25,9 @@ pub mod simulation {
 }
 
 pub use harness::{
-    SimulationCaseReport, SimulationCaseSpec, SimulationCaseStatus, SimulationDomainConfig,
-    SimulationHarness, SimulationHarnessConfig, SimulationHarnessError, SimulationSuiteDefinition,
-    SimulationSuiteReport,
+    SimulationCaseContext, SimulationCaseReport, SimulationCaseSpec, SimulationCaseStatus,
+    SimulationDomainConfig, SimulationHarness, SimulationHarnessConfig, SimulationHarnessError,
+    SimulationSuiteDefinition, SimulationSuiteReport,
 };
 
 pub use terracedb_fuzz::{
