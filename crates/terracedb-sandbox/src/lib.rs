@@ -65,11 +65,13 @@ pub use pr::{
 };
 pub use routing::{SandboxExecutionDomainRoute, SandboxExecutionPlacement, SandboxExecutionRouter};
 pub use runtime::{
-    DeterministicRuntimeBackend, NodeDebugExecutionOptions, SandboxExecutionKind,
-    SandboxExecutionRequest, SandboxExecutionResult, SandboxJsRuntimeBoundaryState,
-    SandboxRuntimeActor, SandboxRuntimeBackend, SandboxRuntimeHandle, SandboxRuntimeMemoryBudget,
-    SandboxRuntimeState, SandboxRuntimeStateHandle, SandboxTrackedMemoryBudgetExceeded,
-    SandboxTrackedMemoryBudgetSnapshot, SandboxTrackedMemoryUsage,
+    DeterministicRuntimeBackend, NodeDebugExecutionOptions, SandboxBatchedDomainMemoryBudget,
+    SandboxExecutionKind, SandboxExecutionRequest, SandboxExecutionResult,
+    SandboxJsRuntimeBoundaryState, SandboxRuntimeActor, SandboxRuntimeBackend,
+    SandboxRuntimeHandle, SandboxRuntimeMemoryBudget, SandboxRuntimeState,
+    SandboxRuntimeStateHandle, SandboxTrackedMemoryBudgetExceeded,
+    SandboxTrackedMemoryBudgetPolicy, SandboxTrackedMemoryBudgetSnapshot,
+    SandboxTrackedMemoryUsage,
 };
 pub use session::{
     CloseSessionOptions, DefaultSandboxStore, ReopenSessionOptions, SandboxServices,

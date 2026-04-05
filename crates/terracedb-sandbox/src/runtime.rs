@@ -39,7 +39,10 @@ use boa_engine::{
     object::{FunctionObjectBuilder, JsObject, ObjectInitializer},
     property::{Attribute, PropertyDescriptor, PropertyKey},
 };
-use boa_gc::runtime_stats as boa_gc_runtime_stats;
+use boa_gc::{
+    GcAllocationBudget, GcAllocationBudgetExceeded, runtime_stats as boa_gc_runtime_stats,
+    set_allocation_budget as boa_gc_set_allocation_budget,
+};
 use boa_interner::Interner;
 use boa_parser::{Parser as BoaParser, Source as BoaParserSource};
 use brotli::{CompressorReader as BrotliCompressorReader, Decompressor as BrotliDecompressor};
@@ -75,6 +78,7 @@ use terracedb_js::{
     JsRuntimeTurn, JsRuntimeTurnOutcome, JsSubstrateError, NeverCancel, RoutedJsHostServices,
     VfsJsHostServiceAdapter,
 };
+use terracedb::{ExecutionResourceUsage, ExecutionUsageHandle};
 use terracedb_vfs::{
     CreateOptions, FileKind, JsonValue, MkdirOptions, ReadOnlyVfsFileSystem, Stats, VfsVolumeExt,
 };
@@ -320,12 +324,12 @@ impl Class for NodeContextifyScriptState {
             js_string!("runInContext"),
             5,
             NativeFunction::from_fn_ptr(node_contextify_script_run_in_context),
-        );
+        )?;
         class.method(
             js_string!("createCachedData"),
             0,
             NativeFunction::from_fn_ptr(node_contextify_script_create_cached_data),
-        );
+        )?;
         Ok(())
     }
 
@@ -1884,7 +1888,25 @@ pub struct SandboxTrackedMemoryBudgetSnapshot {
     pub current: SandboxTrackedMemoryUsage,
     pub peak_bytes: u64,
     pub budget_bytes: Option<u64>,
+    pub charged_bytes: u64,
+    pub allocation_batch_bytes: u64,
+    pub batch_requests: u64,
     pub terminated_for_budget: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxTrackedMemoryBudgetPolicy {
+    pub budget_bytes: Option<u64>,
+    pub allocation_batch_bytes: u64,
+}
+
+impl Default for SandboxTrackedMemoryBudgetPolicy {
+    fn default() -> Self {
+        Self {
+            budget_bytes: None,
+            allocation_batch_bytes: 8 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1909,7 +1931,206 @@ pub trait SandboxRuntimeMemoryBudget: Send + Sync {
         usage: SandboxTrackedMemoryUsage,
     ) -> Result<(), SandboxTrackedMemoryBudgetExceeded>;
 
+    fn reserve_gc_heap_bytes(&self, _bytes: u64) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        Ok(())
+    }
+
+    fn release_gc_heap_bytes(&self, _bytes: u64) {}
+
     fn snapshot(&self) -> SandboxTrackedMemoryBudgetSnapshot;
+}
+
+#[derive(Debug)]
+struct SandboxBatchedDomainMemoryBudgetState {
+    snapshot: SandboxTrackedMemoryBudgetSnapshot,
+}
+
+#[derive(Clone)]
+pub struct SandboxBatchedDomainMemoryBudget {
+    domain_usage: ExecutionUsageHandle,
+    base_usage: ExecutionResourceUsage,
+    policy: SandboxTrackedMemoryBudgetPolicy,
+    state: Arc<StdMutex<SandboxBatchedDomainMemoryBudgetState>>,
+}
+
+impl SandboxBatchedDomainMemoryBudget {
+    pub fn new(
+        domain_usage: ExecutionUsageHandle,
+        policy: SandboxTrackedMemoryBudgetPolicy,
+    ) -> Self {
+        let mut base_usage = domain_usage.held_usage();
+        base_usage.memory_bytes = 0;
+        Self {
+            domain_usage,
+            base_usage,
+            policy,
+            state: Arc::new(StdMutex::new(SandboxBatchedDomainMemoryBudgetState {
+                snapshot: SandboxTrackedMemoryBudgetSnapshot {
+                    current: SandboxTrackedMemoryUsage::default(),
+                    peak_bytes: 0,
+                    budget_bytes: policy.budget_bytes,
+                    charged_bytes: 0,
+                    allocation_batch_bytes: policy.allocation_batch_bytes,
+                    batch_requests: 0,
+                    terminated_for_budget: false,
+                },
+            })),
+        }
+    }
+
+    pub fn policy(&self) -> SandboxTrackedMemoryBudgetPolicy {
+        self.policy
+    }
+
+    fn sync_usage_locked(
+        &self,
+        state: &mut SandboxBatchedDomainMemoryBudgetState,
+        usage: SandboxTrackedMemoryUsage,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        let batch = self.policy.allocation_batch_bytes.max(1);
+        let required_charged_bytes = if usage.total_bytes == 0 {
+            0
+        } else {
+            usage.total_bytes
+                .saturating_add(batch - 1)
+                .saturating_div(batch)
+                .saturating_mul(batch)
+        };
+        let mut requested_usage = self.base_usage;
+        requested_usage.memory_bytes = required_charged_bytes;
+
+        state.snapshot.current = usage.clone();
+        state.snapshot.peak_bytes = state.snapshot.peak_bytes.max(usage.total_bytes);
+        state.snapshot.budget_bytes = self.policy.budget_bytes;
+        state.snapshot.allocation_batch_bytes = batch;
+
+        if let Some(budget_bytes) = self.policy.budget_bytes
+            && usage.total_bytes > budget_bytes
+        {
+            state.snapshot.terminated_for_budget = true;
+            return Err(SandboxTrackedMemoryBudgetExceeded {
+                usage,
+                peak_bytes: state.snapshot.peak_bytes,
+                budget_bytes: Some(budget_bytes),
+                message: format!(
+                    "tracked memory budget exceeded: current_bytes={} budget_bytes={}",
+                    state.snapshot.current.total_bytes, budget_bytes
+                ),
+            });
+        }
+
+        let previous_charged_bytes = state.snapshot.charged_bytes;
+        if required_charged_bytes == previous_charged_bytes {
+            return Ok(());
+        }
+
+        match self.domain_usage.checked_set_usage(requested_usage) {
+            Ok(decision) if decision.admitted => {
+                state.snapshot.charged_bytes = required_charged_bytes;
+                if required_charged_bytes > previous_charged_bytes {
+                    state.snapshot.batch_requests = state.snapshot.batch_requests.saturating_add(1);
+                }
+                Ok(())
+            }
+            Ok(decision) => {
+                state.snapshot.terminated_for_budget = true;
+                Err(SandboxTrackedMemoryBudgetExceeded {
+                    usage,
+                    peak_bytes: state.snapshot.peak_bytes,
+                    budget_bytes: self.policy.budget_bytes,
+                    message: format!(
+                        "domain denied tracked memory batch at {}: current_bytes={} charged_bytes={} blocked_by={:?}",
+                        self.domain_usage.path(),
+                        state.snapshot.current.total_bytes,
+                        required_charged_bytes,
+                        decision.blocked_by
+                    ),
+                })
+            }
+            Err(error) => {
+                state.snapshot.terminated_for_budget = true;
+                Err(SandboxTrackedMemoryBudgetExceeded {
+                    usage,
+                    peak_bytes: state.snapshot.peak_bytes,
+                    budget_bytes: self.policy.budget_bytes,
+                    message: format!(
+                        "updating domain tracked memory usage failed at {}: {error}",
+                        self.domain_usage.path()
+                    ),
+                })
+            }
+        }
+    }
+}
+
+impl SandboxRuntimeMemoryBudget for SandboxBatchedDomainMemoryBudget {
+    fn update_tracked_memory_usage(
+        &self,
+        usage: SandboxTrackedMemoryUsage,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        let mut state = self.state.lock().expect("sandbox batched memory budget");
+        self.sync_usage_locked(&mut state, usage)
+    }
+
+    fn reserve_gc_heap_bytes(&self, bytes: u64) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut state = self.state.lock().expect("sandbox batched memory budget");
+        let non_gc_bytes = state
+            .snapshot
+            .current
+            .total_bytes
+            .saturating_sub(state.snapshot.current.gc_heap_bytes);
+        let mut usage = state.snapshot.current.clone();
+        usage.gc_heap_bytes = usage.gc_heap_bytes.saturating_add(bytes);
+        usage.total_bytes = non_gc_bytes.saturating_add(usage.gc_heap_bytes);
+        self.sync_usage_locked(&mut state, usage)
+    }
+
+    fn release_gc_heap_bytes(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = self.state.lock().expect("sandbox batched memory budget");
+        let non_gc_bytes = state
+            .snapshot
+            .current
+            .total_bytes
+            .saturating_sub(state.snapshot.current.gc_heap_bytes);
+        let mut usage = state.snapshot.current.clone();
+        usage.gc_heap_bytes = usage.gc_heap_bytes.saturating_sub(bytes);
+        usage.total_bytes = non_gc_bytes.saturating_add(usage.gc_heap_bytes);
+        let _ = self.sync_usage_locked(&mut state, usage);
+    }
+
+    fn snapshot(&self) -> SandboxTrackedMemoryBudgetSnapshot {
+        self.state
+            .lock()
+            .expect("sandbox batched memory budget")
+            .snapshot
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct SandboxGcAllocationBudgetAdapter {
+    budget: Arc<dyn SandboxRuntimeMemoryBudget>,
+}
+
+impl GcAllocationBudget for SandboxGcAllocationBudgetAdapter {
+    fn reserve_bytes(&self, bytes: usize) -> Result<(), GcAllocationBudgetExceeded> {
+        self.budget
+            .reserve_gc_heap_bytes(bytes as u64)
+            .map_err(|error| GcAllocationBudgetExceeded {
+                requested_bytes: bytes,
+                message: error.to_string(),
+            })
+    }
+
+    fn release_bytes(&self, bytes: usize) {
+        self.budget.release_gc_heap_bytes(bytes as u64);
+    }
 }
 
 #[derive(Default)]
@@ -2703,6 +2924,10 @@ fn execute_node_command_inner(
     let _guard = span.enter();
 
     with_active_node_host(node_host.clone(), |node_host| {
+        let gc_budget = node_host.runtime_state.memory_budget().map(|budget| {
+            Arc::new(SandboxGcAllocationBudgetAdapter { budget }) as Arc<dyn GcAllocationBudget>
+        });
+        let _budget_guard = boa_gc_set_allocation_budget(gc_budget);
         let module_loader = Rc::new(NodeCommandModuleLoader::new(node_host.clone()));
         let mut context = Context::builder()
             .module_loader(module_loader)
@@ -2713,13 +2938,10 @@ fn execute_node_command_inner(
                 message: error.to_string(),
             })?;
         node_debug_event(node_host, "stage", "context-built".to_string())?;
-        node_enforce_runtime_memory_budget(node_host, "context-built")?;
         install_node_host_bindings(&mut context)?;
         node_debug_event(node_host, "stage", "host-bindings-installed".to_string())?;
-        node_enforce_runtime_memory_budget(node_host, "host-bindings-installed")?;
         node_install_base_process_global(&mut context, node_host)?;
         node_debug_event(node_host, "stage", "base-process-installed".to_string())?;
-        node_enforce_runtime_memory_budget(node_host, "base-process-installed")?;
         match node_execute_upstream_bootstrap_and_main(
             &mut context,
             node_host,
@@ -2727,9 +2949,7 @@ fn execute_node_command_inner(
             &normalized_entrypoint,
         ) {
             Ok(()) => {
-                node_enforce_runtime_memory_budget(node_host, "bootstrap-complete")?;
                 drain_node_jobs_until_quiescent(&mut context, node_host, &entrypoint)?;
-                node_enforce_runtime_memory_budget(node_host, "job-drain-complete")?;
             }
             Err(SandboxError::ProcessExited) => {}
             Err(SandboxError::ExecveReplaced) => {}
@@ -2748,8 +2968,7 @@ fn execute_node_command_inner(
             .filter(|path| path.contains("/node_modules/"))
             .count();
         let debug_trace = node_host.debug_trace.borrow().clone();
-        let runtime_state_snapshot =
-            futures::executor::block_on(node_host.runtime_state.snapshot());
+        let runtime_state_snapshot = futures::executor::block_on(node_host.runtime_state.snapshot());
         let managed_memory = node_runtime_managed_memory_stats(node_host, &runtime_state_snapshot);
         let gc_stats = boa_gc_runtime_stats();
         let accounted_bytes = managed_memory
@@ -3042,7 +3261,6 @@ fn node_execute_upstream_bootstrap_and_main(
 
     node_prepare_process_for_bootstrap(context, host, &process, &internal_binding)?;
     node_debug_event(host, "stage", "bootstrap-realm-done".to_string())?;
-    node_enforce_runtime_memory_budget(host, "bootstrap-realm-ready")?;
 
     for specifier in [
         "internal/bootstrap/node",
@@ -3067,7 +3285,6 @@ fn node_execute_upstream_bootstrap_and_main(
         )?;
         node_await_if_promise(context, host, entrypoint, result)?;
         node_debug_event(host, "stage", format!("builtin-done {specifier}"))?;
-        node_enforce_runtime_memory_budget(host, &format!("builtin-done {specifier}"))?;
     }
 
     Ok(())
@@ -3763,7 +3980,6 @@ impl NodeCommandModuleLoader {
                 .map_err(sandbox_execution_error)?
             }
         };
-        node_enforce_runtime_memory_budget(&self.host, "module-materialize")?;
         self.host
             .materialized_modules
             .borrow_mut()
@@ -3897,7 +4113,8 @@ fn synthetic_node_namespace_module(
         path,
         None,
         context,
-    ))
+    )
+    .map_err(sandbox_execution_error)?)
 }
 
 fn node_namespace_for_resolved(
@@ -4134,45 +4351,6 @@ fn node_runtime_progress_snapshot(
         process.stdout.len(),
         process.stderr.len(),
     )
-}
-
-fn node_runtime_tracked_memory_usage(
-    host: &NodeRuntimeHost,
-    runtime_state: &SandboxRuntimeState,
-) -> SandboxTrackedMemoryUsage {
-    let managed = node_runtime_managed_memory_stats(host, runtime_state);
-    let gc_heap_bytes = boa_gc_runtime_stats().bytes_allocated as u64;
-    SandboxTrackedMemoryUsage {
-        total_bytes: managed.total_bytes.saturating_add(gc_heap_bytes),
-        gc_heap_bytes,
-        context_runtime_bytes: managed.context_runtime_bytes,
-        task_queue_bytes: managed.task_queue_bytes,
-        compiled_code_bytes: managed.compiled_code_bytes,
-        parser_retained_bytes: managed.parser_retained_bytes,
-        module_cache_bytes: managed.module_cache_bytes,
-        host_buffer_bytes: managed.host_buffer_bytes,
-        node_compat_state_bytes: managed.node_compat_state_bytes,
-    }
-}
-
-fn node_enforce_runtime_memory_budget(
-    host: &NodeRuntimeHost,
-    stage: &str,
-) -> Result<(), SandboxError> {
-    let Some(memory_budget) = host.runtime_state.memory_budget() else {
-        return Ok(());
-    };
-    let runtime_state = futures::executor::block_on(host.runtime_state.snapshot());
-    let usage = node_runtime_tracked_memory_usage(host, &runtime_state);
-    memory_budget
-        .update_tracked_memory_usage(usage.clone())
-        .map_err(|error| SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: format!(
-                "tracked runtime memory budget exceeded at {stage}: {} (total_bytes={}, peak_bytes={}, budget_bytes={:?})",
-                error.message, error.usage.total_bytes, error.peak_bytes, error.budget_bytes
-            ),
-        })
 }
 
 fn node_runtime_managed_memory_stats(
@@ -5046,7 +5224,6 @@ fn drain_node_jobs_until_quiescent(
         let drained_before = drain_node_next_ticks(context, host, entrypoint)?;
         let drained_timers = drain_node_timers(context, host, entrypoint)?;
         let drained_after = drain_node_next_ticks(context, host, entrypoint)?;
-        node_enforce_runtime_memory_budget(host, "job-drain-iteration")?;
         if drained_before == 0 && drained_after == 0 && drained_timers == 0 {
             let now_ms = node_monotonic_now_ms(host);
             let bootstrap = host.bootstrap.borrow();
@@ -11879,7 +12056,7 @@ fn node_internal_binding_contextify(context: &mut Context) -> Result<JsObject, S
     let object = ObjectInitializer::new(context).build();
     let mut script_class = ClassBuilder::new::<NodeContextifyScriptState>(context);
     NodeContextifyScriptState::init(&mut script_class).map_err(sandbox_execution_error)?;
-    let script_constructor = script_class.build().constructor();
+    let script_constructor = script_class.build().map_err(sandbox_execution_error)?.constructor();
     object
         .set(
             js_string!("ContextifyScript"),

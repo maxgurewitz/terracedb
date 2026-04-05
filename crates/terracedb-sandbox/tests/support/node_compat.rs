@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -13,13 +13,12 @@ use std::{
 
 use terracedb::{
     DomainCpuBudget, ExecutionDomainBudget, ExecutionDomainOwner, ExecutionDomainPath,
-    ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionResourceUsage, ExecutionUsageHandle,
-    InMemoryResourceManager,
+    ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionResourceUsage, InMemoryResourceManager,
 };
 use terracedb_sandbox::{
-    ConflictPolicy, PackageCompatibilityMode, SandboxBaseLayer, SandboxConfig, SandboxError,
-    SandboxHarness, SandboxRuntimeMemoryBudget, SandboxTrackedMemoryBudgetExceeded,
-    SandboxTrackedMemoryBudgetSnapshot, SandboxTrackedMemoryUsage, SandboxServices,
+    ConflictPolicy, PackageCompatibilityMode, SandboxBaseLayer, SandboxBatchedDomainMemoryBudget,
+    SandboxConfig, SandboxError, SandboxHarness, SandboxRuntimeMemoryBudget, SandboxServices,
+    SandboxTrackedMemoryBudgetPolicy,
 };
 use terracedb_systemtest::{
     SimulationCaseContext, SimulationCaseSpec, SimulationDomainConfig, SimulationHarness,
@@ -37,6 +36,7 @@ const GENERATED_UPSTREAM_NODE_MAX_WORKERS: usize = 3;
 const GENERATED_UPSTREAM_NODE_TOTAL_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const GENERATED_UPSTREAM_NODE_MIN_CASE_MEMORY_BUDGET_BYTES: u64 = 48 * 1024 * 1024;
 const GENERATED_UPSTREAM_NODE_CASE_MEMORY_HEADROOM_MULTIPLIER: u64 = 2;
+const GENERATED_UPSTREAM_NODE_ALLOCATION_BATCH_BYTES: u64 = 4 * 1024 * 1024;
 static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 static SHARED_UPSTREAM_NODE_HARNESS: OnceCell<SandboxHarness<InMemoryVfsStore>> =
     OnceCell::const_new();
@@ -75,93 +75,6 @@ struct GeneratedUpstreamNodeSuite {
 struct GeneratedUpstreamNodeBudget {
     case_requested_usage: ExecutionResourceUsage,
     per_case_accounted_memory_budget_bytes: u64,
-}
-
-#[derive(Clone)]
-pub struct NodeCompatDomainMemoryBudget {
-    domain_usage: ExecutionUsageHandle,
-    base_usage: ExecutionResourceUsage,
-    per_case_budget_bytes: u64,
-    snapshot: Arc<StdMutex<SandboxTrackedMemoryBudgetSnapshot>>,
-}
-
-impl NodeCompatDomainMemoryBudget {
-    pub fn new(domain_usage: ExecutionUsageHandle, per_case_budget_bytes: u64) -> Self {
-        let mut base_usage = domain_usage.held_usage();
-        base_usage.memory_bytes = 0;
-        Self {
-            domain_usage,
-            base_usage,
-            per_case_budget_bytes,
-            snapshot: Arc::new(StdMutex::new(SandboxTrackedMemoryBudgetSnapshot {
-                current: SandboxTrackedMemoryUsage::default(),
-                peak_bytes: 0,
-                budget_bytes: Some(per_case_budget_bytes),
-                terminated_for_budget: false,
-            })),
-        }
-    }
-
-    pub fn snapshot(&self) -> SandboxTrackedMemoryBudgetSnapshot {
-        self.snapshot.lock().expect("node compat memory snapshot").clone()
-    }
-}
-
-impl SandboxRuntimeMemoryBudget for NodeCompatDomainMemoryBudget {
-    fn update_tracked_memory_usage(
-        &self,
-        usage: SandboxTrackedMemoryUsage,
-    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
-        let mut snapshot = self.snapshot.lock().expect("node compat memory snapshot");
-        snapshot.current = usage.clone();
-        snapshot.peak_bytes = snapshot.peak_bytes.max(usage.total_bytes);
-        snapshot.budget_bytes = Some(self.per_case_budget_bytes);
-        if usage.total_bytes > self.per_case_budget_bytes {
-            snapshot.terminated_for_budget = true;
-            return Err(SandboxTrackedMemoryBudgetExceeded {
-                usage,
-                peak_bytes: snapshot.peak_bytes,
-                budget_bytes: snapshot.budget_bytes,
-                message: format!(
-                    "per-case tracked memory budget exceeded: current_bytes={} budget_bytes={}",
-                    snapshot.current.total_bytes, self.per_case_budget_bytes
-                ),
-            });
-        }
-
-        let mut requested_usage = self.base_usage;
-        requested_usage.memory_bytes = usage.total_bytes;
-        match self.domain_usage.checked_set_usage(requested_usage) {
-            Ok(decision) if decision.admitted => Ok(()),
-            Ok(decision) => {
-                snapshot.terminated_for_budget = true;
-                Err(SandboxTrackedMemoryBudgetExceeded {
-                    usage,
-                    peak_bytes: snapshot.peak_bytes,
-                    budget_bytes: snapshot.budget_bytes,
-                    message: format!(
-                        "domain denied tracked memory growth at {}: requested_bytes={} blocked_by={:?}",
-                        self.domain_usage.path(),
-                        snapshot.current.total_bytes,
-                        decision.blocked_by
-                    ),
-                })
-            }
-            Err(error) => {
-                snapshot.terminated_for_budget = true;
-                Err(SandboxTrackedMemoryBudgetExceeded {
-                    usage,
-                    peak_bytes: snapshot.peak_bytes,
-                    budget_bytes: snapshot.budget_bytes,
-                    message: format!("updating domain tracked memory usage failed: {error}"),
-                })
-            }
-        }
-    }
-
-    fn snapshot(&self) -> SandboxTrackedMemoryBudgetSnapshot {
-        NodeCompatDomainMemoryBudget::snapshot(self)
-    }
 }
 
 async fn shared_upstream_node_harness() -> &'static SandboxHarness<InMemoryVfsStore> {
@@ -567,9 +480,12 @@ impl SimulationSuiteDefinition for GeneratedUpstreamNodeSuite {
         let memory_budget = ctx
             .domain_usage()
             .map(|domain_usage| {
-                Arc::new(NodeCompatDomainMemoryBudget::new(
+                Arc::new(SandboxBatchedDomainMemoryBudget::new(
                     domain_usage,
-                    self.per_case_accounted_memory_budget_bytes,
+                    SandboxTrackedMemoryBudgetPolicy {
+                        budget_bytes: Some(self.per_case_accounted_memory_budget_bytes),
+                        allocation_batch_bytes: GENERATED_UPSTREAM_NODE_ALLOCATION_BATCH_BYTES,
+                    },
                 )) as Arc<dyn SandboxRuntimeMemoryBudget>
             });
         let result = exec_upstream_node_test_in_harness(

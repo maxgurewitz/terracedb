@@ -7,6 +7,10 @@ use terracedb::{
     InMemoryResourceManager, ResourceManager,
 };
 use terracedb_simulation::SeededSimulationRunner;
+use terracedb_sandbox::{
+    SandboxBatchedDomainMemoryBudget, SandboxRuntimeMemoryBudget,
+    SandboxTrackedMemoryBudgetPolicy,
+};
 
 #[path = "support/node_compat.rs"]
 mod node_compat_support;
@@ -34,11 +38,12 @@ struct NodeCompatMemorySimulationCapture {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct NodeCompatMemoryBudgetCapture {
-    error: String,
+struct NodeCompatBudgetFailureCapture {
+    message: String,
+    charged_bytes: u64,
     current_bytes: u64,
-    peak_bytes: u64,
-    budget_bytes: Option<u64>,
+    gc_bytes: u64,
+    batch_requests: u64,
     terminated_for_budget: bool,
 }
 
@@ -195,38 +200,32 @@ fn run_node_memory_tracking_simulation(
         })
 }
 
-fn run_node_memory_budget_enforcement_simulation(
+fn run_node_allocator_budget_failure_simulation(
     seed: u64,
-) -> turmoil::Result<NodeCompatMemoryBudgetCapture> {
+) -> turmoil::Result<NodeCompatBudgetFailureCapture> {
     SeededSimulationRunner::new(seed)
         .with_simulation_duration(Duration::from_millis(50))
         .run_with(move |_context| async move {
             let entrypoint = "/workspace/app/index.cjs";
-            let session = node_compat_support::open_node_session(
-                1010 + seed,
-                631 + seed,
-                entrypoint,
-                r#"
-                const { URLPattern } = require("url");
-                globalThis.pattern = new URLPattern({ pathname: "/:id" });
-                globalThis.buffer = Buffer.from("force-budget-failure");
-                console.log(globalThis.buffer.toString());
-                "#,
-            )
-            .await;
+            let session =
+                node_compat_support::open_node_session(1010 + seed, 641 + seed, entrypoint, r#"
+                const values = [];
+                for (let i = 0; i < 20000; i += 1) {
+                  values.push({ index: i, payload: "x".repeat(64) });
+                }
+                console.log(values.length);
+                "#).await;
+
             let resource_manager = std::sync::Arc::new(InMemoryResourceManager::new(
                 ExecutionDomainBudget::default(),
             ));
-            let domain_path = ExecutionDomainPath::new([
-                "process",
-                "sandbox-tests",
-                "node-memory-budget-enforcement",
-            ]);
+            let domain_path =
+                ExecutionDomainPath::new(["process", "sandbox-tests", "allocator-budget"]);
             resource_manager.register_domain(ExecutionDomainSpec {
                 path: domain_path.clone(),
                 owner: ExecutionDomainOwner::Subsystem {
                     database: None,
-                    name: "node-memory-budget-enforcement".to_string(),
+                    name: "allocator-budget".to_string(),
                 },
                 budget: ExecutionDomainBudget {
                     cpu: DomainCpuBudget {
@@ -234,7 +233,7 @@ fn run_node_memory_budget_enforcement_simulation(
                         weight: Some(1),
                     },
                     memory: terracedb::DomainMemoryBudget {
-                        total_bytes: Some(64 * 1024),
+                        total_bytes: Some(256 * 1024),
                         cache_bytes: None,
                         mutable_bytes: None,
                     },
@@ -252,14 +251,18 @@ fn run_node_memory_budget_enforcement_simulation(
                 },
             );
             if !usage_handle.admitted() {
-                return Err("domain usage handle was not admitted".into());
+                return Err("allocator-budget domain was not admitted".into());
             }
-            let budget = std::sync::Arc::new(node_compat_support::NodeCompatDomainMemoryBudget::new(
+            let budget = std::sync::Arc::new(SandboxBatchedDomainMemoryBudget::new(
                 usage_handle,
-                64 * 1024,
+                SandboxTrackedMemoryBudgetPolicy {
+                    budget_bytes: None,
+                    allocation_batch_bytes: 8 * 1024,
+                },
             ));
             session.set_runtime_memory_budget(budget.clone());
-            let error = match session
+
+            match session
                 .exec_node_command(
                     entrypoint,
                     vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
@@ -271,17 +274,19 @@ fn run_node_memory_budget_enforcement_simulation(
                 )
                 .await
             {
-                Ok(_) => return Err("expected tracked memory budget failure".into()),
-                Err(error) => error.to_string(),
-            };
-            let snapshot = budget.snapshot();
-            Ok(NodeCompatMemoryBudgetCapture {
-                error,
-                current_bytes: snapshot.current.total_bytes,
-                peak_bytes: snapshot.peak_bytes,
-                budget_bytes: snapshot.budget_bytes,
-                terminated_for_budget: snapshot.terminated_for_budget,
-            })
+                Ok(result) => Err(format!("expected budget failure, got success: {result:#?}").into()),
+                Err(error) => {
+                    let snapshot = budget.snapshot();
+                    Ok(NodeCompatBudgetFailureCapture {
+                        message: error.to_string(),
+                        charged_bytes: snapshot.charged_bytes,
+                        current_bytes: snapshot.current.total_bytes,
+                        gc_bytes: snapshot.current.gc_heap_bytes,
+                        batch_requests: snapshot.batch_requests,
+                        terminated_for_budget: snapshot.terminated_for_budget,
+                    })
+                }
+            }
         })
 }
 
@@ -346,15 +351,97 @@ fn seeded_node_memory_tracking_reports_named_buckets() -> turmoil::Result<()> {
 }
 
 #[test]
-fn seeded_node_memory_budget_is_enforced_deterministically() -> turmoil::Result<()> {
-    let capture = run_node_memory_budget_enforcement_simulation(991)?;
+fn batched_memory_budget_only_grows_on_batch_boundaries() {
+    let resource_manager = std::sync::Arc::new(InMemoryResourceManager::new(
+        ExecutionDomainBudget::default(),
+    ));
+    let domain_path = ExecutionDomainPath::new(["process", "sandbox-tests", "batched-memory"]);
+    resource_manager.register_domain(ExecutionDomainSpec {
+        path: domain_path.clone(),
+        owner: ExecutionDomainOwner::Subsystem {
+            database: None,
+            name: "batched-memory".to_string(),
+        },
+        budget: ExecutionDomainBudget {
+            cpu: DomainCpuBudget {
+                worker_slots: Some(1),
+                weight: Some(1),
+            },
+            memory: terracedb::DomainMemoryBudget {
+                total_bytes: Some(256 * 1024),
+                cache_bytes: None,
+                mutable_bytes: None,
+            },
+            ..Default::default()
+        },
+        placement: ExecutionDomainPlacement::Dedicated,
+        metadata: Default::default(),
+    });
+    let usage_handle = ExecutionUsageHandle::acquire(
+        resource_manager,
+        domain_path,
+        ExecutionResourceUsage {
+            cpu_workers: 1,
+            ..Default::default()
+        },
+    );
+    assert!(usage_handle.admitted());
+    let budget = SandboxBatchedDomainMemoryBudget::new(
+        usage_handle,
+        SandboxTrackedMemoryBudgetPolicy {
+            budget_bytes: Some(256 * 1024),
+            allocation_batch_bytes: 8 * 1024,
+        },
+    );
+    budget
+        .update_tracked_memory_usage(terracedb_sandbox::SandboxTrackedMemoryUsage {
+            total_bytes: 1_000,
+            ..Default::default()
+        })
+        .expect("first batch request");
+    let first = budget.snapshot();
+    assert_eq!(first.charged_bytes, 8 * 1024, "{first:#?}");
+    assert_eq!(first.batch_requests, 1, "{first:#?}");
+
+    budget
+        .update_tracked_memory_usage(terracedb_sandbox::SandboxTrackedMemoryUsage {
+            total_bytes: 2_000,
+            ..Default::default()
+        })
+        .expect("same batch update");
+    let second = budget.snapshot();
+    assert_eq!(second.charged_bytes, 8 * 1024, "{second:#?}");
+    assert_eq!(second.batch_requests, 1, "{second:#?}");
+
+    budget
+        .update_tracked_memory_usage(terracedb_sandbox::SandboxTrackedMemoryUsage {
+            total_bytes: 9_000,
+            ..Default::default()
+        })
+        .expect("second batch request");
+    let third = budget.snapshot();
+    assert_eq!(third.charged_bytes, 16 * 1024, "{third:#?}");
+    assert_eq!(third.batch_requests, 2, "{third:#?}");
+}
+
+#[test]
+fn seeded_node_budget_failure_happens_from_allocator_accounting() -> turmoil::Result<()> {
+    let capture = run_node_allocator_budget_failure_simulation(991)?;
     assert!(
-        capture.error.contains("tracked runtime memory budget exceeded"),
+        capture.message.contains("domain denied tracked memory batch"),
         "{capture:#?}"
     );
-    assert_eq!(capture.budget_bytes, Some(64 * 1024), "{capture:#?}");
+    assert!(capture.gc_bytes > 0, "{capture:#?}");
+    assert!(capture.current_bytes > 0, "{capture:#?}");
+    assert!(capture.batch_requests > 0, "{capture:#?}");
+    assert!(
+        capture.current_bytes >= capture.charged_bytes,
+        "{capture:#?}"
+    );
+    assert!(
+        capture.current_bytes - capture.charged_bytes <= 8 * 1024,
+        "{capture:#?}"
+    );
     assert!(capture.terminated_for_budget, "{capture:#?}");
-    assert!(capture.current_bytes > 64 * 1024, "{capture:#?}");
-    assert!(capture.peak_bytes >= capture.current_bytes, "{capture:#?}");
     Ok(())
 }
