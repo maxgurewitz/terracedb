@@ -2,27 +2,44 @@
 #[path = "../support/node_compat.rs"]
 mod node_compat;
 
-fn stdout_stderr_exit(result: &terracedb_sandbox::SandboxExecutionResult) -> (String, String, i64) {
-    let report = result
-        .result
-        .as_ref()
-        .and_then(|value| value.as_object())
-        .expect("node command report");
-    let stdout = report
-        .get("stdout")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let stderr = report
-        .get("stderr")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let exit_code = report
-        .get("exitCode")
-        .and_then(|value| value.as_i64())
-        .unwrap_or_default();
-    (stdout, stderr, exit_code)
+include!("body.rs");
+
+fn format_case_timings(report: &terracedb_systemtest::SimulationSuiteReport) -> String {
+    let mut output = String::new();
+    for case in &report.cases {
+        let status = match &case.status {
+            terracedb_systemtest::SimulationCaseStatus::Passed => "passed".to_string(),
+            terracedb_systemtest::SimulationCaseStatus::Failed { .. } => "failed".to_string(),
+            terracedb_systemtest::SimulationCaseStatus::TimedOut { .. } => "timed_out".to_string(),
+            terracedb_systemtest::SimulationCaseStatus::Panicked { .. } => "panicked".to_string(),
+        };
+        output.push_str(&format!(
+            "[{}] {}: {:?} ({})\n",
+            case.case_id, case.label, case.elapsed, status
+        ));
+    }
+    output
 }
 
-include!("body.rs");
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_upstream_node_suite() {
+    let started = std::time::Instant::now();
+    let report = node_compat::run_generated_upstream_node_suite(GENERATED_UPSTREAM_NODE_CASES)
+        .await
+        .expect("run generated upstream node suite");
+    let elapsed = started.elapsed();
+    println!(
+        "generated upstream node suite: {} in {:?}\n{}",
+        report.summary_line(),
+        elapsed,
+        format_case_timings(&report)
+    );
+    assert!(
+        report.is_success(),
+        "generated upstream node suite: {} in {:?}\n{}\n{}",
+        report.summary_line(),
+        elapsed,
+        format_case_timings(&report),
+        report.failure_summary()
+    );
+}

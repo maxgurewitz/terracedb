@@ -9,6 +9,8 @@ use terracedb_fuzz::{
 };
 use thiserror::Error;
 
+pub mod harness;
+
 pub mod http {
     pub use terracedb_http::{
         HttpFailureStage, HttpTraceEvent, SimulatedHttpClient, SimulatedHttpServer,
@@ -21,6 +23,12 @@ pub mod simulation {
         NetworkObjectStore, SeededSimulationRunner, SimulationContext, SimulationHost, TurmoilClock,
     };
 }
+
+pub use harness::{
+    SimulationCaseReport, SimulationCaseSpec, SimulationCaseStatus, SimulationHarness,
+    SimulationHarnessConfig, SimulationHarnessError, SimulationSuiteDefinition,
+    SimulationSuiteReport,
+};
 
 pub use terracedb_fuzz::{
     ArtifactError, MinimizationReport, ReplayBatch, ReplayCapture, ReplayPair, ScenarioOperations,

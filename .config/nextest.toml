@@ -4,8 +4,8 @@ nextest-version = "0.9.132"
 slow-timeout = { period = "15s", terminate-after = 1, grace-period = "0s" }
 
 [[profile.default.overrides]]
-filter = "binary(custom_node_runner) & test(/^upstream_commonjs_custom_runner_single_case$/)"
-slow-timeout = { period = "120s", terminate-after = 2, grace-period = "5s" }
+filter = "binary(generated_node_upstream) & test(/^generated_upstream_node_suite$/)"
+slow-timeout = { period = "300s", terminate-after = 2, grace-period = "5s" }
 
 [profile.pre-commit]
 inherits = "default"

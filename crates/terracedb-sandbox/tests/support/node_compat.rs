@@ -1,12 +1,20 @@
+use async_trait::async_trait;
 use std::{
     collections::BTreeMap,
     fs,
     path::PathBuf,
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use terracedb_systemtest::{
+    SimulationCaseSpec, SimulationHarness, SimulationHarnessError, SimulationSuiteDefinition,
+    SimulationSuiteReport,
+};
 use terracedb_sandbox::{
     ConflictPolicy, PackageCompatibilityMode, SandboxBaseLayer, SandboxConfig, SandboxError,
     SandboxHarness, SandboxServices,
@@ -23,6 +31,33 @@ static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 static SHARED_UPSTREAM_NODE_HARNESS: OnceCell<SandboxHarness<InMemoryVfsStore>> =
     OnceCell::const_new();
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeneratedUpstreamNodeCase {
+    pub case_id: &'static str,
+    pub path: &'static str,
+    pub timeout_secs: u64,
+}
+
+impl GeneratedUpstreamNodeCase {
+    pub const fn new(case_id: &'static str, path: &'static str, timeout_secs: u64) -> Self {
+        Self {
+            case_id,
+            path,
+            timeout_secs,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GeneratedUpstreamNodeFixture {
+    harness: Arc<SandboxHarness<InMemoryVfsStore>>,
+    base_volume_id: VolumeId,
+}
+
+struct GeneratedUpstreamNodeSuite {
+    cases: &'static [GeneratedUpstreamNodeCase],
+}
+
 async fn shared_upstream_node_harness() -> &'static SandboxHarness<InMemoryVfsStore> {
     SHARED_UPSTREAM_NODE_HARNESS
         .get_or_init(|| async {
@@ -34,6 +69,68 @@ async fn shared_upstream_node_harness() -> &'static SandboxHarness<InMemoryVfsSt
                 .expect("import shared node base layer");
             harness
         })
+        .await
+}
+
+pub fn stdout_stderr_exit(
+    result: &terracedb_sandbox::SandboxExecutionResult,
+) -> (String, String, i64) {
+    let report = result
+        .result
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .expect("node command report");
+    let stdout = report
+        .get("stdout")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let stderr = report
+        .get("stderr")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let exit_code = report
+        .get("exitCode")
+        .and_then(|value| value.as_i64())
+        .unwrap_or_default();
+    (stdout, stderr, exit_code)
+}
+
+async fn exec_upstream_node_test_in_harness(
+    harness: &SandboxHarness<InMemoryVfsStore>,
+    base_volume_id: VolumeId,
+    entrypoint: &str,
+) -> Result<terracedb_sandbox::SandboxExecutionResult, SandboxError> {
+    let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
+    let session = harness
+        .open_session_with(
+            base_volume_id,
+            VolumeId::new(SESSION_VOLUME_BASE + 0x1000_0000_0000_0000 + session_suffix),
+            |config| SandboxConfig {
+                workspace_root: "/workspace".to_string(),
+                package_compat: PackageCompatibilityMode::NpmWithNodeBuiltins,
+                conflict_policy: ConflictPolicy::Fail,
+                ..config
+            },
+        )
+        .await
+        .expect("open node sandbox session");
+    let runtime_entrypoint = if entrypoint.starts_with("/node/") {
+        entrypoint.to_string()
+    } else {
+        format!("/node{entrypoint}")
+    };
+    session
+        .exec_node_command(
+            &runtime_entrypoint,
+            vec!["/usr/bin/node".to_string(), runtime_entrypoint.clone()],
+            "/node/test/parallel".to_string(),
+            BTreeMap::from([
+                ("HOME".to_string(), "/workspace/home".to_string()),
+                ("NODE_SKIP_FLAG_CHECK".to_string(), "1".to_string()),
+            ]),
+        )
         .await
 }
 
@@ -120,35 +217,19 @@ pub async fn exec_upstream_node_test(
     entrypoint: &str,
 ) -> Result<terracedb_sandbox::SandboxExecutionResult, SandboxError> {
     let harness = shared_upstream_node_harness().await;
-    let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
-    let session = harness
-        .open_session_with(
-            CACHED_NODE_BASE_VOLUME_ID,
-            VolumeId::new(SESSION_VOLUME_BASE + 0x1000_0000_0000_0000 + session_suffix),
-            |config| SandboxConfig {
-                workspace_root: "/workspace".to_string(),
-                package_compat: PackageCompatibilityMode::NpmWithNodeBuiltins,
-                conflict_policy: ConflictPolicy::Fail,
-                ..config
-            },
+    exec_upstream_node_test_in_harness(harness, CACHED_NODE_BASE_VOLUME_ID, entrypoint).await
+}
+
+pub async fn run_generated_upstream_node_suite(
+    cases: &'static [GeneratedUpstreamNodeCase],
+) -> Result<SimulationSuiteReport, SimulationHarnessError> {
+    SimulationHarness::new()
+        .with_max_workers(
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1),
         )
-        .await
-        .expect("open node sandbox session");
-    let runtime_entrypoint = if entrypoint.starts_with("/node/") {
-        entrypoint.to_string()
-    } else {
-        format!("/node{entrypoint}")
-    };
-    session
-        .exec_node_command(
-            &runtime_entrypoint,
-            vec!["/usr/bin/node".to_string(), runtime_entrypoint.clone()],
-            "/node/test/parallel".to_string(),
-            BTreeMap::from([
-                ("HOME".to_string(), "/workspace/home".to_string()),
-                ("NODE_SKIP_FLAG_CHECK".to_string(), "1".to_string()),
-            ]),
-        )
+        .run_suite(Arc::new(GeneratedUpstreamNodeSuite { cases }))
         .await
 }
 
@@ -222,6 +303,76 @@ pub fn exec_real_node_eval_with_args(
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or_default(),
     })
+}
+
+#[async_trait(?Send)]
+impl SimulationSuiteDefinition for GeneratedUpstreamNodeSuite {
+    type Fixture = GeneratedUpstreamNodeFixture;
+    type Case = GeneratedUpstreamNodeCase;
+
+    async fn prepare(&self) -> Result<Arc<Self::Fixture>, SimulationHarnessError> {
+        tracing_support::init_tracing();
+        let harness = Arc::new(SandboxHarness::deterministic(
+            510,
+            121,
+            SandboxServices::deterministic(),
+        ));
+        SandboxBaseLayer::vendored_node_v24_14_1_js_tree()
+            .ensure_volume(harness.volumes().as_ref(), CACHED_NODE_BASE_VOLUME_ID)
+            .await
+            .map_err(|error| SimulationHarnessError::Setup {
+                message: format!("import shared node base layer: {error}"),
+            })?;
+        Ok(Arc::new(GeneratedUpstreamNodeFixture {
+            harness,
+            base_volume_id: CACHED_NODE_BASE_VOLUME_ID,
+        }))
+    }
+
+    async fn cases(
+        &self,
+        _fixture: Arc<Self::Fixture>,
+    ) -> Result<Vec<SimulationCaseSpec<Self::Case>>, SimulationHarnessError> {
+        Ok(self
+            .cases
+            .iter()
+            .copied()
+            .map(|case| {
+                SimulationCaseSpec::new(
+                    case.case_id,
+                    case.path,
+                    case,
+                    Duration::from_secs(case.timeout_secs),
+                )
+            })
+            .collect())
+    }
+
+    async fn run_case(
+        &self,
+        fixture: Arc<Self::Fixture>,
+        case: SimulationCaseSpec<Self::Case>,
+    ) -> Result<(), SimulationHarnessError> {
+        let result = exec_upstream_node_test_in_harness(
+            fixture.harness.as_ref(),
+            fixture.base_volume_id,
+            case.input.path,
+        )
+        .await
+        .map_err(|error| SimulationHarnessError::Runtime {
+            message: format!("sandbox execution failed for {}: {error}", case.input.path),
+        })?;
+        let (stdout, stderr, exit_code) = stdout_stderr_exit(&result);
+        if exit_code != 0 {
+            return Err(SimulationHarnessError::Runtime {
+                message: format!(
+                    "non-zero exit for {}\nexit: {}\nstdout:\n{}\nstderr:\n{}",
+                    case.input.path, exit_code, stdout, stderr
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 pub fn graceful_fs_repro_source() -> &'static str {

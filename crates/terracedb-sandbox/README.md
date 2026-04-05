@@ -19,4 +19,6 @@ The intent is:
 - keep handwritten tests separate from generated upstream mirrors
 - make the selected upstream Node test set explicit and reviewable
 - select relevant upstream `test-module-*` and `test-require-*` files by default, then exclude known unsupported cases with a denylist
-- let `cargo test` and `cargo nextest run` parallelize the generated tests normally
+- run the generated upstream suite through the in-process `terracedb-systemtest` harness so the
+  Node/npm base layer is prepared once and shared across cases
+- let the harness enforce per-case timeouts while `nextest` only times the outer suite process

@@ -50,6 +50,7 @@ zstd = "0.13.3"
 [dev-dependencies]
 axum = "0.8.8"
 terracedb-git-github = { path = "../terracedb-git-github" }
+terracedb-systemtest = { path = "../terracedb-systemtest" }
 tokio = { version = "1.48.0", features = ["macros", "net", "rt", "sync"] }
 terracedb-simulation = { path = "../terracedb-simulation" }
 turmoil = "0.7.1"

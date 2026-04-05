@@ -16,3 +16,10 @@ The intended workflow is:
 5. optionally feed mutated scenario bytes from `cargo-fuzz` into the same runner.
 
 This crate also re-exports the deterministic HTTP and simulation helpers that application-level tests commonly need, so examples and third-party apps can keep their local `tests/` directories flat and light.
+
+It also owns the in-process simulation suite harness used for:
+
+- suite-scoped shared fixture preparation,
+- thread-level parallel case execution inside one Rust test process,
+- per-case timeout enforcement, and
+- future production-facing simulation scheduling APIs.

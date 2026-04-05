@@ -3683,6 +3683,7 @@ dependencies = [
  "terracedb-git-github",
  "terracedb-js",
  "terracedb-simulation",
+ "terracedb-systemtest",
  "terracedb-vfs",
  "thiserror 2.0.18",
  "tokio",
@@ -3715,11 +3716,14 @@ dependencies = [
 name = "terracedb-systemtest"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "serde",
  "terracedb-fuzz",
  "terracedb-http",
  "terracedb-simulation",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
