@@ -253,7 +253,7 @@ impl SimulationHarness {
                                 case.clone(),
                                 SimulationCaseContext::with_domain_usage(domain_usage.clone()),
                             ))
-                                .catch_unwind(),
+                            .catch_unwind(),
                         )
                         .await
                         {

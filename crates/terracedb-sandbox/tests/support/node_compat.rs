@@ -477,17 +477,15 @@ impl SimulationSuiteDefinition for GeneratedUpstreamNodeSuite {
         case: SimulationCaseSpec<Self::Case>,
         ctx: SimulationCaseContext,
     ) -> Result<(), SimulationHarnessError> {
-        let memory_budget = ctx
-            .domain_usage()
-            .map(|domain_usage| {
-                Arc::new(SandboxBatchedDomainMemoryBudget::new(
-                    domain_usage,
-                    SandboxTrackedMemoryBudgetPolicy {
-                        budget_bytes: Some(self.per_case_accounted_memory_budget_bytes),
-                        allocation_batch_bytes: GENERATED_UPSTREAM_NODE_ALLOCATION_BATCH_BYTES,
-                    },
-                )) as Arc<dyn SandboxRuntimeMemoryBudget>
-            });
+        let memory_budget = ctx.domain_usage().map(|domain_usage| {
+            Arc::new(SandboxBatchedDomainMemoryBudget::new(
+                domain_usage,
+                SandboxTrackedMemoryBudgetPolicy {
+                    budget_bytes: Some(self.per_case_accounted_memory_budget_bytes),
+                    allocation_batch_bytes: GENERATED_UPSTREAM_NODE_ALLOCATION_BATCH_BYTES,
+                },
+            )) as Arc<dyn SandboxRuntimeMemoryBudget>
+        });
         let result = exec_upstream_node_test_in_harness(
             fixture.harness.as_ref(),
             fixture.base_volume_id,

@@ -68,6 +68,7 @@ use sha3::{
     Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256,
     digest::{ExtendableOutput, Update as XofUpdate, XofReader},
 };
+use terracedb::{ExecutionResourceUsage, ExecutionUsageHandle};
 use terracedb_git::{GitCheckoutRequest, GitDiffRequest, GitRefUpdate, GitStatusOptions};
 use terracedb_js::{
     BoaJsRuntimeHost, DeterministicJsEntropySource, DeterministicJsRuntimeHost, FixedJsClock,
@@ -78,7 +79,6 @@ use terracedb_js::{
     JsRuntimeTurn, JsRuntimeTurnOutcome, JsSubstrateError, NeverCancel, RoutedJsHostServices,
     VfsJsHostServiceAdapter,
 };
-use terracedb::{ExecutionResourceUsage, ExecutionUsageHandle};
 use terracedb_vfs::{
     CreateOptions, FileKind, JsonValue, MkdirOptions, ReadOnlyVfsFileSystem, Stats, VfsVolumeExt,
 };
@@ -1883,6 +1883,18 @@ pub struct SandboxTrackedMemoryUsage {
     pub node_compat_state_bytes: u64,
 }
 
+fn sandbox_tracked_memory_total_bytes(usage: &SandboxTrackedMemoryUsage) -> u64 {
+    usage
+        .gc_heap_bytes
+        .saturating_add(usage.context_runtime_bytes)
+        .saturating_add(usage.task_queue_bytes)
+        .saturating_add(usage.compiled_code_bytes)
+        .saturating_add(usage.parser_retained_bytes)
+        .saturating_add(usage.module_cache_bytes)
+        .saturating_add(usage.host_buffer_bytes)
+        .saturating_add(usage.node_compat_state_bytes)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxTrackedMemoryBudgetSnapshot {
     pub current: SandboxTrackedMemoryUsage,
@@ -1991,7 +2003,8 @@ impl SandboxBatchedDomainMemoryBudget {
         let required_charged_bytes = if usage.total_bytes == 0 {
             0
         } else {
-            usage.total_bytes
+            usage
+                .total_bytes
                 .saturating_add(batch - 1)
                 .saturating_div(batch)
                 .saturating_mul(batch)
@@ -2133,9 +2146,24 @@ impl GcAllocationBudget for SandboxGcAllocationBudgetAdapter {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct SandboxRuntimeTrackedMemoryContributions {
+    context_runtime_bytes: u64,
+    module_cache_host_bytes: u64,
+    module_cache_runtime_state_bytes: u64,
+    task_queue_bytes: u64,
+    compiled_code_bytes: u64,
+    parser_retained_bytes: u64,
+    host_buffer_static_bytes: u64,
+    process_stdio_bytes: u64,
+    node_compat_state_static_bytes: u64,
+    process_model_bytes: u64,
+}
+
 #[derive(Default)]
 struct SandboxRuntimeStateSidecar {
     memory_budget: Option<Arc<dyn SandboxRuntimeMemoryBudget>>,
+    tracked_memory: SandboxRuntimeTrackedMemoryContributions,
 }
 
 #[derive(Clone)]
@@ -2175,24 +2203,32 @@ impl SandboxRuntimeStateHandle {
             .unwrap_or(false)
     }
 
-    pub async fn upsert_module_cache(&self, entry: SandboxModuleCacheEntry) {
-        self.inner
-            .lock()
-            .await
-            .module_cache
-            .insert(entry.specifier.clone(), entry);
+    pub async fn upsert_module_cache(
+        &self,
+        entry: SandboxModuleCacheEntry,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        let module_cache_bytes = {
+            let mut state = self.inner.lock().await;
+            state.module_cache.insert(entry.specifier.clone(), entry);
+            node_runtime_state_module_cache_bytes(&state)
+        };
+        self.sync_live_module_cache_runtime_state_bytes(module_cache_bytes)
     }
 
     pub async fn hydrate_module_cache(
         &self,
         entries: Vec<SandboxModuleCacheEntry>,
         next_eval_id: u64,
-    ) {
-        let mut state = self.inner.lock().await;
-        for entry in entries {
-            state.module_cache.insert(entry.specifier.clone(), entry);
-        }
-        state.next_eval_id = state.next_eval_id.max(next_eval_id);
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        let module_cache_bytes = {
+            let mut state = self.inner.lock().await;
+            for entry in entries {
+                state.module_cache.insert(entry.specifier.clone(), entry);
+            }
+            state.next_eval_id = state.next_eval_id.max(next_eval_id);
+            node_runtime_state_module_cache_bytes(&state)
+        };
+        self.sync_live_module_cache_runtime_state_bytes(module_cache_bytes)
     }
 
     pub async fn set_js_boundary(&self, boundary: SandboxJsRuntimeBoundaryState) {
@@ -2200,7 +2236,10 @@ impl SandboxRuntimeStateHandle {
     }
 
     pub fn set_memory_budget(&self, memory_budget: Option<Arc<dyn SandboxRuntimeMemoryBudget>>) {
-        self.sidecar.lock().expect("runtime state sidecar").memory_budget = memory_budget;
+        self.sidecar
+            .lock()
+            .expect("runtime state sidecar")
+            .memory_budget = memory_budget;
     }
 
     pub fn memory_budget(&self) -> Option<Arc<dyn SandboxRuntimeMemoryBudget>> {
@@ -2209,6 +2248,110 @@ impl SandboxRuntimeStateHandle {
             .expect("runtime state sidecar")
             .memory_budget
             .clone()
+    }
+
+    fn sync_tracked_memory_contributions(
+        &self,
+        update: impl FnOnce(&mut SandboxRuntimeTrackedMemoryContributions),
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        let (budget, contributions) = {
+            let mut sidecar = self.sidecar.lock().expect("runtime state sidecar");
+            update(&mut sidecar.tracked_memory);
+            (sidecar.memory_budget.clone(), sidecar.tracked_memory)
+        };
+        let Some(budget) = budget else {
+            return Ok(());
+        };
+        let mut usage = budget.snapshot().current;
+        usage.context_runtime_bytes = contributions.context_runtime_bytes;
+        usage.module_cache_bytes = contributions
+            .module_cache_host_bytes
+            .saturating_add(contributions.module_cache_runtime_state_bytes);
+        usage.task_queue_bytes = contributions.task_queue_bytes;
+        usage.compiled_code_bytes = contributions.compiled_code_bytes;
+        usage.parser_retained_bytes = contributions.parser_retained_bytes;
+        usage.host_buffer_bytes = contributions
+            .host_buffer_static_bytes
+            .saturating_add(contributions.process_stdio_bytes);
+        usage.node_compat_state_bytes = contributions
+            .node_compat_state_static_bytes
+            .saturating_add(contributions.process_model_bytes);
+        usage.total_bytes = sandbox_tracked_memory_total_bytes(&usage);
+        budget.update_tracked_memory_usage(usage)
+    }
+
+    pub(crate) fn seed_live_tracked_memory(
+        &self,
+        contributions: SandboxRuntimeTrackedMemoryContributions,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        self.sync_tracked_memory_contributions(|tracked| {
+            *tracked = contributions;
+        })
+    }
+
+    pub fn sync_live_module_cache_host_bytes(
+        &self,
+        bytes: u64,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        self.sync_tracked_memory_contributions(|tracked| {
+            tracked.module_cache_host_bytes = bytes;
+        })
+    }
+
+    pub fn sync_live_module_cache_runtime_state_bytes(
+        &self,
+        bytes: u64,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        self.sync_tracked_memory_contributions(|tracked| {
+            tracked.module_cache_runtime_state_bytes = bytes;
+        })
+    }
+
+    pub fn sync_live_task_queue_bytes(
+        &self,
+        bytes: u64,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        self.sync_tracked_memory_contributions(|tracked| {
+            tracked.task_queue_bytes = bytes;
+        })
+    }
+
+    pub fn sync_live_compiled_code_bytes(
+        &self,
+        bytes: u64,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        self.sync_tracked_memory_contributions(|tracked| {
+            tracked.compiled_code_bytes = bytes;
+        })
+    }
+
+    pub fn sync_live_host_buffer_static_bytes(
+        &self,
+        bytes: u64,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        self.sync_tracked_memory_contributions(|tracked| {
+            tracked.host_buffer_static_bytes = bytes;
+        })
+    }
+
+    pub fn sync_live_node_compat_state_static_bytes(
+        &self,
+        bytes: u64,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        self.sync_tracked_memory_contributions(|tracked| {
+            tracked.node_compat_state_static_bytes = bytes;
+        })
+    }
+
+    pub fn sync_live_process_state_bytes(
+        &self,
+        model_bytes: u64,
+        stdio_bytes: u64,
+    ) -> Result<(), SandboxTrackedMemoryBudgetExceeded> {
+        self.sync_tracked_memory_contributions(|tracked| {
+            tracked.process_model_bytes = model_bytes;
+            tracked.process_stdio_bytes = stdio_bytes;
+        })
     }
 }
 
@@ -2942,6 +3085,9 @@ fn execute_node_command_inner(
         node_debug_event(node_host, "stage", "host-bindings-installed".to_string())?;
         node_install_base_process_global(&mut context, node_host)?;
         node_debug_event(node_host, "stage", "base-process-installed".to_string())?;
+        let runtime_state_snapshot =
+            futures::executor::block_on(node_host.runtime_state.snapshot());
+        node_seed_live_tracked_memory_budget(node_host, &runtime_state_snapshot)?;
         match node_execute_upstream_bootstrap_and_main(
             &mut context,
             node_host,
@@ -2968,7 +3114,8 @@ fn execute_node_command_inner(
             .filter(|path| path.contains("/node_modules/"))
             .count();
         let debug_trace = node_host.debug_trace.borrow().clone();
-        let runtime_state_snapshot = futures::executor::block_on(node_host.runtime_state.snapshot());
+        let runtime_state_snapshot =
+            futures::executor::block_on(node_host.runtime_state.snapshot());
         let managed_memory = node_runtime_managed_memory_stats(node_host, &runtime_state_snapshot);
         let gc_stats = boa_gc_runtime_stats();
         let accounted_bytes = managed_memory
@@ -3415,6 +3562,8 @@ fn node_sync_process_env_from_js(
     {
         process.locale = value;
     }
+    drop(process);
+    node_sync_live_process_state_budget(host)?;
     Ok(())
 }
 
@@ -3443,6 +3592,8 @@ fn node_set_process_env_value(
         "LANG" | "LC_ALL" | "LC_MESSAGES" => process.locale = value.to_string(),
         _ => {}
     }
+    drop(process);
+    node_sync_live_process_state_budget(host)?;
     Ok(())
 }
 
@@ -3851,6 +4002,7 @@ fn node_exception_snapshot_from_event(
 fn node_graph_invalidate(host: &NodeRuntimeHost) {
     host.module_graph.borrow_mut().invalidate();
     host.read_snapshot_fs.borrow_mut().take();
+    let _ = node_sync_live_module_cache_budget(host);
 }
 
 fn node_readonly_fs(
@@ -3904,6 +4056,7 @@ fn node_graph_stat(host: &NodeRuntimeHost, path: &str) -> Result<Option<Stats>, 
         .borrow_mut()
         .stat_cache
         .insert(path.to_string(), stats.clone());
+    node_sync_live_module_cache_budget(host)?;
     Ok(stats)
 }
 
@@ -3920,6 +4073,7 @@ fn node_graph_read_file(
         .borrow_mut()
         .file_cache
         .insert(path.to_string(), bytes.clone());
+    node_sync_live_module_cache_budget(host)?;
     Ok(bytes)
 }
 
@@ -3984,6 +4138,7 @@ impl NodeCommandModuleLoader {
             .materialized_modules
             .borrow_mut()
             .insert(resolved.specifier.clone(), module.clone());
+        node_sync_live_module_cache_budget(&self.host)?;
         Ok(module)
     }
 }
@@ -4210,13 +4365,18 @@ fn node_error_with_code(
     message: impl Into<String>,
     code: &str,
 ) -> boa_engine::JsError {
-    let object = kind.with_message(message.into()).into_opaque(context);
-    let _ = object.set(
+    let object = match kind.with_message(message.into()).into_opaque(context) {
+        Ok(object) => object,
+        Err(error) => return error,
+    };
+    if let Err(error) = object.set(
         js_string!("code"),
         JsValue::from(JsString::from(code)),
         true,
         context,
-    );
+    ) {
+        return error;
+    }
     boa_engine::JsError::from_opaque(object.into())
 }
 
@@ -4353,99 +4513,18 @@ fn node_runtime_progress_snapshot(
     )
 }
 
-fn node_runtime_managed_memory_stats(
-    host: &NodeRuntimeHost,
-    runtime_state: &SandboxRuntimeState,
-) -> NodeRuntimeManagedMemoryStats {
-    let loaded_modules = host.loaded_modules.borrow();
-    let loaded_module_bytes = loaded_modules
+fn node_loaded_module_bytes(loaded_modules: &BTreeMap<String, NodeLoadedModule>) -> u64 {
+    loaded_modules
         .iter()
         .map(|(key, module)| {
             (key.len() + module.runtime_path.len() + module.media_type.len() + module.source.len())
                 as u64
         })
-        .sum::<u64>();
+        .sum::<u64>()
+}
 
-    let materialized_modules = host.materialized_modules.borrow();
-    let materialized_module_count = materialized_modules.len();
-    let materialized_module_key_bytes = materialized_modules
-        .keys()
-        .map(|value| value.len() as u64)
-        .sum::<u64>();
-    drop(materialized_modules);
-
-    let open_files = host.open_files.borrow();
-    let open_file_bytes = open_files
-        .entries
-        .values()
-        .map(|file| (file.path.len() + file.contents.len()) as u64)
-        .sum::<u64>();
-
-    let process = host.process.borrow();
-    let process_stdio_bytes = (process.stdout.len() + process.stderr.len()) as u64;
-    let process_model_bytes = (process.cwd.len()
-        + process.version.len()
-        + process.exec_path.len()
-        + process.platform.len()
-        + process.arch.len()
-        + process.locale.len()
-        + process.timezone.len()
-        + process.title.len()
-        + process.home_dir.len()
-        + process.temp_dir.len()
-        + process.hostname.len()
-        + process.os_name.len()
-        + process.os_version.len()
-        + process.os_release.len()
-        + process.release_name.len()
-        + process.release_lts.len()
-        + process.username.len()
-        + process.shell.len()) as u64
-        + process
-            .argv
-            .iter()
-            .map(|value| value.len() as u64)
-            .sum::<u64>()
-        + process
-            .exec_argv
-            .iter()
-            .map(|value| value.len() as u64)
-            .sum::<u64>()
-        + process
-            .env
-            .iter()
-            .map(|(key, value)| (key.len() + value.len()) as u64)
-            .sum::<u64>();
-    let process_dynamic_bytes = process_model_bytes + process_stdio_bytes;
-    drop(process);
-
-    let module_graph = host.module_graph.borrow();
-    let module_graph_file_cache_entries = module_graph.file_cache.len();
-    let module_graph_file_cache_bytes = module_graph
-        .file_cache
-        .iter()
-        .map(|(path, contents)| {
-            path.len() as u64
-                + contents
-                    .as_ref()
-                    .map(|value| value.len() as u64)
-                    .unwrap_or_default()
-        })
-        .sum::<u64>();
-    let module_graph_package_json_entries = module_graph.package_json_cache.len();
-    let module_graph_package_json_bytes = module_graph
-        .package_json_cache
-        .iter()
-        .map(|(path, value)| {
-            path.len() as u64
-                + value
-                    .as_ref()
-                    .and_then(|value| serde_json::to_vec(value).ok())
-                    .map(|value| value.len() as u64)
-                    .unwrap_or_default()
-        })
-        .sum::<u64>();
-    let module_graph_lookup_bytes = module_graph
+fn node_module_graph_lookup_bytes(module_graph: &NodeModuleGraph) -> u64 {
+    module_graph
         .stat_cache
         .keys()
         .map(|value| value.len() as u64)
@@ -4537,11 +4616,38 @@ fn node_runtime_managed_memory_stats(
                         .map(|value| value.len() as u64)
                         .unwrap_or_default()
             })
-            .sum::<u64>();
-    drop(module_graph);
+            .sum::<u64>()
+}
 
-    let runtime_module_cache_entries = runtime_state.module_cache.len();
-    let runtime_module_cache_bytes = runtime_state
+fn node_module_graph_cache_bytes(module_graph: &NodeModuleGraph) -> u64 {
+    module_graph
+        .file_cache
+        .iter()
+        .map(|(path, contents)| {
+            path.len() as u64
+                + contents
+                    .as_ref()
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default()
+        })
+        .sum::<u64>()
+        + module_graph
+            .package_json_cache
+            .iter()
+            .map(|(path, value)| {
+                path.len() as u64
+                    + value
+                        .as_ref()
+                        .and_then(|value| serde_json::to_vec(value).ok())
+                        .map(|value| value.len() as u64)
+                        .unwrap_or_default()
+            })
+            .sum::<u64>()
+        + node_module_graph_lookup_bytes(module_graph)
+}
+
+fn node_runtime_state_module_cache_bytes(runtime_state: &SandboxRuntimeState) -> u64 {
+    runtime_state
         .module_cache
         .values()
         .map(|entry| {
@@ -4550,7 +4656,341 @@ fn node_runtime_managed_memory_stats(
                 + entry.media_type.len()
                 + entry.cache_key.len()) as u64
         })
+        .sum::<u64>()
+}
+
+fn node_process_stdio_bytes(process: &NodeProcessState) -> u64 {
+    (process.stdout.len() + process.stderr.len()) as u64
+}
+
+fn node_process_model_bytes(process: &NodeProcessState) -> u64 {
+    (process.cwd.len()
+        + process.version.len()
+        + process.exec_path.len()
+        + process.platform.len()
+        + process.arch.len()
+        + process.locale.len()
+        + process.timezone.len()
+        + process.title.len()
+        + process.home_dir.len()
+        + process.temp_dir.len()
+        + process.hostname.len()
+        + process.os_name.len()
+        + process.os_version.len()
+        + process.os_release.len()
+        + process.release_name.len()
+        + process.release_lts.len()
+        + process.username.len()
+        + process.shell.len()) as u64
+        + process
+            .argv
+            .iter()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + process
+            .exec_argv
+            .iter()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + process
+            .env
+            .iter()
+            .map(|(key, value)| (key.len() + value.len()) as u64)
+            .sum::<u64>()
+}
+
+fn node_message_port_queue_bytes(bootstrap: &NodeBootstrapState) -> u64 {
+    bootstrap
+        .message_ports
+        .values()
+        .map(|state| state.queue.len() as u64 * std::mem::size_of::<JsValue>() as u64)
+        .sum::<u64>()
+}
+
+fn node_live_host_module_cache_bytes(host: &NodeRuntimeHost) -> u64 {
+    let loaded_module_bytes = node_loaded_module_bytes(&host.loaded_modules.borrow());
+    let module_graph_bytes = node_module_graph_cache_bytes(&host.module_graph.borrow());
+    loaded_module_bytes.saturating_add(module_graph_bytes)
+}
+
+fn node_live_task_queue_bytes(host: &NodeRuntimeHost) -> u64 {
+    let bootstrap = host.bootstrap.borrow();
+    node_bootstrap_queue_bytes(&bootstrap).saturating_add(node_message_port_queue_bytes(&bootstrap))
+}
+
+fn node_live_compiled_code_bytes(host: &NodeRuntimeHost) -> u64 {
+    let bootstrap = host.bootstrap.borrow();
+    let compile_cache_entry_bytes = bootstrap
+        .compile_cache_entries
+        .values()
+        .map(|entry| {
+            std::mem::size_of::<NodeCompileCacheEntryState>() as u64
+                + entry.key.len() as u64
+                + entry
+                    .transpiled
+                    .as_ref()
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default()
+        })
         .sum::<u64>();
+    let module_wrap_state_bytes = bootstrap
+        .module_wraps
+        .values()
+        .map(node_module_wrap_state_bytes)
+        .sum::<u64>();
+    let url_pattern_state_bytes = bootstrap
+        .url_patterns
+        .values()
+        .map(node_url_pattern_state_bytes)
+        .sum::<u64>();
+    compile_cache_entry_bytes
+        .saturating_add(module_wrap_state_bytes)
+        .saturating_add(url_pattern_state_bytes)
+}
+
+fn node_live_host_buffer_static_bytes(host: &NodeRuntimeHost) -> u64 {
+    let open_files = host.open_files.borrow();
+    let open_file_bytes = open_files
+        .entries
+        .values()
+        .map(|file| (file.path.len() + file.contents.len()) as u64)
+        .sum::<u64>();
+    drop(open_files);
+
+    let bootstrap = host.bootstrap.borrow();
+    let blob_bytes = bootstrap
+        .blobs
+        .blobs
+        .iter()
+        .map(|(_, value)| value.len() as u64)
+        .sum::<u64>()
+        + bootstrap
+            .blobs
+            .data_objects
+            .iter()
+            .map(|(key, value)| {
+                key.len() as u64 + value.mime_type.len() as u64 + u64::from(value.length)
+            })
+            .sum::<u64>();
+    open_file_bytes.saturating_add(blob_bytes)
+}
+
+fn node_live_process_state_bytes(host: &NodeRuntimeHost) -> (u64, u64) {
+    let process = host.process.borrow();
+    (
+        node_process_model_bytes(&process),
+        node_process_stdio_bytes(&process),
+    )
+}
+
+fn node_live_node_compat_state_static_bytes(host: &NodeRuntimeHost) -> u64 {
+    let builtin_id_bytes = host
+        .builtin_ids
+        .borrow()
+        .as_ref()
+        .map(|values| values.iter().map(|value| value.len() as u64).sum::<u64>())
+        .unwrap_or_default();
+
+    let bootstrap = host.bootstrap.borrow();
+    let bootstrap_state_bytes = node_bootstrap_state_bytes(&bootstrap);
+    let inspector_state_bytes = node_inspector_state_bytes(&bootstrap.inspector);
+    let stream_handle_state_bytes = bootstrap
+        .stream_handles
+        .values()
+        .map(node_stream_handle_state_bytes)
+        .sum::<u64>();
+    let udp_handle_state_bytes = bootstrap
+        .udp_handles
+        .values()
+        .map(node_udp_handle_state_bytes)
+        .sum::<u64>();
+    let process_handle_state_bytes = bootstrap
+        .process_handles
+        .values()
+        .map(node_process_handle_state_bytes)
+        .sum::<u64>();
+    let message_port_state_bytes = bootstrap
+        .message_ports
+        .values()
+        .map(node_message_port_state_bytes)
+        .sum::<u64>();
+    let lock_state_bytes = bootstrap
+        .held_locks
+        .values()
+        .flatten()
+        .map(node_held_lock_state_bytes)
+        .sum::<u64>();
+    let report_state_bytes = node_report_state_bytes(&bootstrap.report);
+    let sea_state_bytes = node_sea_state_bytes(&bootstrap.sea);
+    drop(bootstrap);
+
+    let zlib_streams = host.zlib_streams.borrow();
+    let zlib_state_bytes = zlib_streams
+        .entries
+        .values()
+        .map(node_zlib_stream_bytes)
+        .sum::<u64>();
+    drop(zlib_streams);
+
+    let debug_trace = host.debug_trace.borrow();
+    let debug_trace_bytes = std::mem::size_of::<NodeRuntimeDebugTrace>() as u64
+        + debug_trace
+            .recent_events
+            .iter()
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + debug_trace
+            .structured_events
+            .iter()
+            .filter_map(|value| serde_json::to_vec(value).ok())
+            .map(|value| value.len() as u64)
+            .sum::<u64>()
+        + debug_trace
+            .last_exception
+            .as_ref()
+            .and_then(|value| serde_json::to_vec(value).ok())
+            .map(|value| value.len() as u64)
+            .unwrap_or_default();
+
+    builtin_id_bytes
+        .saturating_add(bootstrap_state_bytes)
+        .saturating_add(inspector_state_bytes)
+        .saturating_add(stream_handle_state_bytes)
+        .saturating_add(udp_handle_state_bytes)
+        .saturating_add(process_handle_state_bytes)
+        .saturating_add(message_port_state_bytes)
+        .saturating_add(lock_state_bytes)
+        .saturating_add(report_state_bytes)
+        .saturating_add(sea_state_bytes)
+        .saturating_add(zlib_state_bytes)
+        .saturating_add(debug_trace_bytes)
+}
+
+fn node_sync_live_module_cache_budget(host: &NodeRuntimeHost) -> Result<(), SandboxError> {
+    host.runtime_state
+        .sync_live_module_cache_host_bytes(node_live_host_module_cache_bytes(host))
+        .map_err(SandboxError::from)
+}
+
+fn node_sync_live_task_queue_budget(host: &NodeRuntimeHost) -> Result<(), SandboxError> {
+    host.runtime_state
+        .sync_live_task_queue_bytes(node_live_task_queue_bytes(host))
+        .map_err(SandboxError::from)
+}
+
+fn node_sync_live_compiled_code_budget(host: &NodeRuntimeHost) -> Result<(), SandboxError> {
+    host.runtime_state
+        .sync_live_compiled_code_bytes(node_live_compiled_code_bytes(host))
+        .map_err(SandboxError::from)
+}
+
+fn node_sync_live_host_buffer_budget(host: &NodeRuntimeHost) -> Result<(), SandboxError> {
+    host.runtime_state
+        .sync_live_host_buffer_static_bytes(node_live_host_buffer_static_bytes(host))
+        .map_err(SandboxError::from)
+}
+
+fn node_sync_live_node_compat_state_budget(host: &NodeRuntimeHost) -> Result<(), SandboxError> {
+    host.runtime_state
+        .sync_live_node_compat_state_static_bytes(node_live_node_compat_state_static_bytes(host))
+        .map_err(SandboxError::from)
+}
+
+fn node_sync_live_process_state_budget(host: &NodeRuntimeHost) -> Result<(), SandboxError> {
+    let (model_bytes, stdio_bytes) = node_live_process_state_bytes(host);
+    host.runtime_state
+        .sync_live_process_state_bytes(model_bytes, stdio_bytes)
+        .map_err(SandboxError::from)
+}
+
+fn node_seed_live_tracked_memory_budget(
+    host: &NodeRuntimeHost,
+    runtime_state: &SandboxRuntimeState,
+) -> Result<(), SandboxError> {
+    let stats = node_runtime_managed_memory_stats(host, runtime_state);
+    host.runtime_state
+        .seed_live_tracked_memory(SandboxRuntimeTrackedMemoryContributions {
+            context_runtime_bytes: stats.context_runtime_bytes,
+            module_cache_host_bytes: stats
+                .loaded_module_bytes
+                .saturating_add(stats.module_graph_file_cache_bytes)
+                .saturating_add(stats.module_graph_package_json_bytes)
+                .saturating_add(stats.module_graph_lookup_bytes),
+            module_cache_runtime_state_bytes: stats.runtime_module_cache_bytes,
+            task_queue_bytes: stats.task_queue_bytes,
+            compiled_code_bytes: stats.compiled_code_bytes,
+            parser_retained_bytes: stats.parser_retained_bytes,
+            host_buffer_static_bytes: stats
+                .host_buffer_bytes
+                .saturating_sub(stats.process_stdio_bytes),
+            process_stdio_bytes: stats.process_stdio_bytes,
+            node_compat_state_static_bytes: stats
+                .node_compat_state_bytes
+                .saturating_sub(stats.process_model_bytes),
+            process_model_bytes: stats.process_model_bytes,
+        })
+        .map_err(SandboxError::from)
+}
+
+fn node_runtime_managed_memory_stats(
+    host: &NodeRuntimeHost,
+    runtime_state: &SandboxRuntimeState,
+) -> NodeRuntimeManagedMemoryStats {
+    let loaded_modules = host.loaded_modules.borrow();
+    let loaded_module_bytes = node_loaded_module_bytes(&loaded_modules);
+
+    let materialized_modules = host.materialized_modules.borrow();
+    let materialized_module_count = materialized_modules.len();
+    let materialized_module_key_bytes = materialized_modules
+        .keys()
+        .map(|value| value.len() as u64)
+        .sum::<u64>();
+    drop(materialized_modules);
+
+    let open_files = host.open_files.borrow();
+    let open_file_bytes = open_files
+        .entries
+        .values()
+        .map(|file| (file.path.len() + file.contents.len()) as u64)
+        .sum::<u64>();
+
+    let process = host.process.borrow();
+    let process_stdio_bytes = node_process_stdio_bytes(&process);
+    let process_model_bytes = node_process_model_bytes(&process);
+    let process_dynamic_bytes = process_model_bytes + process_stdio_bytes;
+    drop(process);
+
+    let module_graph = host.module_graph.borrow();
+    let module_graph_file_cache_entries = module_graph.file_cache.len();
+    let module_graph_file_cache_bytes = module_graph
+        .file_cache
+        .iter()
+        .map(|(path, contents)| {
+            path.len() as u64
+                + contents
+                    .as_ref()
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default()
+        })
+        .sum::<u64>();
+    let module_graph_package_json_entries = module_graph.package_json_cache.len();
+    let module_graph_package_json_bytes = module_graph
+        .package_json_cache
+        .iter()
+        .map(|(path, value)| {
+            path.len() as u64
+                + value
+                    .as_ref()
+                    .and_then(|value| serde_json::to_vec(value).ok())
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default()
+        })
+        .sum::<u64>();
+    let module_graph_lookup_bytes = node_module_graph_lookup_bytes(&module_graph);
+    drop(module_graph);
+
+    let runtime_module_cache_entries = runtime_state.module_cache.len();
+    let runtime_module_cache_bytes = node_runtime_state_module_cache_bytes(runtime_state);
 
     let builtin_id_bytes = host
         .builtin_ids
@@ -4628,11 +5068,7 @@ fn node_runtime_managed_memory_stats(
         .values()
         .map(node_message_port_state_bytes)
         .sum::<u64>();
-    let message_port_queue_bytes = bootstrap
-        .message_ports
-        .values()
-        .map(|state| state.queue.len() as u64 * std::mem::size_of::<JsValue>() as u64)
-        .sum::<u64>();
+    let message_port_queue_bytes = node_message_port_queue_bytes(&bootstrap);
     let lock_state_bytes = bootstrap
         .held_locks
         .values()
@@ -5078,6 +5514,7 @@ fn node_run_microtask_checkpoint(
 ) -> Result<usize, SandboxError> {
     context.run_jobs().map_err(sandbox_execution_error)?;
     let queue = std::mem::take(&mut host.bootstrap.borrow_mut().microtask_queue);
+    node_sync_live_task_queue_budget(host)?;
     let count = queue.len();
     for callback in queue {
         let callable = JsValue::from(callback.clone())
@@ -5283,7 +5720,9 @@ fn node_chdir(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
     let path = node_arg_string(args, 0, context)?;
     node_with_host(|host| {
         node_debug_event(host, "process", format!("chdir path={path}"))?;
-        host.process.borrow_mut().cwd = resolve_node_path(&host.process.borrow().cwd, &path);
+        let current_cwd = host.process.borrow().cwd.clone();
+        host.process.borrow_mut().cwd = resolve_node_path(&current_cwd, &path);
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -5307,6 +5746,7 @@ fn node_set_exit_code(
         })?;
     node_with_host(|host| {
         host.process.borrow_mut().exit_code = code;
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -5320,6 +5760,7 @@ fn node_write_stdout(
     let chunk = node_arg_string(args, 0, context)?;
     node_with_host(|host| {
         host.process.borrow_mut().stdout.push_str(&chunk);
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -5333,6 +5774,7 @@ fn node_write_stderr(
     let chunk = node_arg_string(args, 0, context)?;
     node_with_host(|host| {
         host.process.borrow_mut().stderr.push_str(&chunk);
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -5650,6 +6092,7 @@ fn node_builtin_ids(host: &NodeRuntimeHost) -> Result<Vec<String>, SandboxError>
     ids.sort();
     ids.dedup();
     *host.builtin_ids.borrow_mut() = Some(ids.clone());
+    node_sync_live_node_compat_state_budget(host)?;
     Ok(ids)
 }
 
@@ -6070,15 +6513,18 @@ fn node_stream_handle_write_bytes(
                 .borrow_mut()
                 .stdout
                 .push_str(&String::from_utf8_lossy(bytes));
+            node_sync_live_process_state_budget(host)?;
         }
         Some(2) => {
             host.process
                 .borrow_mut()
                 .stderr
                 .push_str(&String::from_utf8_lossy(bytes));
+            node_sync_live_process_state_budget(host)?;
         }
         _ => {}
     }
+    node_sync_live_node_compat_state_budget(host)?;
     Ok(0)
 }
 
@@ -6154,6 +6600,7 @@ fn node_stream_handle_construct_with_kind(
                 pipe_mode: 0,
             },
         );
+        node_sync_live_node_compat_state_budget(host)?;
         Ok(JsValue::from(this.clone()))
     })
 }
@@ -7775,6 +8222,7 @@ fn node_udp_construct(
                 send_queue_count: 0,
             },
         );
+        node_sync_live_node_compat_state_budget(host)?;
         Ok(JsValue::from(this.clone()))
     })
 }
@@ -8853,6 +9301,7 @@ fn node_process_wrap_construct(
                 result: None,
             },
         );
+        node_sync_live_node_compat_state_budget(host)?;
         Ok(JsValue::from(this.clone()))
     })
 }
@@ -9219,7 +9668,7 @@ fn node_fs_dir_make_handle(
     handle
         .set(
             names_symbol,
-            JsValue::from(JsArray::from_iter(names, context)),
+            JsValue::from(JsArray::from_iter(names, context)?),
             true,
             context,
         )
@@ -9227,7 +9676,7 @@ fn node_fs_dir_make_handle(
     handle
         .set(
             types_symbol,
-            JsValue::from(JsArray::from_iter(types, context)),
+            JsValue::from(JsArray::from_iter(types, context)?),
             true,
             context,
         )
@@ -9318,7 +9767,7 @@ fn node_fs_dir_handle_read(
         values.push(names.get(i as u32, context)?);
         values.push(types.get(i as u32, context)?);
     }
-    let result = JsValue::from(JsArray::from_iter(values, context));
+    let result = JsValue::from(JsArray::from_iter(values, context)?);
     handle.set(index_symbol, JsValue::from(end as u32), true, context)?;
     let req = args.get(2).cloned();
     node_fs_req_complete(req.as_ref(), context, result).map_err(js_error)
@@ -10018,7 +10467,7 @@ fn node_internal_binding_modules(context: &mut Context) -> Result<JsObject, Sand
                     JsValue::from(JsString::from("DISABLED")),
                 ],
                 context,
-            )),
+            )?),
             true,
             context,
         )
@@ -10943,7 +11392,7 @@ fn node_cares_getaddrinfo(
         let values = addresses
             .into_iter()
             .map(|value| JsValue::from(JsString::from(value)));
-        let result = JsArray::from_iter(values, context);
+        let result = JsArray::from_iter(values, context)?;
         let _ = oncomplete.call(
             &JsValue::from(req.clone()),
             &[JsValue::from(0), JsValue::from(result)],
@@ -11594,6 +12043,7 @@ fn node_locks_process_pending(
         };
 
         let pending = host.bootstrap.borrow_mut().pending_locks.remove(index);
+        node_sync_live_task_queue_budget(host)?;
         node_locks_grant_request(
             host,
             pending.request_id,
@@ -11736,6 +12186,7 @@ fn node_locks_request(
                     resolve: resolvers.resolve.clone().into(),
                     reject: resolvers.reject.clone().into(),
                 });
+            node_sync_live_task_queue_budget(host)?;
         }
 
         Ok(JsValue::from(promise))
@@ -12056,7 +12507,10 @@ fn node_internal_binding_contextify(context: &mut Context) -> Result<JsObject, S
     let object = ObjectInitializer::new(context).build();
     let mut script_class = ClassBuilder::new::<NodeContextifyScriptState>(context);
     NodeContextifyScriptState::init(&mut script_class).map_err(sandbox_execution_error)?;
-    let script_constructor = script_class.build().map_err(sandbox_execution_error)?.constructor();
+    let script_constructor = script_class
+        .build()
+        .map_err(sandbox_execution_error)?
+        .constructor();
     object
         .set(
             js_string!("ContextifyScript"),
@@ -12325,6 +12779,7 @@ fn node_messaging_materialize_port(
     if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&id) {
         state.object = Some(port.clone());
     }
+    node_sync_live_task_queue_budget(host)?;
     Ok(port)
 }
 
@@ -12417,6 +12872,7 @@ fn node_messaging_message_port_construct(
                 queue: Vec::new(),
             },
         );
+        node_sync_live_task_queue_budget(host)?;
         let symbols = node_internal_binding_symbols(context)?;
         let oninit = symbols
             .get(js_string!("oninit"), context)
@@ -12466,6 +12922,7 @@ fn node_messaging_message_channel_construct(
         if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&port2_id) {
             state.entangled = Some(port1_id);
         }
+        node_sync_live_task_queue_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
@@ -12504,6 +12961,7 @@ fn node_messaging_emit_pending_messages(
                 return Ok(());
             };
             state.queue.remove(0);
+            node_sync_live_task_queue_budget(host)?;
             (port, message)
         };
 
@@ -12546,7 +13004,9 @@ fn node_messaging_receive_message_on_port(
         Ok(if state.queue.is_empty() {
             node_messaging_no_message_symbol(context).unwrap_or_else(|_| JsValue::undefined())
         } else {
-            state.queue.remove(0)
+            let message = state.queue.remove(0);
+            node_sync_live_task_queue_budget(host)?;
+            message
         })
     })
 }
@@ -12718,6 +13178,7 @@ fn node_messaging_message_port_post_message(
                     }
                 }
             }
+            node_sync_live_task_queue_budget(host)?;
             drop(bootstrap);
             if let Some(targets) = host
                 .bootstrap
@@ -12740,6 +13201,7 @@ fn node_messaging_message_port_post_message(
                     target.queue.push(message);
                 }
             }
+            node_sync_live_task_queue_budget(host)?;
             drop(bootstrap);
             node_messaging_emit_pending_messages(host, target_id, false, context)?;
             return Ok(JsValue::undefined());
@@ -12812,6 +13274,7 @@ fn node_messaging_message_port_close(
                 }
             }
         }
+        node_sync_live_task_queue_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
@@ -13814,11 +14277,11 @@ fn node_cjs_lexer_parse(
             context,
         )?;
     }
-    let reexports = JsValue::from(JsArray::from_iter(reexports, context));
+    let reexports = JsValue::from(JsArray::from_iter(reexports, context)?);
     Ok(JsValue::from(JsArray::from_iter(
         [JsValue::from(exports_set), reexports],
         context,
-    )))
+    )?))
 }
 
 fn node_permission_has(
@@ -14182,7 +14645,7 @@ fn node_sea_get_asset_keys(
             .map(JsString::from)
             .map(JsValue::from)
             .collect::<Vec<_>>();
-        Ok(JsValue::from(JsArray::from_iter(keys, context)))
+        Ok(JsValue::from(JsArray::from_iter(keys, context)?))
     })
 }
 
@@ -14208,13 +14671,21 @@ fn node_report_write_report(
             format!("{}/{}", state.report.directory, state.report.filename)
         });
         if path == "stdout" {
-            host.process.borrow_mut().stdout.push_str(&report);
-            host.process.borrow_mut().stdout.push('\n');
+            {
+                let mut process = host.process.borrow_mut();
+                process.stdout.push_str(&report);
+                process.stdout.push('\n');
+            }
+            node_sync_live_process_state_budget(host)?;
             return Ok((report, path));
         }
         if path == "stderr" {
-            host.process.borrow_mut().stderr.push_str(&report);
-            host.process.borrow_mut().stderr.push('\n');
+            {
+                let mut process = host.process.borrow_mut();
+                process.stderr.push_str(&report);
+                process.stderr.push('\n');
+            }
+            node_sync_live_process_state_budget(host)?;
             return Ok((report, path));
         }
         let resolved = resolve_node_path(&host.process.borrow().cwd, &path);
@@ -15240,6 +15711,7 @@ fn node_process_title_setter(
         .to_std_string_escaped();
     node_with_host(|host| {
         host.process.borrow_mut().title = title;
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -15278,6 +15750,7 @@ fn node_process_debug_port_setter(
     }
     node_with_host(|host| {
         host.process.borrow_mut().debug_port = port as u16;
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -15356,7 +15829,7 @@ fn node_process_methods_get_active_handles(
                 "TraceSigintWatchdog",
             )?);
         }
-        Ok(JsValue::from(JsArray::from_iter(handles, context)))
+        Ok(JsValue::from(JsArray::from_iter(handles, context)?))
     })
 }
 
@@ -15381,7 +15854,7 @@ fn node_process_methods_get_active_requests(
                 "ZlibStream",
             )?);
         }
-        Ok(JsValue::from(JsArray::from_iter(requests, context)))
+        Ok(JsValue::from(JsArray::from_iter(requests, context)?))
     })
 }
 
@@ -15414,7 +15887,7 @@ fn node_process_methods_get_active_resources_info(
         if !state.inspector.async_tasks.is_empty() {
             resources.push(JsValue::from(JsString::from("InspectorAsyncTask")));
         }
-        Ok(JsValue::from(JsArray::from_iter(resources, context)))
+        Ok(JsValue::from(JsArray::from_iter(resources, context)?))
     })
 }
 
@@ -15442,6 +15915,7 @@ fn node_process_methods_really_exit(
         .unwrap_or_default();
     node_with_host(|host| {
         host.process.borrow_mut().exit_code = code;
+        node_sync_live_process_state_budget(host)?;
         Err(SandboxError::ProcessExited)
     })
     .map_err(js_error)
@@ -15471,6 +15945,7 @@ fn node_process_methods_kill(
         }
         if signal > 0 {
             host.process.borrow_mut().exit_code = 128 + signal;
+            node_sync_live_process_state_budget(host)?;
         }
         Ok(JsValue::from(0))
     })
@@ -15652,6 +16127,8 @@ fn node_process_methods_execve(
         process.stdout.push_str(&result.stdout);
         process.stderr.push_str(&result.stderr);
         process.exit_code = result.status.unwrap_or_default();
+        drop(process);
+        node_sync_live_process_state_budget(host)?;
         Err(SandboxError::ExecveReplaced)
     })
     .map_err(js_error)
@@ -15740,6 +16217,7 @@ fn node_process_methods_abort(
 ) -> JsResult<JsValue> {
     node_with_host(|host| {
         host.process.borrow_mut().exit_code = 134;
+        node_sync_live_process_state_budget(host)?;
         Err(SandboxError::ProcessExited)
     })
     .map_err(js_error)
@@ -15781,6 +16259,7 @@ fn node_process_methods_chdir(
             });
         }
         host.process.borrow_mut().cwd = next;
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -15805,6 +16284,8 @@ fn node_process_methods_umask(
                 .to_u32(context)
                 .map_err(sandbox_execution_error)?;
         }
+        drop(process);
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::from(previous))
     })
     .map_err(js_error)
@@ -15842,8 +16323,12 @@ fn node_process_methods_raw_debug(
         .to_string(context)?
         .to_std_string_escaped();
     node_with_host(|host| {
-        host.process.borrow_mut().stderr.push_str(&message);
-        host.process.borrow_mut().stderr.push('\n');
+        {
+            let mut process = host.process.borrow_mut();
+            process.stderr.push_str(&message);
+            process.stderr.push('\n');
+        }
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -15952,6 +16437,7 @@ fn node_task_queue_enqueue_microtask(
         .ok_or_else(|| JsNativeError::typ().with_message("microtask callback must be callable"))?;
     node_with_host(|host| {
         host.bootstrap.borrow_mut().microtask_queue.push(callback);
+        node_sync_live_task_queue_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -16155,7 +16641,7 @@ fn node_async_wrap_get_promise_hooks(
                 .map(JsValue::from)
                 .unwrap_or_else(JsValue::undefined),
         ];
-        Ok(JsValue::from(JsArray::from_iter(values, context)))
+        Ok(JsValue::from(JsArray::from_iter(values, context)?))
     })
 }
 
@@ -16230,6 +16716,7 @@ fn node_async_wrap_push_async_context(
         state.execution_async_id = async_id.max(0.0) as u64;
         state.trigger_async_id = trigger_async_id.max(0.0) as u64;
         state.execution_async_resources.push(resource);
+        node_sync_live_task_queue_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
@@ -16289,6 +16776,7 @@ fn node_async_wrap_pop_async_context(
         state.execution_async_id = previous_execution_async_id.max(0.0) as u64;
         state.trigger_async_id = previous_trigger_async_id.max(0.0) as u64;
         let _ = state.execution_async_resources.pop();
+        node_sync_live_task_queue_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
@@ -16350,6 +16838,7 @@ fn node_async_wrap_clear_async_id_stack(
         state.execution_async_id = 0;
         state.trigger_async_id = 0;
         state.execution_async_resources.clear();
+        node_sync_live_task_queue_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
@@ -18209,6 +18698,8 @@ fn node_blob_register_bytes(host: &NodeRuntimeHost, bytes: Vec<u8>) -> u64 {
     let id = state.blobs.next_id;
     state.blobs.next_id = state.blobs.next_id.saturating_add(1);
     state.blobs.blobs.insert(id, bytes);
+    drop(state);
+    let _ = node_sync_live_host_buffer_budget(host);
     id
 }
 
@@ -18352,7 +18843,7 @@ fn node_blob_create_blob_from_file_path(
         Ok(JsValue::from(JsArray::from_iter(
             [JsValue::from(handle), JsValue::from(length)],
             context,
-        )))
+        )?))
     })
 }
 
@@ -18400,7 +18891,7 @@ fn node_blob_get_data_object(
                 JsValue::from(JsString::from(data.mime_type)),
             ],
             context,
-        )))
+        )?))
     })
 }
 
@@ -18435,6 +18926,7 @@ fn node_blob_store_data_object(
                 mime_type,
             },
         );
+        node_sync_live_host_buffer_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -18452,6 +18944,7 @@ fn node_blob_revoke_object_url(
         .to_string();
     node_with_host(|host| {
         host.bootstrap.borrow_mut().blobs.data_objects.remove(&key);
+        node_sync_live_host_buffer_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)
@@ -19106,6 +19599,7 @@ fn node_url_pattern_construct(
             .borrow_mut()
             .url_patterns
             .insert(id, pattern.clone());
+        node_sync_live_compiled_code_budget(host)?;
         Ok(JsValue::from(object))
     })
 }
@@ -19295,7 +19789,7 @@ fn node_modules_enable_compile_cache(
                         .unwrap_or_else(JsValue::undefined),
                 ],
                 context,
-            )));
+            )?));
         }
         let directory =
             directory.unwrap_or_else(|| format!("{}/node-compile-cache", host.workspace_root));
@@ -19308,7 +19802,7 @@ fn node_modules_enable_compile_cache(
                 JsValue::from(JsString::from(directory)),
             ],
             context,
-        )))
+        )?))
     })
 }
 
@@ -19601,6 +20095,7 @@ fn node_modules_get_compile_cache_entry(
                         transpiled: None,
                     },
                 );
+                let _ = node_sync_live_compiled_code_budget(host);
                 id
             });
         let entry = bootstrap
@@ -20025,7 +20520,7 @@ fn node_options_build_alias_map(context: &mut Context) -> Result<JsObject, Sandb
             JsValue::from(JsArray::from_iter(
                 expansion.into_iter().map(JsString::from).map(JsValue::from),
                 context,
-            )),
+            )?),
             context,
         )
         .map_err(sandbox_execution_error)?;
@@ -20932,6 +21427,7 @@ fn node_module_wrap_construct(
             }
         };
         host.bootstrap.borrow_mut().module_wraps.insert(id, state);
+        node_sync_live_compiled_code_budget(host)?;
         Ok(JsValue::from(object))
     })
 }
@@ -21026,6 +21522,8 @@ fn node_module_wrap_link(
         state.linked_request_ids = linked_request_ids;
         state.linked = true;
         state.status = 1;
+        drop(bootstrap);
+        node_sync_live_compiled_code_budget(host)?;
         Ok(JsValue::undefined())
     })
 }
@@ -21123,6 +21621,8 @@ fn node_module_wrap_instantiate(
         state.instantiated = true;
         state.has_async_graph = Some(has_async_graph);
         state.status = 2;
+        drop(bootstrap);
+        node_sync_live_compiled_code_budget(host)?;
         Ok(JsValue::undefined())
     })
 }
@@ -21182,7 +21682,7 @@ fn node_module_wrap_evaluate_sync(
                 );
                 return Err(sandbox_execution_error(error));
             }
-            module.namespace(context)
+            module.namespace(context).map_err(sandbox_execution_error)?
         } else {
             JsObject::with_null_proto()
         };
@@ -21442,7 +21942,7 @@ fn node_module_wrap_get_namespace(
         ));
     }
     if let Some(module) = state.module {
-        return Ok(JsValue::from(module.namespace(context)));
+        return Ok(JsValue::from(module.namespace(context)?));
     }
     Ok(JsValue::undefined())
 }
@@ -21532,7 +22032,7 @@ fn node_module_wrap_create_required_module_facade(
     let namespace = if state.synthetic {
         node_module_wrap_synthetic_namespace(&state, context).map_err(js_error)?
     } else if let Some(module) = state.module {
-        module.namespace(context)
+        module.namespace(context)?
     } else {
         JsObject::with_null_proto()
     };
@@ -21805,7 +22305,7 @@ fn node_util_get_own_non_index_properties(
             boa_engine::property::PropertyKey::Symbol(_) => {}
         }
     }
-    Ok(JsValue::from(JsArray::from_iter(result, context)))
+    Ok(JsValue::from(JsArray::from_iter(result, context)?))
 }
 
 fn node_util_is_inside_node_modules(
@@ -21895,7 +22395,7 @@ fn node_util_preview_entries(
         }
         values.push(step.get(js_string!("value"), context)?);
     }
-    let entries = JsValue::from(JsArray::from_iter(values, context));
+    let entries = JsValue::from(JsArray::from_iter(values, context)?);
     if args.len() == 1 {
         return Ok(entries);
     }
@@ -21908,7 +22408,7 @@ fn node_util_preview_entries(
     Ok(JsValue::from(JsArray::from_iter(
         [entries, JsValue::from(constructor_name == "Map")],
         context,
-    )))
+    )?))
 }
 
 fn node_util_get_caller_location(
@@ -21942,7 +22442,7 @@ fn node_util_get_caller_location(
             JsValue::from(JsString::from(file)),
         ],
         context,
-    )))
+    )?))
 }
 
 fn node_util_get_call_sites(
@@ -22021,7 +22521,7 @@ fn node_util_get_promise_details(
         PromiseState::Fulfilled(value) => vec![JsValue::from(1), value.clone()],
         PromiseState::Rejected(value) => vec![JsValue::from(2), value.clone()],
     };
-    Ok(JsValue::from(JsArray::from_iter(values, context)))
+    Ok(JsValue::from(JsArray::from_iter(values, context)?))
 }
 
 fn node_util_get_proxy_details(
@@ -22039,7 +22539,7 @@ fn node_util_get_proxy_details(
         return Ok(JsValue::from(JsArray::from_iter(
             [JsValue::from(object.clone()), JsValue::undefined()],
             context,
-        )));
+        )?));
     }
     Ok(JsValue::from(object.clone()))
 }
@@ -22220,7 +22720,7 @@ fn node_uv_get_error_map(
                 JsValue::from(JsString::from(message)),
             ],
             context,
-        );
+        )?;
         node_js_map_set(&map, JsValue::from(code), JsValue::from(pair), context)?;
     }
     Ok(JsValue::from(map))
@@ -22480,6 +22980,7 @@ fn node_os_set_priority(
             });
         }
         host.process.borrow_mut().priority = priority;
+        node_sync_live_process_state_budget(host)?;
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
@@ -22613,7 +23114,7 @@ fn node_require_esm_namespace(
     if let PromiseState::Rejected(reason) = promise.state() {
         return Err(boa_engine::JsError::from_opaque(reason));
     }
-    Ok(module.namespace(context).into())
+    Ok(module.namespace(context)?.into())
 }
 
 fn node_read_module_source(
@@ -22690,7 +23191,7 @@ fn node_require_resolve_paths(
         .transpose()?
         .map(|value| value.to_std_string_escaped());
     node_with_host_js(context, |host, context| {
-        let paths = require_resolve_lookup_paths(host, &specifier, referrer.as_deref());
+        let paths = require_resolve_lookup_paths(host, &specifier, referrer.as_deref())?;
         JsValue::from_json(
             &serde_json::json!({
                 "paths": paths,
@@ -22763,9 +23264,9 @@ fn require_resolve_lookup_paths(
     host: &NodeRuntimeHost,
     specifier: &str,
     referrer: Option<&str>,
-) -> Option<Vec<String>> {
+) -> Result<Option<Vec<String>>, SandboxError> {
     if node_builtin_name(specifier).is_some() || specifier.starts_with("node:") {
-        return None;
+        return Ok(None);
     }
 
     if matches!(specifier, "." | "..")
@@ -22775,13 +23276,13 @@ fn require_resolve_lookup_paths(
         let base = referrer
             .map(directory_for_path)
             .unwrap_or_else(|| host.process.borrow().cwd.clone());
-        return Some(vec![base]);
+        return Ok(Some(vec![base]));
     }
 
     let base = referrer
         .map(directory_for_path)
         .unwrap_or_else(|| host.process.borrow().cwd.clone());
-    Some(node_module_lookup_paths_from(host, &base))
+    Ok(Some(node_module_lookup_paths_from(host, &base)?))
 }
 
 fn node_fs_read_text_file(
@@ -23053,6 +23554,8 @@ fn node_fs_open_impl(
             contents,
         },
     );
+    drop(open_files);
+    node_sync_live_host_buffer_budget(host)?;
     Ok(fd)
 }
 
@@ -23075,6 +23578,7 @@ fn node_fs_close_impl(host: &NodeRuntimeHost, fd: i32) -> Result<(), SandboxErro
             node_graph_invalidate(host);
         }
     }
+    node_sync_live_host_buffer_budget(host)?;
     Ok(())
 }
 
@@ -23128,6 +23632,7 @@ fn node_fs_write_impl(
             .borrow_mut()
             .stdout
             .push_str(&String::from_utf8_lossy(data));
+        node_sync_live_process_state_budget(host)?;
         return Ok(data.len());
     }
     if fd == 2 {
@@ -23135,6 +23640,7 @@ fn node_fs_write_impl(
             .borrow_mut()
             .stderr
             .push_str(&String::from_utf8_lossy(data));
+        node_sync_live_process_state_budget(host)?;
         return Ok(data.len());
     }
     if fd == 0 {
@@ -23176,6 +23682,7 @@ fn node_fs_write_impl(
         }
         (entry.path.clone(), entry.contents.clone())
     };
+    node_sync_live_host_buffer_budget(host)?;
     futures::executor::block_on(host.session.filesystem().write_file(
         &path,
         contents,
@@ -23265,6 +23772,7 @@ fn node_fs_truncate_fd(
             }
             (entry.path.clone(), entry.contents.clone())
         };
+        node_sync_live_host_buffer_budget(host)?;
         futures::executor::block_on(host.session.filesystem().write_file(
             &path,
             contents,
@@ -24138,6 +24646,8 @@ fn node_zlib_stream_create(
         let id = streams.next_id;
         streams.next_id = streams.next_id.saturating_add(1).max(1);
         streams.entries.insert(id, stream);
+        drop(streams);
+        node_sync_live_node_compat_state_budget(host)?;
         Ok(JsValue::new(id))
     })
 }
@@ -24265,6 +24775,7 @@ fn node_zlib_stream_close(
         .to_u32(context)?;
     node_with_host_js(context, |host, _context| {
         host.zlib_streams.borrow_mut().entries.remove(&id);
+        node_sync_live_node_compat_state_budget(host)?;
         Ok(JsValue::undefined())
     })
 }
@@ -24987,11 +25498,15 @@ fn execute_node_child_process(
             ..Default::default()
         })),
     });
-    let result = execute_node_command_inner(
+    let child_result = execute_node_command_inner(
         child_host,
         entrypoint.clone(),
         resolve_node_path(&host.process.borrow().cwd, &entrypoint),
-    )?;
+    );
+    node_sync_live_module_cache_budget(host)?;
+    node_sync_live_task_queue_budget(host)?;
+    node_sync_live_process_state_budget(host)?;
+    let result = child_result?;
     let report = result.result.unwrap_or(JsonValue::Null);
     let stdout = json_object_string(&report, "stdout");
     let stderr = json_object_string(&report, "stderr");
@@ -25189,6 +25704,7 @@ fn resolve_node_module(
     host.loaded_modules
         .borrow_mut()
         .insert(resolved.id.clone(), loaded);
+    node_sync_live_module_cache_budget(host)?;
     Ok(resolved)
 }
 
@@ -25238,12 +25754,14 @@ fn resolve_node_module_path_with_paths(
                 .borrow_mut()
                 .resolve_path_cache
                 .insert(cache_key, Some(resolved.clone()));
+            node_sync_live_module_cache_budget(host)?;
         }
         Err(SandboxError::ModuleNotFound { .. }) => {
             host.module_graph
                 .borrow_mut()
                 .resolve_path_cache
                 .insert(cache_key, None);
+            node_sync_live_module_cache_budget(host)?;
         }
         Err(_) => {}
     }
@@ -25323,7 +25841,7 @@ fn resolve_node_module_path_with_paths_uncached(
         .map(directory_for_path)
         .unwrap_or_else(|| host.process.borrow().cwd.clone());
     let (package_name, subpath) = split_package_request(specifier)?;
-    for directory in node_module_lookup_paths_from(host, &base) {
+    for directory in node_module_lookup_paths_from(host, &base)? {
         let package_root = normalize_node_path(&format!("{directory}/{package_name}"));
         if let Some(resolved) = resolve_package_entry_from_directory(
             host,
@@ -25356,7 +25874,7 @@ fn resolve_bare_node_module_with_lookup_paths(
         } else {
             normalize_node_path(&format!("{cwd}/{lookup_base}"))
         };
-        for directory in node_module_lookup_paths_from(host, &normalized) {
+        for directory in node_module_lookup_paths_from(host, &normalized)? {
             let package_root = normalize_node_path(&format!("{directory}/{package_name}"));
             if let Some(resolved) = resolve_package_entry_from_directory(
                 host,
@@ -25433,6 +25951,7 @@ fn find_nearest_package_root(
                 .borrow_mut()
                 .nearest_package_root_cache
                 .insert(base, Some(directory.clone()));
+            node_sync_live_module_cache_budget(host)?;
             return Ok(Some(directory));
         }
     }
@@ -25440,6 +25959,7 @@ fn find_nearest_package_root(
         .borrow_mut()
         .nearest_package_root_cache
         .insert(base, None);
+    node_sync_live_module_cache_budget(host)?;
     Ok(None)
 }
 
@@ -25479,6 +25999,7 @@ fn resolve_package_entry_from_directory(
             .borrow_mut()
             .package_entry_cache
             .insert(cache_key, None);
+        node_sync_live_module_cache_budget(host)?;
         return Ok(None);
     };
     if stats.kind != FileKind::Directory {
@@ -25486,6 +26007,7 @@ fn resolve_package_entry_from_directory(
             .borrow_mut()
             .package_entry_cache
             .insert(cache_key, None);
+        node_sync_live_module_cache_budget(host)?;
         return Ok(None);
     }
 
@@ -25504,6 +26026,7 @@ fn resolve_package_entry_from_directory(
                             .borrow_mut()
                             .package_entry_cache
                             .insert(cache_key, Some(resolved.clone()));
+                        node_sync_live_module_cache_budget(host)?;
                         return Ok(Some(resolved));
                     }
                 }
@@ -25553,6 +26076,7 @@ fn resolve_package_entry_from_directory(
         .borrow_mut()
         .package_entry_cache
         .insert(cache_key, resolved.clone());
+    node_sync_live_module_cache_budget(host)?;
     Ok(resolved)
 }
 
@@ -25610,6 +26134,7 @@ fn resolve_as_file_or_directory(
                     .borrow_mut()
                     .file_or_directory_cache
                     .insert(cache_key, Some(candidate.clone()));
+                node_sync_live_module_cache_budget(host)?;
                 return Ok(Some(candidate));
             }
             FileKind::Directory => {
@@ -25620,6 +26145,7 @@ fn resolve_as_file_or_directory(
                         .borrow_mut()
                         .file_or_directory_cache
                         .insert(cache_key, Some(resolved.clone()));
+                    node_sync_live_module_cache_budget(host)?;
                     return Ok(Some(resolved));
                 }
             }
@@ -25630,6 +26156,7 @@ fn resolve_as_file_or_directory(
         .borrow_mut()
         .file_or_directory_cache
         .insert(cache_key, None);
+    node_sync_live_module_cache_budget(host)?;
     Ok(None)
 }
 
@@ -25677,6 +26204,7 @@ fn read_package_json(
             .borrow_mut()
             .package_json_cache
             .insert(path.to_string(), None);
+        node_sync_live_module_cache_budget(host)?;
         return Ok(None);
     };
     let text = String::from_utf8(bytes).map_err(|error| SandboxError::Service {
@@ -25692,6 +26220,7 @@ fn read_package_json(
         .borrow_mut()
         .package_json_cache
         .insert(path.to_string(), Some(parsed.clone()));
+    node_sync_live_module_cache_budget(host)?;
     Ok(Some(parsed))
 }
 
@@ -25818,6 +26347,7 @@ fn node_module_kind_for_path(
         .borrow_mut()
         .module_kind_cache
         .insert(path.to_string(), kind);
+    node_sync_live_module_cache_budget(host)?;
     Ok(kind)
 }
 
@@ -25846,6 +26376,7 @@ fn nearest_package_type(
                 .borrow_mut()
                 .nearest_package_type_cache
                 .insert(base, resolved.clone());
+            node_sync_live_module_cache_budget(host)?;
             return Ok(resolved);
         }
     }
@@ -25853,6 +26384,7 @@ fn nearest_package_type(
         .borrow_mut()
         .nearest_package_type_cache
         .insert(base, None);
+    node_sync_live_module_cache_budget(host)?;
     Ok(None)
 }
 
@@ -25890,7 +26422,10 @@ fn ancestor_directories_to_root(start: &str) -> Vec<String> {
     directories
 }
 
-fn node_module_lookup_paths_from(host: &NodeRuntimeHost, base: &str) -> Vec<String> {
+fn node_module_lookup_paths_from(
+    host: &NodeRuntimeHost,
+    base: &str,
+) -> Result<Vec<String>, SandboxError> {
     let normalized = normalize_node_path(base);
     if let Some(cached) = host
         .module_graph
@@ -25899,7 +26434,7 @@ fn node_module_lookup_paths_from(host: &NodeRuntimeHost, base: &str) -> Vec<Stri
         .get(&normalized)
         .cloned()
     {
-        return cached;
+        return Ok(cached);
     }
     let mut paths = Vec::new();
     for directory in ancestor_directories_to_root(&normalized) {
@@ -25920,7 +26455,8 @@ fn node_module_lookup_paths_from(host: &NodeRuntimeHost, base: &str) -> Vec<Stri
         .borrow_mut()
         .node_modules_lookup_cache
         .insert(normalized, paths.clone());
-    paths
+    node_sync_live_module_cache_budget(host)?;
+    Ok(paths)
 }
 
 fn resolve_node_path(cwd: &str, path: &str) -> String {
@@ -26016,6 +26552,13 @@ fn node_execution_error(
 }
 
 fn js_error(error: SandboxError) -> boa_engine::JsError {
+    if let SandboxError::TrackedMemoryBudget(error) = error {
+        return GcAllocationBudgetExceeded {
+            requested_bytes: error.usage.total_bytes as usize,
+            message: error.to_string(),
+        }
+        .into();
+    }
     if matches!(
         error,
         SandboxError::ExecveReplaced | SandboxError::ProcessExited
@@ -26161,7 +26704,10 @@ async fn prepare_js_execution_request(
             };
             let inline = inline_eval_module(&entrypoint, source.clone());
             let was_hit = state.is_module_cache_hit(&inline.cache_entry).await;
-            state.upsert_module_cache(inline.cache_entry.clone()).await;
+            state
+                .upsert_module_cache(inline.cache_entry.clone())
+                .await
+                .map_err(SandboxError::from)?;
             Ok((
                 entrypoint.clone(),
                 JsExecutionRequest {
@@ -26348,7 +26894,10 @@ async fn hydrate_runtime_cache_state(
     };
     let entries = serde_json::from_slice::<Vec<SandboxModuleCacheEntry>>(&bytes)?;
     let next_eval_id = recovered_next_eval_id(&session_info.workspace_root, &entries);
-    state.hydrate_module_cache(entries, next_eval_id).await;
+    state
+        .hydrate_module_cache(entries, next_eval_id)
+        .await
+        .map_err(SandboxError::from)?;
     Ok(())
 }
 

@@ -4,7 +4,7 @@ use terracedb::{ExecutionDomainPath, ExecutionResourceKind};
 use terracedb_capabilities::{ExecutionDomain, ExecutionOperation};
 use terracedb_vfs::{VfsError, VolumeId};
 
-use crate::ConflictReport;
+use crate::{ConflictReport, runtime::SandboxTrackedMemoryBudgetExceeded};
 
 #[derive(Debug, Error)]
 pub enum SandboxError {
@@ -97,7 +97,18 @@ pub enum SandboxError {
         message: String,
     },
     #[error(transparent)]
+    TrackedMemoryBudget(#[from] SandboxTrackedMemoryBudgetExceeded),
+    #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
     #[error(transparent)]
     Vfs(#[from] VfsError),
+}
+
+impl From<boa_engine::JsError> for SandboxError {
+    fn from(error: boa_engine::JsError) -> Self {
+        Self::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: error.to_string(),
+        }
+    }
 }

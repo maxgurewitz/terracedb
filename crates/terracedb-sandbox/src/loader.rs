@@ -218,7 +218,7 @@ impl SandboxModuleLoader {
     ) -> Result<LoadedSandboxModule, SandboxError> {
         let resolved = self.resolve_specifier(specifier, referrer).await?;
         let loaded = self.load_resolved(&resolved).await?;
-        self.record_loaded_module(&loaded).await;
+        self.record_loaded_module(&loaded).await?;
         Ok(loaded)
     }
 
@@ -462,14 +462,15 @@ impl SandboxModuleLoader {
         ))
     }
 
-    async fn record_loaded_module(&self, loaded: &LoadedSandboxModule) {
+    async fn record_loaded_module(&self, loaded: &LoadedSandboxModule) -> Result<(), SandboxError> {
         let cached = self
             .runtime_state
             .is_module_cache_hit(&loaded.cache_entry)
             .await;
         self.runtime_state
             .upsert_module_cache(loaded.cache_entry.clone())
-            .await;
+            .await
+            .map_err(SandboxError::from)?;
 
         let mut trace = self.trace.lock().await;
         if !trace.module_graph.contains(&loaded.specifier) {
@@ -493,6 +494,7 @@ impl SandboxModuleLoader {
         if !bucket.contains(&loaded.specifier) {
             bucket.push(loaded.specifier.clone());
         }
+        Ok(())
     }
 
     fn loaded_module(
@@ -639,7 +641,9 @@ impl JsModuleLoader for SandboxModuleLoader {
             .map_err(|error| {
                 sandbox_error_to_js_substrate(error, resolved.canonical_specifier.clone())
             })?;
-        self.record_loaded_module(&loaded).await;
+        self.record_loaded_module(&loaded).await.map_err(|error| {
+            sandbox_error_to_js_substrate(error, resolved.canonical_specifier.clone())
+        })?;
         self.to_js_loaded_module(loaded).map_err(|error| {
             sandbox_error_to_js_substrate(error, resolved.canonical_specifier.clone())
         })

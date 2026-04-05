@@ -2177,7 +2177,10 @@ impl ExecutionUsageHandle {
         if state.released || !state.last_decision.admitted || !reduction.is_non_zero() {
             return Ok(state.last_decision.snapshot.clone());
         }
-        let snapshot = self.inner.manager.checked_release(&self.inner.path, reduction)?;
+        let snapshot = self
+            .inner
+            .manager
+            .checked_release(&self.inner.path, reduction)?;
         state.held_usage.saturating_sub_assign(reduction);
         state.last_decision = ResourceAdmissionDecision {
             admitted: true,
