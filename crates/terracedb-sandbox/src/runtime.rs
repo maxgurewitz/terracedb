@@ -4326,6 +4326,13 @@ fn node_with_host_js(
     node_with_host(|host| f(host, context)).map_err(js_error)
 }
 
+fn node_with_host_native_result(
+    context: &mut Context,
+    f: impl FnOnce(&NodeRuntimeHost, &mut Context) -> Result<NativeFunctionResult, SandboxError>,
+) -> JsResult<NativeFunctionResult> {
+    node_with_host(|host| f(host, context)).map_err(js_error)
+}
+
 fn node_queue_host_operation(
     host: &NodeRuntimeHost,
     operation: NodePendingHostOperation,
@@ -4826,6 +4833,21 @@ where
             }
         }
     }
+}
+
+async fn node_drive_ignored_callback_job(
+    context: &mut Context,
+    callable: JsObject,
+    this_value: JsValue,
+    args: Vec<JsValue>,
+) -> JsResult<JsValue> {
+    let host = active_node_host().map_err(js_error)?;
+    let _ = node_drive_interruptible_value(context, host, move |context| {
+        callable.call_interruptible(&this_value, &args, context)
+    })
+    .await
+    .map_err(js_error)?;
+    Ok(JsValue::undefined())
 }
 
 #[async_recursion(?Send)]
@@ -8048,12 +8070,12 @@ fn node_stream_handle_close(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(this) = this.as_object() else {
-        return Ok(JsValue::from(-1));
+        return Ok(NativeFunctionResult::complete(JsValue::from(-1)));
     };
     let callback = args.first().and_then(JsValue::as_object);
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         node_stream_handle_state_mut(host, &this, context, |state| {
             state.closed = true;
             state.reading = false;
@@ -8061,9 +8083,15 @@ fn node_stream_handle_close(
         this.set(js_string!("reading"), JsValue::from(false), true, context)
             .map_err(sandbox_execution_error)?;
         if let Some(callback) = callback.and_then(|value| JsValue::from(value).as_callable()) {
-            let _ = callback.call(&JsValue::undefined(), &[], context);
+            return Ok(node_call_ignored_callback_interruptible(
+                &callback,
+                &JsValue::undefined(),
+                &[],
+                JsValue::undefined(),
+                context,
+            )?);
         }
-        Ok(JsValue::undefined())
+        Ok(NativeFunctionResult::complete(JsValue::undefined()))
     })
 }
 
@@ -8266,12 +8294,12 @@ fn node_stream_handle_shutdown(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(this) = this.as_object() else {
-        return Ok(JsValue::from(-1));
+        return Ok(NativeFunctionResult::complete(JsValue::from(-1)));
     };
     let req = args.first().and_then(JsValue::as_object);
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         node_stream_handle_state_mut(host, &this, context, |state| {
             state.reading = false;
         })?;
@@ -8284,16 +8312,22 @@ fn node_stream_handle_shutdown(
                 true,
                 context,
             )
-            .map_err(sandbox_execution_error)?;
+                .map_err(sandbox_execution_error)?;
             if let Some(oncomplete) = req
                 .get(js_string!("oncomplete"), context)
                 .map_err(sandbox_execution_error)?
                 .as_callable()
             {
-                let _ = oncomplete.call(&JsValue::from(req), &[], context);
+                return Ok(node_call_ignored_callback_interruptible(
+                    &oncomplete,
+                    &JsValue::from(req.clone()),
+                    &[],
+                    JsValue::from(0),
+                    context,
+                )?);
             }
         }
-        Ok(JsValue::from(0))
+        Ok(NativeFunctionResult::complete(JsValue::from(0)))
     })
 }
 
@@ -8630,9 +8664,9 @@ fn node_stream_handle_connect(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(this) = this.as_object() else {
-        return Ok(JsValue::from(NODE_UV_EBADF));
+        return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EBADF)));
     };
     let req = args.first().and_then(JsValue::as_object);
     let address = args
@@ -8642,27 +8676,27 @@ fn node_stream_handle_connect(
         .to_string(context)?
         .to_std_string_escaped();
     let port_value = args.get(2).cloned().unwrap_or_else(|| JsValue::from(0));
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
             Ok(kind) => kind,
-            Err(code) => return Ok(JsValue::from(code)),
+            Err(code) => return Ok(NativeFunctionResult::complete(JsValue::from(code))),
         };
         if matches!(kind, NodeStreamHandleKind::TcpSocket) {
             let Some(req) = req else {
-                return Ok(JsValue::from(NODE_UV_EINVAL));
+                return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EINVAL)));
             };
             let port = match port_value.to_u32(context) {
                 Ok(value) => value as u16,
-                Err(_) => return Ok(JsValue::from(NODE_UV_EINVAL)),
+                Err(_) => return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EINVAL))),
             };
             if address.parse::<std::net::Ipv4Addr>().is_err() {
-                return Ok(JsValue::from(NODE_UV_EINVAL));
+                return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EINVAL)));
             }
             let already_connected = node_stream_handle_state(host, &this, context, |state| {
                 state.peer_address.is_some()
             })?;
             if already_connected {
-                return Ok(JsValue::from(NODE_UV_EISCONN));
+                return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EISCONN)));
             }
             node_stream_handle_state_mut(host, &this, context, |state| {
                 state.peer_address = Some(address.clone());
@@ -8686,7 +8720,8 @@ fn node_stream_handle_connect(
                 .map_err(sandbox_execution_error)?
                 .as_callable()
             {
-                let _ = oncomplete.call(
+                return Ok(node_call_ignored_callback_interruptible(
+                    &oncomplete,
                     &JsValue::from(req.clone()),
                     &[
                         JsValue::from(0),
@@ -8695,25 +8730,26 @@ fn node_stream_handle_connect(
                         JsValue::from(true),
                         JsValue::from(true),
                     ],
+                    JsValue::from(0),
                     context,
-                );
+                )?);
             }
-            return Ok(JsValue::from(0));
+            return Ok(NativeFunctionResult::complete(JsValue::from(0)));
         } else if matches!(
             kind,
             NodeStreamHandleKind::PipeSocket | NodeStreamHandleKind::PipeIpc
         ) {
             let Some(req) = req else {
-                return Ok(JsValue::from(NODE_UV_EINVAL));
+                return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EINVAL)));
             };
             if address.is_empty() {
-                return Ok(JsValue::from(NODE_UV_EINVAL));
+                return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EINVAL)));
             }
             let already_connected = node_stream_handle_state(host, &this, context, |state| {
                 state.peer_address.is_some()
             })?;
             if already_connected {
-                return Ok(JsValue::from(NODE_UV_EISCONN));
+                return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EISCONN)));
             }
             node_stream_handle_state_mut(host, &this, context, |state| {
                 state.peer_address = Some(address.clone());
@@ -8732,7 +8768,8 @@ fn node_stream_handle_connect(
                 .map_err(sandbox_execution_error)?
                 .as_callable()
             {
-                let _ = oncomplete.call(
+                return Ok(node_call_ignored_callback_interruptible(
+                    &oncomplete,
                     &JsValue::from(req.clone()),
                     &[
                         JsValue::from(0),
@@ -8741,12 +8778,13 @@ fn node_stream_handle_connect(
                         JsValue::from(true),
                         JsValue::from(true),
                     ],
+                    JsValue::from(0),
                     context,
-                );
+                )?);
             }
-            return Ok(JsValue::from(0));
+            return Ok(NativeFunctionResult::complete(JsValue::from(0)));
         }
-        Ok(JsValue::from(NODE_UV_EBADF))
+        Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EBADF)))
     })
 }
 
@@ -8754,9 +8792,9 @@ fn node_stream_handle_connect6(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(this) = this.as_object() else {
-        return Ok(JsValue::from(NODE_UV_EBADF));
+        return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EBADF)));
     };
     let req = args.first().and_then(JsValue::as_object);
     let address = args
@@ -8770,23 +8808,23 @@ fn node_stream_handle_connect6(
         .cloned()
         .unwrap_or_else(|| JsValue::from(0))
         .to_u32(context)? as u16;
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         let kind = match node_stream_handle_kind_or_code(host, &this, context) {
             Ok(kind) => kind,
-            Err(code) => return Ok(JsValue::from(code)),
+            Err(code) => return Ok(NativeFunctionResult::complete(JsValue::from(code))),
         };
         if !matches!(kind, NodeStreamHandleKind::TcpSocket)
             || address.parse::<std::net::Ipv6Addr>().is_err()
         {
-            return Ok(JsValue::from(NODE_UV_EINVAL));
+            return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EINVAL)));
         }
         let Some(req) = req else {
-            return Ok(JsValue::from(NODE_UV_EINVAL));
+            return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EINVAL)));
         };
         let already_connected =
             node_stream_handle_state(host, &this, context, |state| state.peer_address.is_some())?;
         if already_connected {
-            return Ok(JsValue::from(NODE_UV_EISCONN));
+            return Ok(NativeFunctionResult::complete(JsValue::from(NODE_UV_EISCONN)));
         }
         node_stream_handle_state_mut(host, &this, context, |state| {
             state.peer_address = Some(address.clone());
@@ -8810,7 +8848,8 @@ fn node_stream_handle_connect6(
             .map_err(sandbox_execution_error)?
             .as_callable()
         {
-            let _ = oncomplete.call(
+            return Ok(node_call_ignored_callback_interruptible(
+                &oncomplete,
                 &JsValue::from(req.clone()),
                 &[
                     JsValue::from(0),
@@ -8819,10 +8858,11 @@ fn node_stream_handle_connect6(
                     JsValue::from(true),
                     JsValue::from(true),
                 ],
+                JsValue::from(0),
                 context,
-            );
+            )?);
         }
-        Ok(JsValue::from(0))
+        Ok(NativeFunctionResult::complete(JsValue::from(0)))
     })
 }
 
@@ -9037,47 +9077,124 @@ fn node_stream_handle_define_method(
     Ok(())
 }
 
+fn node_stream_handle_define_suspend_method(
+    target: &JsObject,
+    method_name: &'static str,
+    length: usize,
+    function: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    target
+        .set(
+            JsString::from(method_name),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_copy_closure_with_captures(
+                        move |this, args, _captures: &(), context| function(this, args, context),
+                        (),
+                    ),
+                )
+                .name(JsString::from(method_name))
+                .length(length)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    Ok(())
+}
+
 fn node_stream_handle_install_base_methods(
     target: &JsObject,
     context: &mut Context,
 ) -> Result<(), SandboxError> {
+    node_stream_handle_define_suspend_method(
+        target,
+        "close",
+        1,
+        node_stream_handle_close,
+        context,
+    )?;
     for (method_name, length, function) in [
         (
-            "close",
-            1usize,
-            node_stream_handle_close as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+            "readStart",
+            0usize,
+            node_stream_handle_read_start
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("readStart", 0usize, node_stream_handle_read_start),
-        ("readStop", 0usize, node_stream_handle_read_stop),
-        ("useUserBuffer", 1usize, node_stream_handle_use_user_buffer),
-        ("writeBuffer", 2usize, node_stream_handle_write_buffer),
+        (
+            "readStop",
+            0usize,
+            node_stream_handle_read_stop
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "useUserBuffer",
+            1usize,
+            node_stream_handle_use_user_buffer
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "writeBuffer",
+            2usize,
+            node_stream_handle_write_buffer
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         (
             "writeLatin1String",
             2usize,
-            node_stream_handle_write_latin1_string,
+            node_stream_handle_write_latin1_string
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "writeUtf8String",
             2usize,
-            node_stream_handle_write_utf8_string,
+            node_stream_handle_write_utf8_string
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "writeAsciiString",
             2usize,
-            node_stream_handle_write_ascii_string,
+            node_stream_handle_write_ascii_string
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "writeUcs2String",
             2usize,
-            node_stream_handle_write_ucs2_string,
+            node_stream_handle_write_ucs2_string
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("writev", 3usize, node_stream_handle_writev),
-        ("shutdown", 1usize, node_stream_handle_shutdown),
-        ("getAsyncId", 0usize, node_stream_handle_get_async_id),
-        ("setBlocking", 1usize, node_stream_handle_set_blocking),
+        (
+            "writev",
+            3usize,
+            node_stream_handle_writev
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "getAsyncId",
+            0usize,
+            node_stream_handle_get_async_id
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "setBlocking",
+            1usize,
+            node_stream_handle_set_blocking
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
     ] {
         node_stream_handle_define_method(target, method_name, length, function, context)?;
     }
+    node_stream_handle_define_suspend_method(
+        target,
+        "shutdown",
+        1,
+        node_stream_handle_shutdown,
+        context,
+    )?;
     target
         .define_property_or_throw(
             js_string!("bytesWritten"),
@@ -9132,8 +9249,6 @@ fn node_stream_handle_install_tcp_methods(
         ("bind", 3usize, node_stream_handle_bind),
         ("bind6", 3usize, node_stream_handle_bind6),
         ("listen", 1usize, node_stream_handle_listen),
-        ("connect", 3usize, node_stream_handle_connect),
-        ("connect6", 3usize, node_stream_handle_connect6),
         ("getsockname", 1usize, node_stream_handle_getsockname),
         ("getpeername", 1usize, node_stream_handle_getpeername),
         ("setNoDelay", 1usize, node_stream_handle_set_no_delay),
@@ -9142,6 +9257,20 @@ fn node_stream_handle_install_tcp_methods(
     ] {
         node_stream_handle_define_method(target, method_name, length, function, context)?;
     }
+    node_stream_handle_define_suspend_method(
+        target,
+        "connect",
+        3,
+        node_stream_handle_connect,
+        context,
+    )?;
+    node_stream_handle_define_suspend_method(
+        target,
+        "connect6",
+        3,
+        node_stream_handle_connect6,
+        context,
+    )?;
     Ok(())
 }
 
@@ -9157,11 +9286,17 @@ fn node_stream_handle_install_pipe_methods(
         ),
         ("bind", 3usize, node_stream_handle_bind),
         ("listen", 1usize, node_stream_handle_listen),
-        ("connect", 3usize, node_stream_handle_connect),
         ("fchmod", 1usize, node_stream_handle_fchmod),
     ] {
         node_stream_handle_define_method(target, method_name, length, function, context)?;
     }
+    node_stream_handle_define_suspend_method(
+        target,
+        "connect",
+        3,
+        node_stream_handle_connect,
+        context,
+    )?;
     Ok(())
 }
 
@@ -10126,17 +10261,18 @@ fn node_udp_schedule_message_delivery(
             )
             .map_err(sandbox_execution_error)
             .map_err(js_error)?;
-            onmessage.call(
-                &JsValue::from(target.clone()),
-                &[
+            node_drive_ignored_callback_job(
+                context,
+                onmessage,
+                JsValue::from(target.clone()),
+                vec![
                     JsValue::from(nread),
                     JsValue::from(target.clone()),
                     buffer,
                     rinfo,
                 ],
-                context,
-            )?;
-            Ok(JsValue::undefined())
+            )
+            .await
         })
         .into(),
     );
@@ -10582,15 +10718,16 @@ fn node_process_schedule_onexit(
                 return Ok(JsValue::undefined());
             };
             let signal = term_signal.unwrap_or_default();
-            onexit.call(
-                &JsValue::from(handle),
-                &[
+            node_drive_ignored_callback_job(
+                context,
+                onexit,
+                JsValue::from(handle),
+                vec![
                     JsValue::from(exit_status),
                     JsValue::from(JsString::from(signal)),
                 ],
-                context,
-            )?;
-            Ok(JsValue::undefined())
+            )
+            .await
         })
         .into(),
     );
@@ -10835,9 +10972,9 @@ fn node_process_wrap_spawn_resume(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeProcessWrapSpawnResume,
     context: &mut Context,
-) -> JsResult<boa_engine::vm::CompletionRecord> {
+) -> JsResult<NativeFunctionResult> {
     if let Some(completion) = node_resume_completion(completion)? {
-        return Ok(completion);
+        return Ok(NativeFunctionResult::from_completion(completion));
     }
     let host = active_node_host().map_err(js_error)?;
     let result = take_child_process_result_for_resume(capture.request_id).map_err(js_error)?;
@@ -10868,7 +11005,8 @@ fn node_process_wrap_spawn_resume(
         .handle
         .get(js_string!("onexit"), context)?;
     if let Some(onexit) = onexit.as_callable() {
-        let _ = onexit.call(
+        return node_call_ignored_callback_interruptible(
+            &onexit,
             &JsValue::from(capture.handle.clone()),
             &[
                 JsValue::from(errno),
@@ -10877,10 +11015,11 @@ fn node_process_wrap_spawn_resume(
                     .map(|signal| JsValue::from(JsString::from(signal)))
                     .unwrap_or_else(JsValue::null),
             ],
+            JsValue::from(errno),
             context,
         );
     }
-    Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::from(errno)))
+    Ok(NativeFunctionResult::complete(JsValue::from(errno)))
 }
 
 fn node_process_wrap_kill(
@@ -11171,24 +11310,35 @@ fn node_fs_dir_make_handle(
     handle
         .set(closed_symbol, JsValue::from(false), true, context)
         .map_err(sandbox_execution_error)?;
-    for (name, length, function) in [
-        (
-            "read",
-            3usize,
-            node_fs_dir_handle_read as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+    let read = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_suspend_copy_closure_with_captures(
+            |this, args, _captures: &(), context| node_fs_dir_handle_read(this, args, context),
+            (),
         ),
-        ("close", 1usize, node_fs_dir_handle_close),
-    ] {
-        let value =
-            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-                .name(JsString::from(name))
-                .length(length)
-                .constructor(false)
-                .build();
-        handle
-            .set(JsString::from(name), JsValue::from(value), true, context)
-            .map_err(sandbox_execution_error)?;
-    }
+    )
+    .name(js_string!("read"))
+    .length(3)
+    .constructor(false)
+    .build();
+    handle
+        .set(js_string!("read"), JsValue::from(read), true, context)
+        .map_err(sandbox_execution_error)?;
+
+    let close = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_suspend_copy_closure_with_captures(
+            |this, args, _captures: &(), context| node_fs_dir_handle_close(this, args, context),
+            (),
+        ),
+    )
+    .name(js_string!("close"))
+    .length(1)
+    .constructor(false)
+    .build();
+    handle
+        .set(js_string!("close"), JsValue::from(close), true, context)
+        .map_err(sandbox_execution_error)?;
     Ok(handle)
 }
 
@@ -11196,9 +11346,9 @@ fn node_resume_fs_dir_opendir(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeFsDirOpendirResume,
     context: &mut Context,
-) -> JsResult<boa_engine::vm::CompletionRecord> {
+) -> JsResult<NativeFunctionResult> {
     if let Some(completion) = node_resume_completion(completion)? {
-        return Ok(completion);
+        return Ok(NativeFunctionResult::from_completion(completion));
     }
     let entries = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::DirEntries(entries) => entries,
@@ -11206,10 +11356,7 @@ fn node_resume_fs_dir_opendir(
     };
     let host = active_node_host().map_err(js_error)?;
     let handle = node_fs_dir_make_handle(&host, context, &capture.path, &entries).map_err(js_error)?;
-    match node_fs_req_complete(capture.req.as_ref(), context, JsValue::from(handle)).map_err(js_error) {
-        Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
-        Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
-    }
+    node_fs_req_complete(capture.req.as_ref(), context, JsValue::from(handle))
 }
 
 fn node_fs_dir_opendir_suspend(
@@ -11240,7 +11387,7 @@ fn node_fs_dir_handle_read(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let host = active_node_host().map_err(js_error)?;
     let closed_symbol = node_host_private_symbol(&host, "fs_dir.closed").map_err(js_error)?;
     let index_symbol = node_host_private_symbol(&host, "fs_dir.index").map_err(js_error)?;
@@ -11250,7 +11397,7 @@ fn node_fs_dir_handle_read(
         JsNativeError::typ().with_message("DirHandle.read receiver must be an object")
     })?;
     if handle.get(closed_symbol, context)?.to_boolean() {
-        return Ok(JsValue::null());
+        return Ok(NativeFunctionResult::complete(JsValue::null()));
     }
     let index = handle.get(index_symbol.clone(), context)?.to_u32(context)? as usize;
     let names = handle
@@ -11266,7 +11413,7 @@ fn node_fs_dir_handle_read(
     let len = names_array.length(context)? as usize;
     if index >= len {
         let req = args.get(2).cloned();
-        return node_fs_req_complete(req.as_ref(), context, JsValue::null()).map_err(js_error);
+        return node_fs_req_complete(req.as_ref(), context, JsValue::null());
     }
     let buffer_size = args
         .get(1)
@@ -11283,14 +11430,14 @@ fn node_fs_dir_handle_read(
     let result = JsValue::from(JsArray::from_iter(values, context)?);
     handle.set(index_symbol, JsValue::from(end as u32), true, context)?;
     let req = args.get(2).cloned();
-    node_fs_req_complete(req.as_ref(), context, result).map_err(js_error)
+    node_fs_req_complete(req.as_ref(), context, result)
 }
 
 fn node_fs_dir_handle_close(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let host = active_node_host().map_err(js_error)?;
     let closed_symbol = node_host_private_symbol(&host, "fs_dir.closed").map_err(js_error)?;
     let handle = this.as_object().ok_or_else(|| {
@@ -11298,7 +11445,7 @@ fn node_fs_dir_handle_close(
     })?;
     handle.set(closed_symbol, JsValue::from(true), true, context)?;
     let req = args.first().cloned();
-    node_fs_req_complete(req.as_ref(), context, JsValue::undefined()).map_err(js_error)
+    node_fs_req_complete(req.as_ref(), context, JsValue::undefined())
 }
 
 fn node_fs_binding_stat_values(context: &mut Context) -> Result<JsObject, SandboxError> {
@@ -11374,28 +11521,149 @@ fn node_fill_fs_stat_values(
     Ok(())
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct NodeIgnoredCallbackResume {
+    continuation: boa_engine::native_function::NativeResume,
+    return_value: JsValue,
+}
+
+fn node_resume_ignored_callback(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeIgnoredCallbackResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            Ok(NativeFunctionResult::complete(capture.return_value.clone()))
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_ignored_callback,
+                NodeIgnoredCallbackResume {
+                    continuation,
+                    return_value: capture.return_value.clone(),
+                },
+            ),
+        ),
+    }
+}
+
+fn node_call_ignored_callback_interruptible(
+    callable: &JsObject,
+    this_value: &JsValue,
+    args: &[JsValue],
+    return_value: JsValue,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match callable.call_interruptible(this_value, args, context)? {
+        InterruptibleCallOutcome::Complete(_) => Ok(NativeFunctionResult::complete(return_value)),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_ignored_callback,
+                NodeIgnoredCallbackResume {
+                    continuation,
+                    return_value,
+                },
+            ),
+        ),
+    }
+}
+
 fn node_fs_req_complete(
     req: Option<&JsValue>,
     context: &mut Context,
     result: JsValue,
-) -> Result<JsValue, SandboxError> {
+) -> JsResult<NativeFunctionResult> {
     let Some(req) = req else {
-        return Ok(result);
+        return Ok(NativeFunctionResult::complete(result));
     };
     let Some(req_object) = req.as_object() else {
-        return Ok(result);
+        return Ok(NativeFunctionResult::complete(result));
     };
     let callback = req_object
         .get(js_string!("oncomplete"), context)
-        .map_err(sandbox_execution_error)?;
+        ?;
     if let Some(callable) = callback.as_callable() {
-        callable
-            .call(req, &[JsValue::null(), result], context)
-            .map_err(sandbox_execution_error)?;
-        Ok(JsValue::undefined())
+        node_call_ignored_callback_interruptible(
+            &callable,
+            req,
+            &[JsValue::null(), result],
+            JsValue::undefined(),
+            context,
+        )
     } else {
-        Ok(result)
+        Ok(NativeFunctionResult::complete(result))
     }
+}
+
+fn node_fs_error_from_sandbox_error(
+    context: &mut Context,
+    error: SandboxError,
+) -> boa_engine::JsError {
+    let message = match &error {
+        SandboxError::Execution { message, .. }
+        | SandboxError::Io { message, .. }
+        | SandboxError::Service { message, .. } => message.clone(),
+        _ => error.to_string(),
+    };
+
+    let code = message
+        .split_once(':')
+        .map(|(prefix, _)| prefix)
+        .filter(|prefix| {
+            !prefix.is_empty()
+                && prefix
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        })
+        .map(str::to_string);
+
+    match code {
+        Some(code) => node_error_with_code(context, JsNativeError::error(), message, &code),
+        None => js_error(error),
+    }
+}
+
+fn node_fs_req_reject(
+    req: Option<&JsValue>,
+    context: &mut Context,
+    error: boa_engine::JsError,
+) -> JsResult<NativeFunctionResult> {
+    let Some(req) = req else {
+        return Ok(NativeFunctionResult::from_completion(
+            boa_engine::vm::CompletionRecord::Throw(error),
+        ));
+    };
+    let Some(req_object) = req.as_object() else {
+        return Ok(NativeFunctionResult::from_completion(
+            boa_engine::vm::CompletionRecord::Throw(error),
+        ));
+    };
+    let callback = req_object.get(js_string!("oncomplete"), context)?;
+    if let Some(callable) = callback.as_callable() {
+        let error = error.into_opaque(context)?;
+        node_call_ignored_callback_interruptible(
+            &callable,
+            req,
+            &[error],
+            JsValue::undefined(),
+            context,
+        )
+    } else {
+        Ok(NativeFunctionResult::from_completion(
+            boa_engine::vm::CompletionRecord::Throw(error),
+        ))
+    }
+}
+
+fn node_internal_fs_fail_req(
+    req: Option<&JsValue>,
+    context: &mut Context,
+    error: SandboxError,
+) -> JsResult<NativeFunctionResult> {
+    let error = node_fs_error_from_sandbox_error(context, error);
+    node_fs_req_reject(req, context, error)
 }
 
 #[derive(Clone, Trace, Finalize)]
@@ -11466,8 +11734,8 @@ fn node_internal_fs_complete_req(
     req: Option<&JsValue>,
     context: &mut Context,
     result: JsValue,
-) -> JsResult<JsValue> {
-    node_fs_req_complete(req, context, result).map_err(js_error)
+) -> JsResult<NativeFunctionResult> {
+    node_fs_req_complete(req, context, result)
 }
 
 fn node_internal_fs_queue_req_operation(
@@ -11477,7 +11745,7 @@ fn node_internal_fs_queue_req_operation(
         boa_engine::vm::CompletionRecord,
         &NodeInternalFsReqResume,
         &mut Context,
-    ) -> JsResult<boa_engine::vm::CompletionRecord>,
+    ) -> JsResult<NativeFunctionResult>,
 ) -> JsResult<NativeFunctionResult> {
     let host = active_node_host().map_err(js_error)?;
     let request_id = node_queue_host_operation(&host, operation).map_err(js_error)?;
@@ -11510,26 +11778,21 @@ fn node_resume_internal_fs_stat_like(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReqResume,
     context: &mut Context,
-) -> JsResult<boa_engine::vm::CompletionRecord> {
+) -> JsResult<NativeFunctionResult> {
     if let Some(completion) = node_resume_completion(completion)? {
-        return Ok(completion);
+        return Ok(NativeFunctionResult::from_completion(completion));
     }
-    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::Stats(Some(stats)) => {
+    match take_host_operation_completion_for_resume(capture.request_id) {
+        Err(error) => node_internal_fs_fail_req(capture.req.as_ref(), context, error),
+        Ok(NodeCompletedHostOperation::Stats(Some(stats))) => {
             let stat_values = node_fs_binding_stat_values(context).map_err(js_error)?;
             node_fill_fs_stat_values(context, &stat_values, &stats).map_err(js_error)?;
-            match node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(stat_values)) {
-                Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
-                Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
-            }
+            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(stat_values))
         }
-        NodeCompletedHostOperation::Stats(None) => {
-            match node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::undefined()) {
-                Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
-                Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
-            }
+        Ok(NodeCompletedHostOperation::Stats(None)) => {
+            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::undefined())
         }
-        other => Err(node_unexpected_host_operation_result("stats", &other)),
+        Ok(other) => Err(node_unexpected_host_operation_result("stats", &other)),
     }
 }
 
@@ -11537,20 +11800,18 @@ fn node_resume_internal_fs_string_req(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReqResume,
     context: &mut Context,
-) -> JsResult<boa_engine::vm::CompletionRecord> {
+) -> JsResult<NativeFunctionResult> {
     if let Some(completion) = node_resume_completion(completion)? {
-        return Ok(completion);
+        return Ok(NativeFunctionResult::from_completion(completion));
     }
-    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::String(value) => match node_internal_fs_complete_req(
+    match take_host_operation_completion_for_resume(capture.request_id) {
+        Err(error) => node_internal_fs_fail_req(capture.req.as_ref(), context, error),
+        Ok(NodeCompletedHostOperation::String(value)) => node_internal_fs_complete_req(
             capture.req.as_ref(),
             context,
             JsValue::from(JsString::from(value)),
-        ) {
-            Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
-            Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
-        },
-        other => Err(node_unexpected_host_operation_result("string", &other)),
+        ),
+        Ok(other) => Err(node_unexpected_host_operation_result("string", &other)),
     }
 }
 
@@ -11558,20 +11819,18 @@ fn node_resume_internal_fs_i32_req(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReqResume,
     context: &mut Context,
-) -> JsResult<boa_engine::vm::CompletionRecord> {
+) -> JsResult<NativeFunctionResult> {
     if let Some(completion) = node_resume_completion(completion)? {
-        return Ok(completion);
+        return Ok(NativeFunctionResult::from_completion(completion));
     }
-    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::I32(value) => match node_internal_fs_complete_req(
+    match take_host_operation_completion_for_resume(capture.request_id) {
+        Err(error) => node_internal_fs_fail_req(capture.req.as_ref(), context, error),
+        Ok(NodeCompletedHostOperation::I32(value)) => node_internal_fs_complete_req(
             capture.req.as_ref(),
             context,
             JsValue::from(value),
-        ) {
-            Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
-            Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
-        },
-        other => Err(node_unexpected_host_operation_result("i32", &other)),
+        ),
+        Ok(other) => Err(node_unexpected_host_operation_result("i32", &other)),
     }
 }
 
@@ -11579,20 +11838,18 @@ fn node_resume_internal_fs_undefined_req(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReqResume,
     context: &mut Context,
-) -> JsResult<boa_engine::vm::CompletionRecord> {
+) -> JsResult<NativeFunctionResult> {
     if let Some(completion) = node_resume_completion(completion)? {
-        return Ok(completion);
+        return Ok(NativeFunctionResult::from_completion(completion));
     }
-    match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::Undefined => match node_internal_fs_complete_req(
+    match take_host_operation_completion_for_resume(capture.request_id) {
+        Err(error) => node_internal_fs_fail_req(capture.req.as_ref(), context, error),
+        Ok(NodeCompletedHostOperation::Undefined) => node_internal_fs_complete_req(
             capture.req.as_ref(),
             context,
             JsValue::undefined(),
-        ) {
-            Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
-            Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
-        },
-        other => Err(node_unexpected_host_operation_result("undefined", &other)),
+        ),
+        Ok(other) => Err(node_unexpected_host_operation_result("undefined", &other)),
     }
 }
 
@@ -11600,13 +11857,14 @@ fn node_resume_internal_fs_read(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReadResume,
     context: &mut Context,
-) -> JsResult<boa_engine::vm::CompletionRecord> {
+) -> JsResult<NativeFunctionResult> {
     if let Some(completion) = node_resume_completion(completion)? {
-        return Ok(completion);
+        return Ok(NativeFunctionResult::from_completion(completion));
     }
-    let bytes = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::Bytes(bytes) => bytes,
-        other => return Err(node_unexpected_host_operation_result("bytes", &other)),
+    let bytes = match take_host_operation_completion_for_resume(capture.request_id) {
+        Err(error) => return node_internal_fs_fail_req(capture.req.as_ref(), context, error),
+        Ok(NodeCompletedHostOperation::Bytes(bytes)) => bytes,
+        Ok(other) => return Err(node_unexpected_host_operation_result("bytes", &other)),
     };
     let dest = JsUint8Array::from_object(capture.buffer.clone()).map_err(|_| {
         JsNativeError::typ().with_message("read buffer must be a Uint8Array-compatible object")
@@ -11616,23 +11874,21 @@ fn node_resume_internal_fs_read(
         dest.set((capture.offset + index) as u32, byte, true, context)?;
         written = written.saturating_add(1);
     }
-    match node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written as u32)) {
-        Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
-        Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
-    }
+    node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written as u32))
 }
 
 fn node_resume_internal_fs_write(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsWriteResume,
     context: &mut Context,
-) -> JsResult<boa_engine::vm::CompletionRecord> {
+) -> JsResult<NativeFunctionResult> {
     if let Some(completion) = node_resume_completion(completion)? {
-        return Ok(completion);
+        return Ok(NativeFunctionResult::from_completion(completion));
     }
-    let written = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::U32(value) => value,
-        other => return Err(node_unexpected_host_operation_result("u32", &other)),
+    let written = match take_host_operation_completion_for_resume(capture.request_id) {
+        Err(error) => return node_internal_fs_fail_req(capture.req.as_ref(), context, error),
+        Ok(NodeCompletedHostOperation::U32(value)) => value,
+        Ok(other) => return Err(node_unexpected_host_operation_result("u32", &other)),
     };
     if let Some(ctx_object) = capture.ctx.as_ref() {
         ctx_object
@@ -11640,10 +11896,7 @@ fn node_resume_internal_fs_write(
             .map_err(sandbox_execution_error)
             .map_err(js_error)?;
     }
-    match node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written)) {
-        Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
-        Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
-    }
+    node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written))
 }
 
 fn node_internal_fs_internal_module_stat(
@@ -13010,18 +13263,22 @@ fn node_internal_binding_cares_wrap(context: &mut Context) -> Result<JsObject, S
     let object = ObjectInitializer::new(context).build();
     for (name, length, function) in [
         (
-            "getaddrinfo",
-            5usize,
-            node_cares_getaddrinfo as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+            "canonicalizeIP",
+            1usize,
+            node_cares_canonicalize_ip
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("getnameinfo", 3usize, node_cares_getnameinfo),
-        ("canonicalizeIP", 1usize, node_cares_canonicalize_ip),
         (
             "convertIpv6StringToBuffer",
             1usize,
-            node_cares_convert_ipv6_string_to_buffer,
+            node_cares_convert_ipv6_string_to_buffer
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("strerror", 1usize, node_cares_strerror),
+        (
+            "strerror",
+            1usize,
+            node_cares_strerror as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
     ] {
         let value =
             FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
@@ -13029,6 +13286,30 @@ fn node_internal_binding_cares_wrap(context: &mut Context) -> Result<JsObject, S
                 .length(length)
                 .constructor(false)
                 .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    for (name, length, function) in [
+        (
+            "getaddrinfo",
+            5usize,
+            node_cares_getaddrinfo
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
+        ),
+        ("getnameinfo", 3usize, node_cares_getnameinfo),
+    ] {
+        let value = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_suspend_copy_closure_with_captures(
+                move |this, args, _captures: &(), context| function(this, args, context),
+                (),
+            ),
+        )
+        .name(JsString::from(name))
+        .length(length)
+        .constructor(false)
+        .build();
         object
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
@@ -13128,7 +13409,7 @@ fn node_cares_getaddrinfo(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let req = args
         .first()
         .and_then(JsValue::as_object)
@@ -13167,20 +13448,22 @@ fn node_cares_getaddrinfo(
             .into_iter()
             .map(|value| JsValue::from(JsString::from(value)));
         let result = JsArray::from_iter(values, context)?;
-        let _ = oncomplete.call(
+        return node_call_ignored_callback_interruptible(
+            &oncomplete,
             &JsValue::from(req.clone()),
             &[JsValue::from(0), JsValue::from(result)],
+            JsValue::from(0),
             context,
         );
     }
-    Ok(JsValue::from(0))
+    Ok(NativeFunctionResult::complete(JsValue::from(0)))
 }
 
 fn node_cares_getnameinfo(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let req = args
         .first()
         .and_then(JsValue::as_object)
@@ -13193,17 +13476,19 @@ fn node_cares_getnameinfo(
         .to_u32(context)
         .unwrap_or_default();
     if let Some(oncomplete) = req.get(js_string!("oncomplete"), context)?.as_callable() {
-        let _ = oncomplete.call(
+        return node_call_ignored_callback_interruptible(
+            &oncomplete,
             &JsValue::from(req.clone()),
             &[
                 JsValue::from(0),
                 JsValue::from(JsString::from(hostname)),
                 JsValue::from(JsString::from(port.to_string())),
             ],
+            JsValue::from(0),
             context,
         );
     }
-    Ok(JsValue::from(0))
+    Ok(NativeFunctionResult::complete(JsValue::from(0)))
 }
 
 fn node_internal_binding_os(context: &mut Context) -> Result<JsObject, SandboxError> {
