@@ -18,8 +18,9 @@ use crate::{
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     error::JsNativeError,
     js_string,
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
     object::{
-        CONSTRUCTOR, IndexedProperties, JsData, JsObject,
+        CONSTRUCTOR, IndexedProperties, InterruptibleCallOutcome, JsData, JsFunction, JsObject,
         internal_methods::{
             InternalMethodPropertyContext, InternalObjectMethods, ORDINARY_INTERNAL_METHODS,
             get_prototype_from_constructor, ordinary_define_own_property,
@@ -31,8 +32,9 @@ use crate::{
     string::StaticJsStrings,
     symbol::JsSymbol,
     value::{IntegerOrInfinity, JsValue},
+    vm::CompletionRecord,
 };
-use std::cmp::{Ordering, min};
+use std::{cell::Cell, cmp::{Ordering, min}};
 
 use super::{BuiltInBuilder, BuiltInConstructor, IntrinsicObject};
 
@@ -135,7 +137,11 @@ impl IntrinsicObject for Array {
             .method(Self::find_last_index, js_string!("findLastIndex"), 1)
             .method(Self::flat, js_string!("flat"), 0)
             .method(Self::flat_map, js_string!("flatMap"), 1)
-            .method(Self::for_each, js_string!("forEach"), 1)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::for_each),
+                js_string!("forEach"),
+                1,
+            )
             .method(Self::includes_value, js_string!("includes"), 1)
             .method(Self::index_of, js_string!("indexOf"), 1)
             .method(Self::join, js_string!("join"), 1)
@@ -948,7 +954,7 @@ impl Array {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be ? ToObject(this value).
         let o = this.to_object(context)?;
         // 2. Let len be ? LengthOfArrayLike(O).
@@ -957,23 +963,19 @@ impl Array {
         let callback = args.get_or_undefined(0).as_callable().ok_or_else(|| {
             JsNativeError::typ().with_message("Array.prototype.forEach: invalid callback function")
         })?;
-        // 4. Let k be 0.
-        // 5. Repeat, while k < len,
-        for k in 0..len {
-            // a. Let Pk be ! ToString(𝔽(k)).
-            let pk = k;
-            // b. Let kPresent be ? HasProperty(O, Pk).
-            // c. If kPresent is true, then
-            // c.i. Let kValue be ? Get(O, Pk).
-            if let Some(k_value) = o.try_get(pk, context)? {
-                // ii. Perform ? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »).
-                let this_arg = args.get_or_undefined(1);
-                callback.call(this_arg, &[k_value, k.into(), o.clone().into()], context)?;
-            }
-            // d. Set k to k + 1.
-        }
-        // 6. Return undefined.
-        Ok(JsValue::undefined())
+        let callback =
+            JsFunction::from_object(callback).expect("callable check must produce a function");
+        let this_arg = args.get_or_undefined(1).clone();
+
+        let state = ForEachState {
+            o,
+            callback,
+            this_arg,
+            len,
+            next_index: Cell::new(0),
+        };
+
+        continue_for_each(&state, context)
     }
 
     /// `Array.prototype.join( separator )`
@@ -3335,6 +3337,86 @@ impl Array {
         // 13. Return unscopableList.
         unscopable_list
     }
+}
+
+#[derive(Trace, Finalize)]
+struct ForEachState {
+    o: JsObject,
+    callback: JsFunction,
+    this_arg: JsValue,
+    len: u64,
+    next_index: Cell<u64>,
+}
+
+#[derive(Trace, Finalize)]
+struct ForEachSuspendState {
+    state: ForEachState,
+    continuation: NativeResume,
+}
+
+fn clone_for_each_state(state: &ForEachState) -> ForEachState {
+    ForEachState {
+        o: state.o.clone(),
+        callback: state.callback.clone(),
+        this_arg: state.this_arg.clone(),
+        len: state.len,
+        next_index: Cell::new(state.next_index.get()),
+    }
+}
+
+fn wrap_for_each_suspend(state: ForEachSuspendState) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_for_each_suspend, state)
+}
+
+fn resume_for_each_suspend(
+    completion: CompletionRecord,
+    state: &ForEachSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            record.consume()?;
+            continue_for_each(&state.state, context)
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_for_each_suspend(ForEachSuspendState {
+                state: clone_for_each_state(&state.state),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_for_each(
+    state: &ForEachState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let mut index = state.next_index.get();
+    while index < state.len {
+        if let Some(k_value) = state.o.try_get(index, context)? {
+            match state.callback.call_interruptible(
+                &state.this_arg,
+                &[k_value, index.into(), state.o.clone().into()],
+                context,
+            )? {
+                InterruptibleCallOutcome::Complete(_) => {}
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    state.next_index.set(index + 1);
+                    return Ok(NativeFunctionResult::Suspend(wrap_for_each_suspend(
+                        ForEachSuspendState {
+                            state: clone_for_each_state(state),
+                            continuation,
+                        },
+                    )));
+                }
+            }
+        }
+
+        index += 1;
+        state.next_index.set(index);
+    }
+
+    Ok(NativeFunctionResult::complete(JsValue::undefined()))
 }
 
 /// [`CompareArrayElements ( x, y, comparefn )`][spec]

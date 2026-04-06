@@ -15,6 +15,7 @@ use crate::{
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     error::JsNativeError,
     js_string,
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
     object::{JsObject, internal_methods::get_prototype_from_constructor},
     property::{Attribute, PropertyDescriptor},
     realm::Realm,
@@ -22,6 +23,7 @@ use crate::{
     symbol::JsSymbol,
     value::IntegerOrInfinity,
 };
+use boa_gc::{Finalize, Trace};
 use boa_macros::utf16;
 
 use cow_utils::CowUtils;
@@ -38,6 +40,72 @@ pub(crate) use string_iterator::StringIterator;
 
 #[cfg(feature = "annex-b")]
 pub use crate::{JsStr, js_str};
+
+fn is_reg_exp_interruptible(
+    argument: &JsValue,
+    context: &mut Context,
+) -> JsResult<crate::context::ExecutionOutcome<Option<JsObject>>> {
+    let Some(argument) = argument.as_object() else {
+        return Ok(crate::context::ExecutionOutcome::Complete(None));
+    };
+
+    match argument.get_method_interruptible(JsSymbol::r#match(), context)? {
+        crate::context::ExecutionOutcome::Complete(matcher) => {
+            if matcher.is_some() || argument.is::<RegExp>() {
+                Ok(crate::context::ExecutionOutcome::Complete(Some(argument.clone())))
+            } else {
+                Ok(crate::context::ExecutionOutcome::Complete(None))
+            }
+        }
+        crate::context::ExecutionOutcome::Suspend(continuation) => {
+            Ok(crate::context::ExecutionOutcome::Suspend(continuation))
+        }
+    }
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct StringReplaceResumeState {
+    preserved: JsString,
+    string: JsString,
+    position: usize,
+    search_length: usize,
+}
+
+fn wrap_string_replace_suspend(state: StringReplaceResumeState, continuation: NativeResume) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_string_replace_suspend, (state, continuation))
+}
+
+fn resume_string_replace_suspend(
+    completion: crate::vm::CompletionRecord,
+    captures: &(StringReplaceResumeState, NativeResume),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let (state, continuation) = captures;
+    match continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            crate::vm::CompletionRecord::Normal(value) | crate::vm::CompletionRecord::Return(value) => {
+                let replacement = value.to_string(context)?;
+                Ok(NativeFunctionResult::complete(JsValue::from(js_string!(
+                    &state.preserved,
+                    &replacement,
+                    &state.string.get_expect(state.position + state.search_length..)
+                ))))
+            }
+            crate::vm::CompletionRecord::Throw(err) => {
+                Ok(NativeFunctionResult::from_completion(crate::vm::CompletionRecord::Throw(err)))
+            }
+            crate::vm::CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("replace continuation resumed with suspended completion")
+                .into()),
+        },
+        NativeFunctionResult::Suspend(next) => {
+            Ok(NativeFunctionResult::Suspend(wrap_string_replace_suspend(
+                state.clone(),
+                next,
+            )))
+        }
+    }
+}
 
 /// The set of normalizers required for the `String.prototype.normalize` function.
 #[derive(Debug)]
@@ -109,7 +177,11 @@ impl IntrinsicObject for String {
             .method(Self::is_well_formed, js_string!("isWellFormed"), 0)
             .method(Self::last_index_of, js_string!("lastIndexOf"), 1)
             .method(Self::locale_compare, js_string!("localeCompare"), 1)
-            .method(Self::r#match, js_string!("match"), 1)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::r#match),
+                js_string!("match"),
+                1,
+            )
             .method(Self::normalize, js_string!("normalize"), 0)
             .method(Self::pad_end, js_string!("padEnd"), 1)
             .method(Self::pad_start, js_string!("padStart"), 1)
@@ -128,13 +200,29 @@ impl IntrinsicObject for String {
                 0,
             )
             .method(Self::substring, js_string!("substring"), 2)
-            .method(Self::split, js_string!("split"), 2)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::split),
+                js_string!("split"),
+                2,
+            )
             .method(Self::value_of, js_string!("valueOf"), 0)
-            .method(Self::match_all, js_string!("matchAll"), 1)
-            .method(Self::replace, js_string!("replace"), 2)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::match_all),
+                js_string!("matchAll"),
+                1,
+            )
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::replace),
+                js_string!("replace"),
+                2,
+            )
             .method(Self::replace_all, js_string!("replaceAll"), 2)
             .method(Self::iterator, JsSymbol::iterator(), 0)
-            .method(Self::search, js_string!("search"), 1)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::search),
+                js_string!("search"),
+                1,
+            )
             .method(Self::at, js_string!("at"), 1);
 
         #[cfg(feature = "annex-b")]
@@ -1014,7 +1102,7 @@ impl String {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // Helper enum.
         enum CallableOrString {
             FunctionalReplace(JsObject),
@@ -1030,12 +1118,28 @@ impl String {
         // 2. If searchValue is an Object, then
         if search_value.is_object() {
             // a. Let replacer be ? GetMethod(searchValue, @@replace).
-            let replacer = search_value.get_method(JsSymbol::replace(), context)?;
+            let replacer = match search_value.get_method_interruptible(JsSymbol::replace(), context)? {
+                crate::context::ExecutionOutcome::Complete(value) => value,
+                crate::context::ExecutionOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(continuation));
+                }
+            };
 
             // b. If replacer is not undefined, then
             if let Some(replacer) = replacer {
                 // i. Return ? Call(replacer, searchValue, « O, replaceValue »).
-                return replacer.call(search_value, &[o.clone(), replace_value.clone()], context);
+                return match replacer.call_interruptible(
+                    search_value,
+                    &[o.clone(), replace_value.clone()],
+                    context,
+                )? {
+                    crate::object::InterruptibleCallOutcome::Complete(value) => {
+                        Ok(NativeFunctionResult::complete(value))
+                    }
+                    crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                        Ok(NativeFunctionResult::Suspend(continuation))
+                    }
+                };
             }
         }
 
@@ -1062,7 +1166,7 @@ impl String {
         // 8. Let position be ! StringIndexOf(string, searchString, 0).
         // 9. If position is -1, return string.
         let Some(position) = string.index_of(search_string.as_str(), 0) else {
-            return Ok(string.into());
+            return Ok(NativeFunctionResult::complete(string));
         };
 
         // 10. Let preserved be the substring of string from 0 to position.
@@ -1072,13 +1176,28 @@ impl String {
             // 11. If functionalReplace is true, then
             CallableOrString::FunctionalReplace(replace_fn) => {
                 // a. Let replacement be ? ToString(? Call(replaceValue, undefined, « searchString, 𝔽(position), string »)).
-                replace_fn
-                    .call(
-                        &JsValue::undefined(),
-                        &[search_string.into(), position.into(), string.clone().into()],
-                        context,
-                    )?
-                    .to_string(context)?
+                let outcome = replace_fn.call_interruptible(
+                    &JsValue::undefined(),
+                    &[search_string.into(), position.into(), string.clone().into()],
+                    context,
+                )?;
+
+                match outcome {
+                    crate::object::InterruptibleCallOutcome::Complete(value) => {
+                        value.to_string(context)?
+                    }
+                    crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                        let state = StringReplaceResumeState {
+                            preserved: preserved.clone(),
+                            string: string.clone(),
+                            position,
+                            search_length,
+                        };
+                        return Ok(NativeFunctionResult::Suspend(
+                            wrap_string_replace_suspend(state, continuation),
+                        ));
+                    }
+                }
             }
             // 12. Else,
             CallableOrString::ReplaceValue(replace_value) => {
@@ -1100,12 +1219,11 @@ impl String {
         };
 
         // 13. Return the string-concatenation of preserved, replacement, and the substring of string from position + searchLength.
-        Ok(js_string!(
+        Ok(NativeFunctionResult::complete(JsValue::from(js_string!(
             &preserved,
             &replacement,
             &string.get_expect(position + search_length..)
-        )
-        .into())
+        ))))
     }
 
     /// `22.1.3.18 String.prototype.replaceAll ( searchValue, replaceValue )`
@@ -1487,7 +1605,7 @@ impl String {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be ? RequireObjectCoercible(this value).
         let o = this.require_object_coercible()?;
 
@@ -1495,11 +1613,27 @@ impl String {
         let regexp = args.get_or_undefined(0);
         if regexp.is_object() {
             // a. Let matcher be ? GetMethod(regexp, @@match).
-            let matcher = regexp.get_method(JsSymbol::r#match(), context)?;
+            let matcher = match regexp.get_method_interruptible(JsSymbol::r#match(), context)? {
+                crate::context::ExecutionOutcome::Complete(value) => value,
+                crate::context::ExecutionOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(continuation));
+                }
+            };
             // b. If matcher is not undefined, then
             if let Some(matcher) = matcher {
                 // i. Return ? Call(matcher, regexp, « O »).
-                return matcher.call(regexp, std::slice::from_ref(o), context);
+                return match matcher.call_interruptible(
+                    regexp,
+                    std::slice::from_ref(o),
+                    context,
+                )? {
+                    crate::object::InterruptibleCallOutcome::Complete(value) => {
+                        Ok(NativeFunctionResult::complete(value))
+                    }
+                    crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                        Ok(NativeFunctionResult::Suspend(continuation))
+                    }
+                };
             }
         }
 
@@ -1507,10 +1641,20 @@ impl String {
         let s = o.to_string(context)?;
 
         // 4. Let rx be ? RegExpCreate(regexp, undefined).
-        let rx = RegExp::create(regexp, &JsValue::undefined(), context)?;
+        let rx = RegExp::create(regexp, &JsValue::undefined(), context)?
+            .as_object()
+            .js_expect("RegExpCreate should return an object")?
+            .clone();
 
         // 5. Return ? Invoke(rx, @@match, « S »).
-        rx.invoke(JsSymbol::r#match(), &[JsValue::new(s)], context)
+        match rx.invoke_interruptible(JsSymbol::r#match(), &[JsValue::new(s)], context)? {
+            crate::context::ExecutionOutcome::Complete(value) => {
+                Ok(NativeFunctionResult::complete(value))
+            }
+            crate::context::ExecutionOutcome::Suspend(continuation) => {
+                Ok(NativeFunctionResult::Suspend(continuation))
+            }
+        }
     }
 
     /// Abstract operation `StringPad ( O, maxLength, fillString, placement )`.
@@ -1951,7 +2095,7 @@ impl String {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be ? RequireObjectCoercible(this value).
         let this = this.require_object_coercible()?;
 
@@ -1961,11 +2105,27 @@ impl String {
         // 2. If separator is an Object, then
         if separator.is_object() {
             // a. Let splitter be ? GetMethod(separator, @@split).
-            let splitter = separator.get_method(JsSymbol::split(), context)?;
+            let splitter = match separator.get_method_interruptible(JsSymbol::split(), context)? {
+                crate::context::ExecutionOutcome::Complete(value) => value,
+                crate::context::ExecutionOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(continuation));
+                }
+            };
             // b. If splitter is not undefined, then
             if let Some(splitter) = splitter {
                 // i. Return ? Call(splitter, separator, « O, limit »).
-                return splitter.call(separator, &[this.clone(), limit.clone()], context);
+                return match splitter.call_interruptible(
+                    separator,
+                    &[this.clone(), limit.clone()],
+                    context,
+                )? {
+                    crate::object::InterruptibleCallOutcome::Complete(value) => {
+                        Ok(NativeFunctionResult::complete(value))
+                    }
+                    crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                        Ok(NativeFunctionResult::Suspend(continuation))
+                    }
+                };
             }
         }
 
@@ -1985,13 +2145,17 @@ impl String {
         // 6. If lim = 0, return A.
         if lim == 0 {
             // a. Return ! CreateArrayFromList(« »).
-            return Ok(Array::create_array_from_list([], context)?.into());
+            return Ok(NativeFunctionResult::complete(
+                Array::create_array_from_list([], context)?,
+            ));
         }
 
         // 7. If separator is undefined, then
         if separator.is_undefined() {
             // a. Return ! CreateArrayFromList(« S »).
-            return Ok(Array::create_array_from_list([this_str.into()], context)?.into());
+            return Ok(NativeFunctionResult::complete(
+                Array::create_array_from_list([this_str.into()], context)?,
+            ));
         }
 
         // 8. Let separatorLength be the length of R.
@@ -2007,12 +2171,16 @@ impl String {
                 .map(|code| js_string!(std::slice::from_ref(&code)).into());
 
             // c. Return ! CreateArrayFromList(codeUnits).
-            return Ok(Array::create_array_from_list(head, context)?.into());
+            return Ok(NativeFunctionResult::complete(
+                Array::create_array_from_list(head, context)?,
+            ));
         }
 
         // 10. If S is the empty String, return ! CreateArrayFromList(« S »).
         if this_str.is_empty() {
-            return Ok(Array::create_array_from_list([this_str.into()], context)?.into());
+            return Ok(NativeFunctionResult::complete(
+                Array::create_array_from_list([this_str.into()], context)?,
+            ));
         }
 
         // 11. Let substrings be a new empty List.
@@ -2032,11 +2200,12 @@ impl String {
 
             // c. If the number of elements of substrings is lim, return ! CreateArrayFromList(substrings).
             if substrings.len() == lim {
-                return Ok(Array::create_array_from_list(
-                    substrings.into_iter().map(JsValue::from),
-                    context,
-                )?
-                .into());
+                return Ok(NativeFunctionResult::complete(
+                    Array::create_array_from_list(
+                        substrings.into_iter().map(JsValue::from),
+                        context,
+                    )?,
+                ));
             }
             // d. Set i to j + separatorLength.
             i = index + separator_length;
@@ -2050,10 +2219,9 @@ impl String {
         substrings.push(this_str.slice(i, this_str.len()));
 
         // 17. Return ! CreateArrayFromList(substrings).
-        Ok(
-            Array::create_array_from_list(substrings.into_iter().map(JsValue::from), context)?
-                .into(),
-        )
+        Ok(NativeFunctionResult::complete(
+            Array::create_array_from_list(substrings.into_iter().map(JsValue::from), context)?,
+        ))
     }
 
     /// `String.prototype.valueOf()`
@@ -2091,7 +2259,7 @@ impl String {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be ? RequireObjectCoercible(this value).
         let o = this.require_object_coercible()?;
 
@@ -2100,7 +2268,12 @@ impl String {
         if regexp.is_object() {
             // a. Let isRegExp be ? IsRegExp(regexp).
             // b. If isRegExp is true, then
-            if let Some(regexp) = RegExp::is_reg_exp(regexp, context)? {
+            if let Some(regexp) = match is_reg_exp_interruptible(regexp, context)? {
+                crate::context::ExecutionOutcome::Complete(value) => value,
+                crate::context::ExecutionOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(continuation));
+                }
+            } {
                 // i. Let flags be ? Get(regexp, "flags").
                 let flags = regexp.get(js_string!("flags"), context)?;
 
@@ -2117,10 +2290,26 @@ impl String {
                 }
             }
             // c. Let matcher be ? GetMethod(regexp, @@matchAll).
-            let matcher = regexp.get_method(JsSymbol::match_all(), context)?;
+            let matcher = match regexp.get_method_interruptible(JsSymbol::match_all(), context)? {
+                crate::context::ExecutionOutcome::Complete(value) => value,
+                crate::context::ExecutionOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(continuation));
+                }
+            };
             // d. If matcher is not undefined, then
             if let Some(matcher) = matcher {
-                return matcher.call(regexp, std::slice::from_ref(o), context);
+                return match matcher.call_interruptible(
+                    regexp,
+                    std::slice::from_ref(o),
+                    context,
+                )? {
+                    crate::object::InterruptibleCallOutcome::Complete(value) => {
+                        Ok(NativeFunctionResult::complete(value))
+                    }
+                    crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                        Ok(NativeFunctionResult::Suspend(continuation))
+                    }
+                };
             }
         }
 
@@ -2128,10 +2317,20 @@ impl String {
         let s = o.to_string(context)?;
 
         // 4. Let rx be ? RegExpCreate(regexp, "g").
-        let rx = RegExp::create(regexp, &JsValue::new(js_string!("g")), context)?;
+        let rx = RegExp::create(regexp, &JsValue::new(js_string!("g")), context)?
+            .as_object()
+            .js_expect("RegExpCreate should return an object")?
+            .clone();
 
         // 5. Return ? Invoke(rx, @@matchAll, « S »).
-        rx.invoke(JsSymbol::match_all(), &[JsValue::new(s)], context)
+        match rx.invoke_interruptible(JsSymbol::match_all(), &[JsValue::new(s)], context)? {
+            crate::context::ExecutionOutcome::Complete(value) => {
+                Ok(NativeFunctionResult::complete(value))
+            }
+            crate::context::ExecutionOutcome::Suspend(continuation) => {
+                Ok(NativeFunctionResult::Suspend(continuation))
+            }
+        }
     }
 
     /// `String.prototype.normalize( [ form ] )`
@@ -2233,7 +2432,7 @@ impl String {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be ? RequireObjectCoercible(this value).
         let o = this.require_object_coercible()?;
 
@@ -2241,11 +2440,27 @@ impl String {
         let regexp = args.get_or_undefined(0);
         if regexp.is_object() {
             // a. Let searcher be ? GetMethod(regexp, @@search).
-            let searcher = regexp.get_method(JsSymbol::search(), context)?;
+            let searcher = match regexp.get_method_interruptible(JsSymbol::search(), context)? {
+                crate::context::ExecutionOutcome::Complete(value) => value,
+                crate::context::ExecutionOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(continuation));
+                }
+            };
             // b. If searcher is not undefined, then
             if let Some(searcher) = searcher {
                 // i. Return ? Call(searcher, regexp, « O »).
-                return searcher.call(regexp, std::slice::from_ref(o), context);
+                return match searcher.call_interruptible(
+                    regexp,
+                    std::slice::from_ref(o),
+                    context,
+                )? {
+                    crate::object::InterruptibleCallOutcome::Complete(value) => {
+                        Ok(NativeFunctionResult::complete(value))
+                    }
+                    crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                        Ok(NativeFunctionResult::Suspend(continuation))
+                    }
+                };
             }
         }
 
@@ -2253,10 +2468,20 @@ impl String {
         let string = o.to_string(context)?;
 
         // 4. Let rx be ? RegExpCreate(regexp, undefined).
-        let rx = RegExp::create(regexp, &JsValue::undefined(), context)?;
+        let rx = RegExp::create(regexp, &JsValue::undefined(), context)?
+            .as_object()
+            .js_expect("RegExpCreate should return an object")?
+            .clone();
 
         // 5. Return ? Invoke(rx, @@search, « string »).
-        rx.invoke(JsSymbol::search(), &[JsValue::new(string)], context)
+        match rx.invoke_interruptible(JsSymbol::search(), &[JsValue::new(string)], context)? {
+            crate::context::ExecutionOutcome::Complete(value) => {
+                Ok(NativeFunctionResult::complete(value))
+            }
+            crate::context::ExecutionOutcome::Suspend(continuation) => {
+                Ok(NativeFunctionResult::Suspend(continuation))
+            }
+        }
     }
 
     pub(crate) fn iterator(

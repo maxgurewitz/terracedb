@@ -107,6 +107,7 @@ pub struct VolumeInfo {
 #[async_trait]
 pub trait VolumeStore: Send + Sync {
     async fn open_volume(&self, config: VolumeConfig) -> Result<Arc<dyn Volume>, VfsError>;
+    async fn delete_volume(&self, volume_id: crate::VolumeId) -> Result<(), VfsError>;
     async fn clone_volume(
         &self,
         source: CloneVolumeSource,
@@ -618,6 +619,18 @@ impl VolumeStore for InMemoryVfsStore {
         ));
         volumes.insert(config.volume_id, StoredVolume::Regular(volume.clone()));
         Ok(Arc::new(InMemoryVolume { inner: volume }))
+    }
+
+    async fn delete_volume(&self, volume_id: crate::VolumeId) -> Result<(), VfsError> {
+        let mut volumes = self
+            .inner
+            .volumes
+            .lock()
+            .expect("in-memory volume registry lock poisoned");
+        volumes
+            .remove(&volume_id)
+            .map(|_| ())
+            .ok_or(VfsError::VolumeNotFound { volume_id })
     }
 
     async fn clone_volume(

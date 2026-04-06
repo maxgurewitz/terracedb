@@ -7,6 +7,7 @@ use crate::{
     Context, JsResult, JsValue,
     builtins::weak_map::{NativeWeakMap, WeakMap},
     error::JsNativeError,
+    native_function::NativeFunctionResult,
     object::JsObject,
     value::TryFromJs,
 };
@@ -123,11 +124,18 @@ impl JsWeakMap {
         callback: JsValue,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        WeakMap::get_or_insert_computed(
+        match WeakMap::get_or_insert_computed(
             &self.inner.clone().into(),
             &[key.clone().into(), callback],
             context,
-        )
+        )? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message(
+                    "suspendable WeakMap.prototype.getOrInsertComputed requires interruptible execution",
+                )
+                .into()),
+        }
     }
 
     /// Creates a `JsWeakMap` from a `JsObject`, or returns the original object as `Err`

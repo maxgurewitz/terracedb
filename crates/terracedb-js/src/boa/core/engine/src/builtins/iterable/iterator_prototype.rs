@@ -1,3 +1,4 @@
+use boa_gc::{Finalize, Trace};
 use crate::{
     Context, JsArgs, JsObject, JsResult, JsSymbol, JsValue,
     builtins::{
@@ -14,8 +15,12 @@ use crate::{
     object::{CONSTRUCTOR, JsFunction},
     property::{Attribute, PropertyKey},
     realm::Realm,
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
+    object::InterruptibleCallOutcome,
     value::{IntegerOrInfinity, TryFromJs},
+    vm::CompletionRecord,
 };
+use std::cell::Cell;
 
 /// `%IteratorPrototype%` object
 ///
@@ -48,7 +53,11 @@ impl IntrinsicObject for Iterator {
             .static_method(Self::flat_map, js_string!("flatMap"), 1)
             .static_method(Self::reduce, js_string!("reduce"), 1)
             .static_method(Self::to_array, js_string!("toArray"), 0)
-            .static_method(Self::for_each, js_string!("forEach"), 1)
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::for_each),
+                js_string!("forEach"),
+                1,
+            )
             .static_method(Self::some, js_string!("some"), 1)
             .static_method(Self::every, js_string!("every"), 1)
             .static_method(Self::find, js_string!("find"), 1)
@@ -543,7 +552,11 @@ impl Iterator {
     ///  - [ECMAScript reference][spec]
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-iterator.prototype.foreach
-    fn for_each(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn for_each(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. If O is not an Object, throw a TypeError exception.
         let o = this.as_object().ok_or_else(
@@ -557,40 +570,27 @@ impl Iterator {
         let Some(func) = args.get_or_undefined(0).as_callable() else {
             // a. Let error be ThrowCompletion(a newly created TypeError object).
             // b. Return ? IteratorClose(iterated, error).
-            return iterated.close(
-                Err(js_error!(
-                    TypeError: "Iterator.prototype.forEach: argument is not callable"
-                )),
-                context,
-            );
+            return iterated
+                .close(
+                    Err(js_error!(
+                        TypeError: "Iterator.prototype.forEach: argument is not callable"
+                    )),
+                    context,
+                )
+                .map(NativeFunctionResult::complete);
         };
+        let func = JsFunction::from_object(func).expect("callable check must produce a function");
 
         // 5. Set iterated to ? GetIteratorDirect(O).
-        let mut iterated = get_iterator_direct(iterated.iterator(), context)?;
+        let iterated = get_iterator_direct(iterated.iterator(), context)?;
 
-        // 6. Let counter be 0.
-        let mut counter = 0u64;
+        let state = IteratorForEachState {
+            iterated: Cell::new(Some(iterated)),
+            func,
+            counter: Cell::new(0),
+        };
 
-        // 7. Repeat,
-        //    a. Let value be ? IteratorStepValue(iterated).
-        //    b. If value is done, return undefined.
-        while let Some(value) = iterated.step_value(context)? {
-            // c. Let result be Completion(Call(procedure, undefined, « value, 𝔽(counter) »)).
-            let result = func.call(
-                &JsValue::undefined(),
-                &[value, JsValue::new(counter)],
-                context,
-            );
-
-            // d. IfAbruptCloseIterator(result, iterated).
-            if_abrupt_close_iterator!(result, iterated, context);
-
-            // e. Set counter to counter + 1.
-            counter += 1;
-        }
-
-        // Step 7.b
-        Ok(JsValue::undefined())
+        continue_iterator_for_each(&state, context)
     }
 
     /// `Iterator.prototype.some ( predicate )`
@@ -771,4 +771,87 @@ impl Iterator {
         // Step 7.b
         Ok(JsValue::undefined())
     }
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorForEachState {
+    iterated: Cell<Option<IteratorRecord>>,
+    func: JsFunction,
+    counter: Cell<u64>,
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorForEachSuspendState {
+    state: IteratorForEachState,
+    continuation: NativeResume,
+}
+
+fn clone_iterator_for_each_state(state: &IteratorForEachState) -> IteratorForEachState {
+    let iterated = state.iterated.take();
+    state.iterated.set(iterated.clone());
+    IteratorForEachState {
+        iterated: Cell::new(iterated),
+        func: state.func.clone(),
+        counter: Cell::new(state.counter.get()),
+    }
+}
+
+fn wrap_iterator_for_each_suspend(state: IteratorForEachSuspendState) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_iterator_for_each_suspend, state)
+}
+
+fn resume_iterator_for_each_suspend(
+    completion: CompletionRecord,
+    state: &IteratorForEachSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            record.consume()?;
+            continue_iterator_for_each(&state.state, context)
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_iterator_for_each_suspend(IteratorForEachSuspendState {
+                state: clone_iterator_for_each_state(&state.state),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_iterator_for_each(
+    state: &IteratorForEachState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let Some(mut iterated) = state.iterated.take() else {
+        return Err(js_error!(
+            TypeError: "Iterator.prototype.forEach continuation lost iterator state"
+        ));
+    };
+    let mut counter = state.counter.get();
+
+    while let Some(value) = iterated.step_value(context)? {
+        match state
+            .func
+            .call_interruptible(&JsValue::undefined(), &[value, JsValue::new(counter)], context)?
+        {
+            InterruptibleCallOutcome::Complete(_) => {}
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                state.counter.set(counter + 1);
+                state.iterated.set(Some(iterated));
+                return Ok(NativeFunctionResult::Suspend(wrap_iterator_for_each_suspend(
+                    IteratorForEachSuspendState {
+                        state: clone_iterator_for_each_state(state),
+                        continuation,
+                    },
+                )));
+            }
+        }
+
+        counter += 1;
+        state.counter.set(counter);
+    }
+
+    state.iterated.set(Some(iterated));
+    Ok(NativeFunctionResult::complete(JsValue::undefined()))
 }

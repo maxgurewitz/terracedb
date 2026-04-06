@@ -16,12 +16,17 @@ use crate::{
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     error::JsNativeError,
     js_error, js_string,
-    object::{JsFunction, JsObject, internal_methods::get_prototype_from_constructor},
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
+    object::{
+        InterruptibleCallOutcome, JsFunction, JsObject, internal_methods::get_prototype_from_constructor,
+    },
     property::{Attribute, PropertyNameKind},
     realm::Realm,
     string::StaticJsStrings,
     symbol::JsSymbol,
+    vm::CompletionRecord,
 };
+use boa_gc::{Finalize, Trace};
 
 use super::{
     BuiltInBuilder, BuiltInConstructor, IntrinsicObject, canonicalize_keyed_collection_key,
@@ -39,6 +44,21 @@ mod tests;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Map;
+
+#[derive(Clone, Trace, Finalize)]
+struct MapForEachState {
+    map: JsObject<OrderedMap<JsValue>>,
+    callback: JsObject,
+    this_arg: JsValue,
+    index: usize,
+    locked: bool,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct MapInsertComputedState {
+    map: JsObject<OrderedMap<JsValue>>,
+    key: JsValue,
+}
 
 impl IntrinsicObject for Map {
     fn init(realm: &Realm) -> crate::JsResult<()> {
@@ -79,15 +99,19 @@ impl IntrinsicObject for Map {
             )
             .method(Self::clear, js_string!("clear"), 0)
             .method(Self::delete, js_string!("delete"), 1)
-            .method(Self::for_each, js_string!("forEach"), 1)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::for_each),
+                js_string!("forEach"),
+                1,
+            )
             .method(Self::get, js_string!("get"), 1)
             .method(Self::has, js_string!("has"), 1)
             .method(Self::keys, js_string!("keys"), 0)
             .method(Self::set, js_string!("set"), 2)
             .method(Self::values, js_string!("values"), 0)
             .method(Self::get_or_insert, js_string!("getOrInsert"), 2)
-            .method(
-                Self::get_or_insert_computed,
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::get_or_insert_computed),
                 js_string!("getOrInsertComputed"),
                 2,
             )
@@ -452,7 +476,7 @@ impl Map {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let M be the this value.
         // 2. Perform ? RequireInternalSlot(M, [[MapData]]).
         let map = this
@@ -473,7 +497,6 @@ impl Map {
         };
 
         let this_arg = args.get_or_undefined(1);
-
         // NOTE:
         //
         // forEach does not directly mutate the object on which it is called but
@@ -483,31 +506,92 @@ impl Map {
         // after it has been visited and then re-added before the forEach call completes.
         // Keys that are deleted after the call to forEach begins and before being visited
         // are not visited unless the key is added again before the forEach call completes.
-        let _lock = MapLock::new(&map);
+        map.borrow_mut().data_mut().lock();
 
-        // 4. Let entries be the List that is M.[[MapData]].
-        // 5. For each Record { [[Key]], [[Value]] } e of entries, do
-        let mut index = 0;
+        let state = MapForEachState {
+            map: map.clone(),
+            callback: callback.clone(),
+            this_arg: this_arg.clone(),
+            index: 0,
+            locked: true,
+        };
+
+        Self::map_for_each_step(state, context)
+    }
+
+    fn map_for_each_step(
+        mut state: MapForEachState,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         loop {
             let arguments = {
-                let map = map.borrow();
+                let map = state.map.borrow();
                 let map = map.data();
-                if index < map.full_len() {
-                    map.get_index(index)
-                        .map(|(k, v)| [v.clone(), k.clone(), this.clone()])
+                if state.index < map.full_len() {
+                    map.get_index(state.index)
+                        .map(|(k, v)| [v.clone(), k.clone(), state.this_arg.clone()])
                 } else {
-                    // 6. Return undefined.
-                    return Ok(JsValue::undefined());
+                    if state.locked {
+                        state.map.borrow_mut().data_mut().unlock();
+                    }
+                    return Ok(NativeFunctionResult::complete(JsValue::undefined()));
                 }
             };
 
-            // a. If e.[[Key]] is not empty, then
-            if let Some(arguments) = arguments {
-                // i. Perform ? Call(callbackfn, thisArg, « e.[[Value]], e.[[Key]], M »).
-                callback.call(this_arg, &arguments, context)?;
-            }
+            let Some(arguments) = arguments else {
+                state.index += 1;
+                continue;
+            };
 
-            index += 1;
+            match state
+                .callback
+                .call_interruptible(&state.this_arg, &arguments, context)?
+            {
+                InterruptibleCallOutcome::Complete(_) => {
+                    state.index += 1;
+                }
+                InterruptibleCallOutcome::Suspend(next) => {
+                    return Ok(NativeFunctionResult::Suspend(
+                        NativeResume::from_copy_closure_with_captures(
+                            Self::resume_map_for_each_after_callback,
+                            (next, state),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn resume_map_for_each_after_callback(
+        completion: CompletionRecord,
+        captures: &(NativeResume, MapForEachState),
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        match captures.0.call(completion, context)? {
+            NativeFunctionResult::Complete(record) => match record {
+                CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                    let mut state = captures.1.clone();
+                    state.index += 1;
+                    Self::map_for_each_step(state, context)
+                }
+                CompletionRecord::Throw(err) => {
+                    if captures.1.locked {
+                        captures.1.map.borrow_mut().data_mut().unlock();
+                    }
+                    Ok(NativeFunctionResult::from_completion(
+                        CompletionRecord::Throw(err),
+                    ))
+                }
+                CompletionRecord::Suspend => Err(js_error!(
+                    TypeError: "Map.prototype.forEach resumed with unexpected suspend completion"
+                )),
+            },
+            NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+                NativeResume::from_copy_closure_with_captures(
+                    Self::resume_map_for_each_after_callback,
+                    (next, captures.1.clone()),
+                ),
+            )),
         }
     }
 
@@ -652,7 +736,7 @@ impl Map {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let M be the this value.
         // 2. Perform ? RequireInternalSlot(M, [[MapData]]).
         let map = this
@@ -677,25 +761,58 @@ impl Map {
         // 5. For each Record { [[Key]], [[Value]] } p of M.[[MapData]], do
         if let Some(existing) = map.borrow().data().get(&key) {
             // a. If p.[[Key]] is not empty and SameValue(p.[[Key]], key) is true, return p.[[Value]].
-            return Ok(existing.clone());
+            return Ok(NativeFunctionResult::complete(existing.clone()));
         }
 
-        // 6. Let value be ? Call(callback, undefined, « key »).
-        // 7. NOTE: The Map may have been modified during execution of callback.
-        let value = callback_fn.call(&JsValue::undefined(), std::slice::from_ref(&key), context)?;
+                let state = MapInsertComputedState {
+                    map: map.clone(),
+                    key: key.clone(),
+                };
 
-        // 8. For each Record { [[Key]], [[Value]] } p of M.[[MapData]], do
-        //    a. If p.[[Key]] is not empty and SameValue(p.[[Key]], key) is true, then
-        //       i. Set p.[[Value]] to value.
-        //       ii. Return value.
-        // 9. Let p be the Record { [[Key]]: key, [[Value]]: value }.
-        // 10. Append p to M.[[MapData]].
-        // [`OrderedMap::insert`] handles both cases
-        map.borrow_mut()
-            .data_mut()
-            .insert(key.clone(), value.clone());
-        // 11. Return value.
-        Ok(value)
+        match callback_fn.call_interruptible(&JsValue::undefined(), std::slice::from_ref(&key), context)? {
+            InterruptibleCallOutcome::Complete(value) => {
+                map.borrow_mut().data_mut().insert(key.clone(), value.clone());
+                Ok(NativeFunctionResult::complete(value))
+            }
+            InterruptibleCallOutcome::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+                NativeResume::from_copy_closure_with_captures(
+                    Self::resume_map_get_or_insert_computed,
+                    (next, state),
+                ),
+            )),
+        }
+    }
+
+    fn resume_map_get_or_insert_computed(
+        completion: CompletionRecord,
+        captures: &(NativeResume, MapInsertComputedState),
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        match captures.0.call(completion, context)? {
+            NativeFunctionResult::Complete(record) => match record {
+                CompletionRecord::Normal(value) | CompletionRecord::Return(value) => {
+                    captures
+                        .1
+                        .map
+                        .borrow_mut()
+                        .data_mut()
+                        .insert(captures.1.key.clone(), value.clone());
+                    Ok(NativeFunctionResult::complete(value))
+                }
+                CompletionRecord::Throw(err) => {
+                    Ok(NativeFunctionResult::from_completion(CompletionRecord::Throw(err)))
+                }
+                CompletionRecord::Suspend => Err(js_error!(
+                    TypeError: "Map.prototype.getOrInsertComputed resumed with unexpected suspend completion"
+                )),
+            },
+            NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+                NativeResume::from_copy_closure_with_captures(
+                    Self::resume_map_get_or_insert_computed,
+                    (next, captures.1.clone()),
+                ),
+            )),
+        }
     }
 
     /// [`Map.groupBy ( items, callbackfn )`][spec]

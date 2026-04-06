@@ -14,11 +14,11 @@ use crate::property::PropertyKey;
 use crate::{
     Context, JsArgs, JsError, JsExpect, JsResult, JsString,
     builtins::{Array, BuiltInObject},
-    context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
+    context::{ExecutionOutcome, intrinsics::{Intrinsics, StandardConstructor, StandardConstructors}},
     error::JsNativeError,
     job::{JobCallback, PromiseJob},
     js_string,
-    native_function::NativeFunction,
+    native_function::{NativeFunction, NativeFunctionResult},
     object::{
         CONSTRUCTOR, FunctionObjectBuilder, JsFunction, JsObject,
         internal_methods::get_prototype_from_constructor,
@@ -359,7 +359,11 @@ impl IntrinsicObject for Promise {
                 Attribute::CONFIGURABLE,
             )
             .method(Self::then, js_string!("then"), 2)
-            .method(Self::catch, js_string!("catch"), 1)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::catch),
+                js_string!("catch"),
+                1,
+            )
             .method(Self::finally, js_string!("finally"), 1)
             // <https://tc39.es/ecma262/#sec-promise.prototype-@@tostringtag>
             .property(
@@ -1932,17 +1936,26 @@ impl Promise {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         let on_rejected = args.get_or_undefined(0);
 
         // 1. Let promise be the this value.
-        let promise = this;
+        let promise = this.as_object().ok_or_else(|| {
+            JsNativeError::typ()
+                .with_message("Promise.prototype.catch called on a non-object")
+        })?;
+
         // 2. Return ? Invoke(promise, "then", « undefined, onRejected »).
-        promise.invoke(
+        match promise.invoke_interruptible(
             js_string!("then"),
             &[JsValue::undefined(), on_rejected.clone()],
             context,
-        )
+        )? {
+            ExecutionOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
+            ExecutionOutcome::Suspend(continuation) => {
+                Ok(NativeFunctionResult::Suspend(continuation))
+            }
+        }
     }
 
     /// `Promise.prototype.finally ( onFinally )`

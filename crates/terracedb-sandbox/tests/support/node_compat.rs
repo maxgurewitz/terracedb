@@ -16,15 +16,16 @@ use terracedb::{
     ExecutionDomainPlacement, ExecutionDomainSpec, ExecutionResourceUsage, InMemoryResourceManager,
 };
 use terracedb_sandbox::{
-    ConflictPolicy, PackageCompatibilityMode, SandboxBaseLayer, SandboxBatchedDomainMemoryBudget,
-    SandboxConfig, SandboxError, SandboxHarness, SandboxRuntimeMemoryBudget, SandboxServices,
+    CloseSessionOptions, ConflictPolicy, PackageCompatibilityMode, SandboxBaseLayer,
+    SandboxBatchedDomainMemoryBudget, SandboxConfig, SandboxError, SandboxHarness,
+    SandboxRuntimeMemoryBudget, SandboxServices,
     SandboxTrackedMemoryBudgetPolicy,
 };
 use terracedb_systemtest::{
     SimulationCaseContext, SimulationCaseSpec, SimulationDomainConfig, SimulationHarness,
     SimulationHarnessError, SimulationSuiteDefinition, SimulationSuiteReport,
 };
-use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId};
+use terracedb_vfs::{CreateOptions, InMemoryVfsStore, VolumeId, VolumeStore};
 use tokio::sync::OnceCell;
 
 #[path = "tracing.rs"]
@@ -66,7 +67,7 @@ struct GeneratedUpstreamNodeFixture {
 }
 
 struct GeneratedUpstreamNodeSuite {
-    cases: &'static [GeneratedUpstreamNodeCase],
+    cases: Vec<GeneratedUpstreamNodeCase>,
     case_requested_usage: ExecutionResourceUsage,
     per_case_accounted_memory_budget_bytes: u64,
     calibration_case_id: String,
@@ -76,6 +77,7 @@ struct GeneratedUpstreamNodeSuite {
 struct GeneratedUpstreamNodeBudget {
     case_requested_usage: ExecutionResourceUsage,
     per_case_accounted_memory_budget_bytes: u64,
+    calibration_case_id: &'static str,
 }
 
 async fn shared_upstream_node_harness() -> &'static SandboxHarness<InMemoryVfsStore> {
@@ -125,10 +127,12 @@ async fn exec_upstream_node_test_in_harness(
     memory_budget: Option<Arc<dyn SandboxRuntimeMemoryBudget>>,
 ) -> Result<terracedb_sandbox::SandboxExecutionResult, SandboxError> {
     let session_suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed) as u128;
+    let session_volume_id =
+        VolumeId::new(SESSION_VOLUME_BASE + 0x1000_0000_0000_0000 + session_suffix);
     let session = harness
         .open_session_with(
             base_volume_id,
-            VolumeId::new(SESSION_VOLUME_BASE + 0x1000_0000_0000_0000 + session_suffix),
+            session_volume_id,
             |config| SandboxConfig {
                 workspace_root: "/workspace".to_string(),
                 package_compat: PackageCompatibilityMode::NpmWithNodeBuiltins,
@@ -151,7 +155,7 @@ async fn exec_upstream_node_test_in_harness(
         ("HOME".to_string(), "/workspace/home".to_string()),
         ("NODE_SKIP_FLAG_CHECK".to_string(), "1".to_string()),
     ]);
-    if let Some(timeout) = wall_time_timeout.map(inner_node_execution_timeout) {
+    let result = if let Some(timeout) = wall_time_timeout.map(inner_node_execution_timeout) {
         session
             .exec_node_command_with_timeout(
                 &runtime_entrypoint,
@@ -170,6 +174,21 @@ async fn exec_upstream_node_test_in_harness(
                 env,
             )
             .await
+    };
+    let close_result = session.close(CloseSessionOptions { flush: false }).await;
+    drop(session);
+    let delete_result = harness.volumes().delete_volume(session_volume_id).await;
+    match result {
+        Ok(result) => {
+            close_result?;
+            delete_result.map_err(SandboxError::from)?;
+            Ok(result)
+        }
+        Err(error) => {
+            close_result?;
+            delete_result.map_err(SandboxError::from)?;
+            Err(error)
+        }
     }
 }
 
@@ -276,15 +295,17 @@ pub async fn exec_upstream_node_test(
 pub async fn run_generated_upstream_node_suite(
     cases: &'static [GeneratedUpstreamNodeCase],
 ) -> Result<SimulationSuiteReport, SimulationHarnessError> {
-    if cases.is_empty() {
+    let selected_cases = selected_generated_upstream_node_cases(cases);
+    if selected_cases.is_empty() {
         return Ok(SimulationSuiteReport::default());
     }
-    let budget = calibrate_generated_upstream_node_budget(cases).await?;
+    let budget = calibrate_generated_upstream_node_budget(&selected_cases).await?;
+    let max_workers = generated_upstream_node_max_workers();
     let resource_manager = Arc::new(InMemoryResourceManager::new(
         ExecutionDomainBudget::default(),
     ));
     SimulationHarness::new()
-        .with_max_workers(GENERATED_UPSTREAM_NODE_MAX_WORKERS)
+        .with_max_workers(max_workers)
         .with_domain(SimulationDomainConfig {
             resource_manager,
             domain_spec: ExecutionDomainSpec {
@@ -295,8 +316,8 @@ pub async fn run_generated_upstream_node_suite(
                 },
                 budget: ExecutionDomainBudget {
                     cpu: DomainCpuBudget {
-                        worker_slots: Some(GENERATED_UPSTREAM_NODE_MAX_WORKERS as u32),
-                        weight: Some(GENERATED_UPSTREAM_NODE_MAX_WORKERS as u32),
+                        worker_slots: Some(max_workers as u32),
+                        weight: Some(max_workers as u32),
                     },
                     memory: terracedb::DomainMemoryBudget {
                         total_bytes: Some(GENERATED_UPSTREAM_NODE_TOTAL_MEMORY_BUDGET_BYTES),
@@ -314,18 +335,22 @@ pub async fn run_generated_upstream_node_suite(
             default_case_usage: budget.case_requested_usage,
         })
         .run_suite(Arc::new(GeneratedUpstreamNodeSuite {
-            cases,
+            cases: selected_cases,
             case_requested_usage: budget.case_requested_usage,
             per_case_accounted_memory_budget_bytes: budget.per_case_accounted_memory_budget_bytes,
-            calibration_case_id: cases[0].case_id.to_string(),
+            calibration_case_id: budget.calibration_case_id.to_string(),
         }))
         .await
 }
 
 async fn calibrate_generated_upstream_node_budget(
-    cases: &'static [GeneratedUpstreamNodeCase],
+    cases: &[GeneratedUpstreamNodeCase],
 ) -> Result<GeneratedUpstreamNodeBudget, SimulationHarnessError> {
     let calibration_case = cases[0];
+    eprintln!(
+        "generated-node-upstream calibration start {}",
+        calibration_case.case_id
+    );
     let harness = SandboxHarness::deterministic(510, 121, SandboxServices::deterministic());
     SandboxBaseLayer::vendored_node_v24_14_1_js_tree()
         .ensure_volume(harness.volumes().as_ref(), CACHED_NODE_BASE_VOLUME_ID)
@@ -357,13 +382,44 @@ async fn calibrate_generated_upstream_node_budget(
     let per_case_accounted_memory_budget_bytes = accounted_bytes
         .max(GENERATED_UPSTREAM_NODE_MIN_CASE_MEMORY_BUDGET_BYTES)
         .saturating_mul(GENERATED_UPSTREAM_NODE_CASE_MEMORY_HEADROOM_MULTIPLIER);
+    eprintln!(
+        "generated-node-upstream calibration done {} accounted_bytes={}",
+        calibration_case.case_id, accounted_bytes
+    );
     Ok(GeneratedUpstreamNodeBudget {
         case_requested_usage: ExecutionResourceUsage {
             cpu_workers: 1,
             ..Default::default()
         },
         per_case_accounted_memory_budget_bytes,
+        calibration_case_id: calibration_case.case_id,
     })
+}
+
+fn generated_upstream_node_max_workers() -> usize {
+    std::env::var("TERRACE_GENERATED_NODE_MAX_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(GENERATED_UPSTREAM_NODE_MAX_WORKERS)
+}
+
+fn selected_generated_upstream_node_cases(
+    cases: &[GeneratedUpstreamNodeCase],
+) -> Vec<GeneratedUpstreamNodeCase> {
+    let Some(filter) = std::env::var("TERRACE_GENERATED_NODE_CASE_FILTER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return cases.to_vec();
+    };
+
+    cases
+        .iter()
+        .copied()
+        .filter(|case| case.case_id.contains(&filter) || case.path.contains(&filter))
+        .collect()
 }
 
 fn node_runtime_accounted_bytes(result: &terracedb_sandbox::SandboxExecutionResult) -> Option<u64> {
@@ -508,6 +564,7 @@ impl SimulationSuiteDefinition for GeneratedUpstreamNodeSuite {
         case: SimulationCaseSpec<Self::Case>,
         ctx: SimulationCaseContext,
     ) -> Result<(), SimulationHarnessError> {
+        eprintln!("generated-node-upstream start {}", case.case_id);
         let memory_budget = ctx.domain_usage().map(|domain_usage| {
             Arc::new(SandboxBatchedDomainMemoryBudget::new(
                 domain_usage,
@@ -557,6 +614,10 @@ impl SimulationSuiteDefinition for GeneratedUpstreamNodeSuite {
                 ),
             });
         }
+        eprintln!(
+            "generated-node-upstream done {} accounted_bytes={}",
+            case.case_id, accounted_bytes
+        );
         Ok(())
     }
 }

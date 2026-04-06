@@ -15,11 +15,16 @@ use crate::{
     },
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     js_error, js_string,
-    object::{ErasedVTableObject, JsObject, internal_methods::get_prototype_from_constructor},
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
+    object::{
+        InterruptibleCallOutcome, ErasedVTableObject, JsObject,
+        internal_methods::get_prototype_from_constructor,
+    },
     property::Attribute,
     realm::Realm,
     string::StaticJsStrings,
     symbol::JsSymbol,
+    vm::CompletionRecord,
 };
 use boa_gc::{Finalize, Trace};
 
@@ -27,6 +32,12 @@ pub(crate) type NativeWeakMap = boa_gc::WeakMap<ErasedVTableObject, JsValue>;
 
 #[derive(Debug, Trace, Finalize)]
 pub(crate) struct WeakMap;
+
+#[derive(Clone, Trace, Finalize)]
+struct WeakMapInsertComputedState {
+    map: JsObject<NativeWeakMap>,
+    key: JsObject,
+}
 
 #[cfg(test)]
 mod tests;
@@ -48,8 +59,8 @@ impl IntrinsicObject for WeakMap {
             .method(Self::has, js_string!("has"), 1)
             .method(Self::set, js_string!("set"), 2)
             .method(Self::get_or_insert, js_string!("getOrInsert"), 2)
-            .method(
-                Self::get_or_insert_computed,
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::get_or_insert_computed),
                 js_string!("getOrInsertComputed"),
                 2,
             )
@@ -356,7 +367,7 @@ impl WeakMap {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let M be the this value.
         // 2. Perform ? RequireInternalSlot(M, [[WeakMapData]]).
         let object = this.as_object();
@@ -392,21 +403,66 @@ impl WeakMap {
             && let Some(value) = existing.value()
         {
             // a. If p.[[Key]] is not empty and SameValue(p.[[Key]], key) is true, return p.[[Value]].
-            return Ok(value.clone());
+            return Ok(NativeFunctionResult::complete(value.clone()));
         }
 
         // 6. Let value be ? Call(callback, undefined, « key »).
         // 7. NOTE: The WeakMap may have been modified during execution of callback.
-        let value = callback_fn.call(
+        match callback_fn.call_interruptible(
             &JsValue::undefined(),
             std::slice::from_ref(&key_value),
             context,
-        )?;
+        )? {
+            InterruptibleCallOutcome::Complete(value) => {
+                map.borrow_mut()
+                    .data_mut()
+                    .insert(key_obj.inner(), value.clone());
+                Ok(NativeFunctionResult::complete(value))
+            }
+            InterruptibleCallOutcome::Suspend(next) => {
+                let state = WeakMapInsertComputedState {
+                    map: map.clone(),
+                    key: key_obj.clone(),
+                };
+                Ok(NativeFunctionResult::Suspend(
+                    NativeResume::from_copy_closure_with_captures(
+                        Self::resume_weak_map_get_or_insert_computed,
+                        (next, state),
+                    ),
+                ))
+            }
+        }
+    }
 
-        // 8-10. Insert or update the entry and return value.
-        map.borrow_mut()
-            .data_mut()
-            .insert(key_obj.inner(), value.clone());
-        Ok(value)
+    fn resume_weak_map_get_or_insert_computed(
+        completion: CompletionRecord,
+        captures: &(NativeResume, WeakMapInsertComputedState),
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        match captures.0.call(completion, context)? {
+            NativeFunctionResult::Complete(record) => match record {
+                CompletionRecord::Normal(value) | CompletionRecord::Return(value) => {
+                    captures
+                        .1
+                        .map
+                        .borrow_mut()
+                        .data_mut()
+                        .insert(captures.1.key.inner(), value.clone());
+                    Ok(NativeFunctionResult::complete(value))
+                }
+                CompletionRecord::Throw(err) => {
+                    Ok(NativeFunctionResult::from_completion(CompletionRecord::Throw(err)))
+                }
+                CompletionRecord::Suspend => Err(js_error!(
+                    TypeError: "WeakMap.prototype.getOrInsertComputed resumed with unexpected suspend completion"
+                )),
+            },
+            NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+                NativeResume::from_copy_closure_with_captures(
+                    Self::resume_weak_map_get_or_insert_computed,
+                    (next, captures.1.clone()),
+                ),
+            )),
+        }
     }
 }

@@ -8,6 +8,7 @@ use crate::{
     },
     error::JsNativeError,
     js_string,
+    native_function::NativeFunctionResult,
     object::{JsFunction, JsMapIterator, JsObject},
     value::TryFromJs,
 };
@@ -405,11 +406,16 @@ impl JsMap {
         this_arg: JsValue,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        Map::for_each(
+        match Map::for_each(
             &self.inner.clone().into(),
             &[callback.into(), this_arg],
             context,
-        )
+        )? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable Map.prototype.forEach requires interruptible execution")
+                .into()),
+        }
     }
 
     /// Executes the provided callback function for each key-value pair within the [`JsMap`].

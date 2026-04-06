@@ -28,13 +28,18 @@ use crate::{
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     error::JsNativeError,
     js_error, js_string,
-    object::{JsObject, internal_methods::get_prototype_from_constructor},
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
+    object::{
+        InterruptibleCallOutcome, JsObject, internal_methods::get_prototype_from_constructor,
+    },
     property::{Attribute, PropertyNameKind},
     realm::Realm,
     string::StaticJsStrings,
     symbol::JsSymbol,
+    vm::CompletionRecord,
 };
 use boa_engine::value::IntegerOrInfinity;
+use boa_gc::{Finalize, Trace};
 pub(crate) use set_iterator::SetIterator;
 
 /// A record containing information about a Set-like object.
@@ -119,6 +124,15 @@ fn get_set_record(obj: &JsValue, context: &mut Context) -> JsResult<SetRecord> {
 #[derive(Debug, Clone)]
 pub(crate) struct Set;
 
+#[derive(Clone, Trace, Finalize)]
+struct SetForEachState {
+    set: JsObject<OrderedSet>,
+    callback: JsObject,
+    this_arg: JsValue,
+    index: usize,
+    locked: bool,
+}
+
 impl IntrinsicObject for Set {
     fn get(intrinsics: &Intrinsics) -> JsObject {
         Self::STANDARD_CONSTRUCTOR(intrinsics.constructors()).constructor()
@@ -147,7 +161,11 @@ impl IntrinsicObject for Set {
             .method(Self::clear, js_string!("clear"), 0)
             .method(Self::delete, js_string!("delete"), 1)
             .method(Self::entries, js_string!("entries"), 0)
-            .method(Self::for_each, js_string!("forEach"), 1)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::for_each),
+                js_string!("forEach"),
+                1,
+            )
             .method(Self::has, js_string!("has"), 1)
             .method(Self::difference, js_string!("difference"), 1)
             .method(Self::intersection, js_string!("intersection"), 1)
@@ -419,7 +437,7 @@ impl Set {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let S be the this value.
         // 2. Perform ? RequireInternalSlot(S, [[SetData]]).
 
@@ -440,36 +458,88 @@ impl Set {
             ));
         };
 
-        let _lock = SetLock::new(&obj);
+        obj.borrow_mut().data_mut().lock();
 
-        // 4. Let entries be S.[[SetData]].
-        // 5. Let numEntries be the number of elements in entries.
-        // 6. Let index be 0.
-        let mut index = 0;
+        let state = SetForEachState {
+            set: obj.clone(),
+            callback: callback_fn.clone(),
+            this_arg: args.get_or_undefined(1).clone(),
+            index: 0,
+            locked: true,
+        };
 
-        // 7. Repeat, while index < numEntries,
-        while index < obj.borrow().data().full_len() {
-            // a. Let e be entries[index].
-            let e = obj.borrow().data().get_index(index).cloned();
+        Self::set_for_each_step(state, context)
+    }
 
-            // b. Set index to index + 1.
-            index += 1;
+    fn set_for_each_step(
+        mut state: SetForEachState,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        loop {
+            let value = {
+                let set = state.set.borrow();
+                let set = set.data();
 
-            // c. If e is not empty, then
-            if let Some(e) = e {
-                // i. Perform ? Call(callbackfn, thisArg, « e, e, S »).
-                // ii. NOTE: The number of elements in entries may have increased during execution of callbackfn.
-                // iii. Set numEntries to the number of elements in entries.
-                callback_fn.call(
-                    args.get_or_undefined(1),
-                    &[e.clone(), e.clone(), this.clone()],
-                    context,
-                )?;
+                if state.index < set.full_len() {
+                    set.get_index(state.index).cloned()
+                } else {
+                    if state.locked {
+                        state.set.borrow_mut().data_mut().unlock();
+                    }
+                    return Ok(NativeFunctionResult::complete(JsValue::undefined()));
+                }
+            };
+
+            state.index += 1;
+
+            if let Some(value) = value {
+                match state
+                    .callback
+                    .call_interruptible(&state.this_arg, &[value.clone(), value, state.set.clone().into()], context)?
+                {
+                    InterruptibleCallOutcome::Complete(_) => {}
+                    InterruptibleCallOutcome::Suspend(next) => {
+                        return Ok(NativeFunctionResult::Suspend(
+                            NativeResume::from_copy_closure_with_captures(
+                                Self::resume_set_for_each_after_callback,
+                                (next, state),
+                            ),
+                        ));
+                    }
+                }
             }
         }
+    }
 
-        // 8. Return undefined.
-        Ok(JsValue::undefined())
+    fn resume_set_for_each_after_callback(
+        completion: CompletionRecord,
+        captures: &(NativeResume, SetForEachState),
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        match captures.0.call(completion, context)? {
+            NativeFunctionResult::Complete(record) => match record {
+                CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                    Self::set_for_each_step(captures.1.clone(), context)
+                }
+                CompletionRecord::Throw(err) => {
+                    if captures.1.locked {
+                        captures.1.set.borrow_mut().data_mut().unlock();
+                    }
+                    Ok(NativeFunctionResult::from_completion(
+                        CompletionRecord::Throw(err),
+                    ))
+                }
+                CompletionRecord::Suspend => Err(js_error!(
+                    TypeError: "Set.prototype.forEach resumed with unexpected suspend completion"
+                )),
+            },
+            NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+                NativeResume::from_copy_closure_with_captures(
+                    Self::resume_set_for_each_after_callback,
+                    (next, captures.1.clone()),
+                ),
+            )),
+        }
     }
 
     /// Call `f` for each `(value)` in the `Set`.
