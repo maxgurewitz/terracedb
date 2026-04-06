@@ -1,8 +1,10 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
+    future::Future,
     mem,
     path::PathBuf,
+    pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -979,35 +981,37 @@ impl JobExecutor for BoaJobExecutor {
         futures::executor::block_on(self.run_jobs_async(&RefCell::new(context)))
     }
 
-    async fn run_jobs_async(self: Rc<Self>, context: &RefCell<&mut Context>) -> JsResult<()>
-    where
-        Self: Sized,
-    {
-        loop {
-            if self.promise_jobs.borrow().is_empty()
-                && self.async_jobs.borrow().is_empty()
-                && self.generic_jobs.borrow().is_empty()
-                && !self.has_ready_timeout_jobs(context)
-            {
-                break;
+    fn run_jobs_async<'a>(
+        self: Rc<Self>,
+        context: &'a RefCell<&'a mut Context>,
+    ) -> Pin<Box<dyn Future<Output = JsResult<()>> + 'a>> {
+        Box::pin(async move {
+            loop {
+                if self.promise_jobs.borrow().is_empty()
+                    && self.async_jobs.borrow().is_empty()
+                    && self.generic_jobs.borrow().is_empty()
+                    && !self.has_ready_timeout_jobs(context)
+                {
+                    break;
+                }
+
+                self.run_ready_timeout_jobs(context)?;
+                self.run_promise_jobs(context)?;
+                self.run_generic_jobs(context)?;
+
+                let next_async_job = { self.async_jobs.borrow_mut().pop_front() };
+                if let Some(job) = next_async_job
+                    && let Err(error) = job.call(context).await
+                {
+                    self.clear();
+                    return Err(error);
+                }
+
+                context.borrow_mut().clear_kept_objects();
             }
 
-            self.run_ready_timeout_jobs(context)?;
-            self.run_promise_jobs(context)?;
-            self.run_generic_jobs(context)?;
-
-            let next_async_job = { self.async_jobs.borrow_mut().pop_front() };
-            if let Some(job) = next_async_job
-                && let Err(error) = job.call(context).await
-            {
-                self.clear();
-                return Err(error);
-            }
-
-            context.borrow_mut().clear_kept_objects();
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -1112,7 +1116,7 @@ fn synthetic_host_module(loaded: &JsLoadedModule, context: &mut Context) -> JsRe
         Some(PathBuf::from(loaded.resolved.canonical_specifier.clone())),
         None,
         context,
-    ))
+    )?)
 }
 
 fn host_capability_dispatch(
@@ -1295,6 +1299,7 @@ fn export_default_value(
 ) -> Result<Option<JsonValue>, JsSubstrateError> {
     let value = module
         .namespace(context)
+        .map_err(|error| execution_error(entrypoint, error))?
         .get(js_string!("default"), context)
         .map_err(|error| execution_error(entrypoint, error))?;
     if value.is_undefined() {

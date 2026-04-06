@@ -5,7 +5,14 @@
 //!   the same async TerraceDB-owned scheduler, host-service, and module-loader seams.
 
 pub mod adapters;
-mod boa;
+pub mod boa {
+    pub use boa_ast as ast;
+    pub use boa_engine as engine;
+    pub use boa_gc as gc;
+    pub use boa_interner as interner;
+    pub use boa_parser as parser;
+}
+mod boa_runtime;
 pub mod engine;
 pub mod entropy;
 pub mod error;
@@ -17,7 +24,7 @@ pub mod time;
 pub mod types;
 
 pub use adapters::{SandboxJsRuntimeBinding, SandboxJsRuntimeRequest};
-pub use boa::{BoaJsExecutionHooks, BoaJsRuntimeHost, BoaJsScheduler};
+pub use boa_runtime::{BoaJsExecutionHooks, BoaJsRuntimeHost, BoaJsScheduler};
 pub use engine::context::{
     JsAttachedRuntimeContext, JsContextAttachmentSnapshot, JsContextDetachedSnapshot,
     JsContextError, JsContextServiceConfiguration, JsContextSnapshot, JsRealmId, JsRealmSnapshot,

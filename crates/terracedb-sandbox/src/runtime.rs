@@ -24,34 +24,6 @@ use base64::{
         STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
     },
 };
-use boa_ast::scope::Scope;
-use boa_ast::visitor::Visitor;
-use boa_engine::{
-    Context, Finalize, JsData, JsError, JsNativeError, JsResult, JsString, JsSymbol, JsValue,
-    NativeFunction, Script, Source, Trace,
-    builtins::promise::{OperationType, Promise, PromiseState},
-    class::{Class, ClassBuilder},
-    context::HostHooks,
-    job::JobCallback,
-    job::NativeAsyncJob,
-    js_string,
-    module::{
-        Module, ModuleLoader as BoaModuleLoader, ModuleRequest, Referrer,
-        SyntheticModuleInitializer,
-    },
-    object::builtins::{
-        JsArray, JsArrayBuffer, JsFunction, JsPromise, JsProxy, JsSharedArrayBuffer, JsUint8Array,
-    },
-    object::{FunctionObjectBuilder, InterruptibleCallOutcome, JsObject, ObjectInitializer},
-    property::{Attribute, PropertyDescriptor, PropertyKey},
-};
-use boa_engine::native_function::NativeFunctionResult;
-use boa_gc::{
-    GcAllocationBudget, GcAllocationBudgetExceeded, runtime_stats as boa_gc_runtime_stats,
-    set_allocation_budget as boa_gc_set_allocation_budget,
-};
-use boa_interner::Interner;
-use boa_parser::{Parser as BoaParser, Source as BoaParserSource};
 use brotli::{CompressorReader as BrotliCompressorReader, Decompressor as BrotliDecompressor};
 use clap_lex::RawArgs;
 use dotenvy::from_read_iter as dotenv_from_read_iter;
@@ -85,6 +57,37 @@ use terracedb_js::{
     JsRuntimeOpenRequest, JsRuntimePolicy, JsRuntimeProvenance, JsRuntimeSuspendedState,
     JsRuntimeTurn, JsRuntimeTurnOutcome, JsSubstrateError, NeverCancel, RoutedJsHostServices,
     VfsJsHostServiceAdapter,
+};
+use crate::{boa_engine, boa_gc};
+use terracedb_js::boa::{
+    ast::{self as boa_ast, scope::Scope, visitor::Visitor},
+    engine::{
+        Context, Finalize, JsData, JsError, JsNativeError, JsResult,
+        JsString, JsSymbol, JsValue, NativeFunction, Script, Source, Trace,
+        builtins::promise::{OperationType, Promise, PromiseState},
+        class::{Class, ClassBuilder},
+        context::HostHooks,
+        job::JobCallback,
+        job::NativeAsyncJob,
+        js_string,
+        module::{
+            Module, ModuleLoader as BoaModuleLoader, ModuleRequest, Referrer,
+            SyntheticModuleInitializer,
+        },
+        native_function::NativeFunctionResult,
+        object::builtins::{
+            JsArray, JsArrayBuffer, JsFunction, JsPromise, JsProxy, JsSharedArrayBuffer,
+            JsUint8Array,
+        },
+        object::{FunctionObjectBuilder, InterruptibleCallOutcome, JsObject, ObjectInitializer},
+        property::{Attribute, PropertyDescriptor, PropertyKey},
+    },
+    gc::{
+        GcAllocationBudget, GcAllocationBudgetExceeded,
+        runtime_stats as boa_gc_runtime_stats, set_allocation_budget as boa_gc_set_allocation_budget,
+    },
+    interner::Interner,
+    parser::{Parser as BoaParser, Source as BoaParserSource},
 };
 use terracedb_vfs::{
     CreateOptions, FileKind, JsonValue, MkdirOptions, ReadOnlyVfsFileSystem, Stats, VfsVolumeExt,
@@ -4410,10 +4413,11 @@ fn node_suspend_host_operation(
 }
 
 fn node_resume_string_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: Result<(), boa_engine::JsError>,
     request_id: &u64,
     _context: &mut Context,
 ) -> JsResult<JsValue> {
+    completion?;
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::String(value) => Ok(JsValue::from(JsString::from(value))),
         other => Err(node_unexpected_host_operation_result("string", &other)),
@@ -4656,20 +4660,24 @@ where
     loop {
         match outcome {
             InterruptibleCallOutcome::Complete(value) => return Ok(value),
-            InterruptibleCallOutcome::DirectSuspend(continuation) => {
-                context.install_direct_resume(continuation);
-                node_execute_next_host_operation(context, host.clone()).await?;
-                outcome = with_active_node_host(host.clone(), |host| {
-                    node_check_execution_timeout(host)?;
-                    context.resume_interruptible().map_err(sandbox_execution_error)
-                })?;
-            }
-            InterruptibleCallOutcome::NativeSuspend => {
-                node_execute_next_host_operation(context, host.clone()).await?;
-                outcome = with_active_node_host(host.clone(), |host| {
-                    node_check_execution_timeout(host)?;
-                    context.resume_interruptible().map_err(sandbox_execution_error)
-                })?;
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                context.install_interruptible_resume(continuation);
+                match node_execute_next_host_operation(context, host.clone()).await {
+                    Ok(()) => {
+                        outcome = with_active_node_host(host.clone(), |host| {
+                            node_check_execution_timeout(host)?;
+                            context.resume_interruptible().map_err(sandbox_execution_error)
+                        })?;
+                    }
+                    Err(error) => {
+                        outcome = with_active_node_host(host.clone(), |host| {
+                            node_check_execution_timeout(host)?;
+                            context
+                                .resume_interruptible_with_error(js_error(error))
+                                .map_err(sandbox_execution_error)
+                        })?;
+                    }
+                }
             }
         }
     }
@@ -4691,24 +4699,42 @@ where
     loop {
         match outcome {
             InterruptibleCallOutcome::Complete(value) => return Ok(value),
-            InterruptibleCallOutcome::DirectSuspend(continuation) => {
-                context.install_direct_resume(continuation);
-                node_execute_next_host_operation(context, host.clone()).await?;
-                outcome = with_active_node_host(host.clone(), |host| {
-                    node_check_execution_timeout(host)?;
-                    context
-                        .resume_interruptible_construct()
-                        .map_err(sandbox_execution_error)
-                })?;
-            }
-            InterruptibleCallOutcome::NativeSuspend => {
-                node_execute_next_host_operation(context, host.clone()).await?;
-                outcome = with_active_node_host(host.clone(), |host| {
-                    node_check_execution_timeout(host)?;
-                    context
-                        .resume_interruptible_construct()
-                        .map_err(sandbox_execution_error)
-                })?;
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                context.install_interruptible_resume(continuation);
+                match node_execute_next_host_operation(context, host.clone()).await {
+                    Ok(()) => {
+                        outcome = with_active_node_host(host.clone(), |host| {
+                            node_check_execution_timeout(host)?;
+                            context
+                                .resume_interruptible_construct()
+                                .map_err(sandbox_execution_error)
+                        })?;
+                    }
+                    Err(error) => {
+                        let resumed = with_active_node_host(host.clone(), |host| {
+                            node_check_execution_timeout(host)?;
+                            context
+                                .resume_interruptible_with_error(js_error(error))
+                                .map_err(sandbox_execution_error)
+                        })?;
+                        outcome = match resumed {
+                            InterruptibleCallOutcome::Complete(value) => {
+                                InterruptibleCallOutcome::Complete(
+                                    value.as_object()
+                                        .ok_or_else(|| {
+                                            sandbox_execution_error(
+                                                "resumed constructor did not return an object",
+                                            )
+                                        })?
+                                        .clone(),
+                                )
+                            }
+                            InterruptibleCallOutcome::Suspend(continuation) => {
+                                InterruptibleCallOutcome::Suspend(continuation)
+                            }
+                        };
+                    }
+                }
             }
         }
     }
@@ -4776,8 +4802,11 @@ async fn node_execute_next_host_operation(
                         entrypoint: path,
                         message: error.to_string(),
                     }),
-                Ok(None) => Err(SandboxError::ModuleNotFound { specifier: path }),
-                Err(error) => Err(error.into()),
+                Ok(None) => return Err(SandboxError::Io {
+                    path,
+                    message: "ENOENT: no such file or directory".to_string(),
+                }),
+                Err(error) => return Err(error.into()),
             }
         }
         NodePendingHostOperation::FsWriteTextFile { path, data } => {
@@ -15597,15 +15626,7 @@ fn node_resume_interruptible_native_call(
     };
     match outcome {
         InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
-        InterruptibleCallOutcome::DirectSuspend(continuation) => {
-            Ok(NativeFunctionResult::Suspend(continuation))
-        }
-        InterruptibleCallOutcome::NativeSuspend => Ok(
-            NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_interruptible_native_call,
-                NodeInterruptibleResume,
-            ),
-        ),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(NativeFunctionResult::Suspend(continuation)),
     }
 }
 
@@ -15617,15 +15638,7 @@ fn node_call_interruptible_native(
 ) -> JsResult<NativeFunctionResult> {
     match callable.call_interruptible(this_value, call_args, context)? {
         InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
-        InterruptibleCallOutcome::DirectSuspend(continuation) => {
-            Ok(NativeFunctionResult::Suspend(continuation))
-        }
-        InterruptibleCallOutcome::NativeSuspend => Ok(
-            NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_interruptible_native_call,
-                NodeInterruptibleResume,
-            ),
-        ),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(NativeFunctionResult::Suspend(continuation)),
     }
 }
 
@@ -15638,30 +15651,17 @@ fn node_start_inspector_console_node_method(
         .call_interruptible(&capture.this_value, &capture.call_args, context)?
     {
         InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
-        InterruptibleCallOutcome::DirectSuspend(continuation) => {
-            Ok(NativeFunctionResult::Suspend(continuation))
-        }
-        InterruptibleCallOutcome::NativeSuspend => Ok(
-            NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_inspector_console_call,
-                NodeInspectorConsoleCallResume {
-                    phase: NodeInspectorConsoleCallPhase::AfterNode,
-                    this_value: capture.this_value.clone(),
-                    node_method: capture.node_method.clone(),
-                    call_args: capture.call_args.clone(),
-                },
-            ),
-        ),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(NativeFunctionResult::Suspend(continuation)),
     }
 }
 
-fn node_resume_inspector_console_call_after_direct_suspend(
+fn node_resume_inspector_console_call_after_suspend(
     completion: Result<(), boa_engine::JsError>,
     capture: &(NodeInspectorConsoleCallResume, boa_engine::native_function::NativeResume),
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     let (capture, continuation) = capture;
-    context.install_direct_resume(continuation.clone());
+    context.install_interruptible_resume(continuation.clone());
     node_resume_inspector_console_call(completion, capture, context)
 }
 
@@ -15679,16 +15679,10 @@ fn node_resume_inspector_console_call(
             InterruptibleCallOutcome::Complete(_) => {
                 node_start_inspector_console_node_method(capture, context)
             }
-            InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+            InterruptibleCallOutcome::Suspend(continuation) => Ok(
                 NativeFunctionResult::suspend_with_copy_closure(
-                    node_resume_inspector_console_call_after_direct_suspend,
+                    node_resume_inspector_console_call_after_suspend,
                     (capture.clone(), continuation),
-                ),
-            ),
-            InterruptibleCallOutcome::NativeSuspend => Ok(
-                NativeFunctionResult::suspend_with_copy_closure(
-                    node_resume_inspector_console_call,
-                    capture.clone(),
                 ),
             ),
         },
@@ -15696,15 +15690,7 @@ fn node_resume_inspector_console_call(
             InterruptibleCallOutcome::Complete(value) => {
                 Ok(NativeFunctionResult::complete(value))
             }
-            InterruptibleCallOutcome::DirectSuspend(continuation) => {
-                Ok(NativeFunctionResult::Suspend(continuation))
-            }
-            InterruptibleCallOutcome::NativeSuspend => Ok(
-                NativeFunctionResult::suspend_with_copy_closure(
-                    node_resume_inspector_console_call,
-                    capture.clone(),
-                ),
-            ),
+            InterruptibleCallOutcome::Suspend(continuation) => Ok(NativeFunctionResult::Suspend(continuation)),
         },
     }
 }
@@ -15743,16 +15729,10 @@ fn node_inspector_console_call(
         InterruptibleCallOutcome::Complete(_) => {
             node_start_inspector_console_node_method(&capture, context)
         }
-        InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
             NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_inspector_console_call_after_direct_suspend,
+                node_resume_inspector_console_call_after_suspend,
                 (capture, continuation),
-            ),
-        ),
-        InterruptibleCallOutcome::NativeSuspend => Ok(
-            NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_inspector_console_call,
-                capture,
             ),
         ),
     }
@@ -23906,16 +23886,10 @@ fn node_resume_util_lazy_property_getter(
         InterruptibleCallOutcome::Complete(exports) => {
             node_finish_lazy_property_getter(exports, capture, context)
         }
-        InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
             NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_util_lazy_property_getter_after_direct_suspend,
+                node_resume_util_lazy_property_getter_after_suspend,
                 (capture.clone(), continuation),
-            ),
-        ),
-        InterruptibleCallOutcome::NativeSuspend => Ok(
-            NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_util_lazy_property_getter,
-                capture.clone(),
             ),
         ),
     }
@@ -23938,28 +23912,22 @@ fn node_util_lazy_property_getter_suspend(
         InterruptibleCallOutcome::Complete(exports) => {
             node_finish_lazy_property_getter(exports, capture, context)
         }
-        InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
             NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_util_lazy_property_getter_after_direct_suspend,
+                node_resume_util_lazy_property_getter_after_suspend,
                 (capture.clone(), continuation),
-            ),
-        ),
-        InterruptibleCallOutcome::NativeSuspend => Ok(
-            NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_util_lazy_property_getter,
-                capture.clone(),
             ),
         ),
     }
 }
 
-fn node_resume_util_lazy_property_getter_after_direct_suspend(
+fn node_resume_util_lazy_property_getter_after_suspend(
     completion: Result<(), boa_engine::JsError>,
     capture: &(NodeUtilLazyPropertyCapture, boa_engine::native_function::NativeResume),
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     let (capture, continuation) = capture;
-    context.install_direct_resume(continuation.clone());
+    context.install_interruptible_resume(continuation.clone());
     let outcome = match completion {
         Ok(()) => context.resume_interruptible()?,
         Err(error) => context.resume_interruptible_with_error(error)?,
@@ -23968,16 +23936,10 @@ fn node_resume_util_lazy_property_getter_after_direct_suspend(
         InterruptibleCallOutcome::Complete(exports) => {
             node_finish_lazy_property_getter(exports, capture, context)
         }
-        InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
             NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_util_lazy_property_getter_after_direct_suspend,
+                node_resume_util_lazy_property_getter_after_suspend,
                 (capture.clone(), continuation),
-            ),
-        ),
-        InterruptibleCallOutcome::NativeSuspend => Ok(
-            NativeFunctionResult::suspend_with_copy_closure(
-                node_resume_util_lazy_property_getter,
-                capture.clone(),
             ),
         ),
     }

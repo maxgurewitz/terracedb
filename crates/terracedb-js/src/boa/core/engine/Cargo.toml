@@ -1,0 +1,151 @@
+[package]
+name = "boa_engine"
+keywords = ["javascript", "js", "compiler", "lexer", "parser"]
+categories = ["parser-implementations", "compilers"]
+readme = "../../README.md"
+description = "Boa is a Javascript lexer, parser and compiler written in Rust. Currently, it has support for some of the language."
+version = "1.0.0-dev"
+edition = "2024"
+authors = ["boa-dev"]
+license = "Unlicense OR MIT"
+repository = "https://github.com/boa-dev/boa"
+rust-version = "1.91.0"
+
+[features]
+default = ["float16", "xsum", "temporal"]
+embedded_lz4 = ["boa_macros/embedded_lz4", "lz4_flex"]
+jsvalue-enum = []
+deser = ["boa_interner/serde", "boa_ast/serde"]
+either = ["dep:either", "boa_gc/either"]
+intl_bundled = ["intl", "dep:boa_icu_provider"]
+intl = [
+    "boa_gc/icu",
+    "icu_normalizer/serde",
+    "dep:icu_locale",
+    "dep:icu_datetime",
+    "dep:icu_time",
+    "dep:icu_plurals",
+    "dep:icu_provider",
+    "dep:icu_calendar",
+    "dep:icu_collator",
+    "dep:icu_casemap",
+    "dep:icu_list",
+    "dep:icu_segmenter",
+    "dep:icu_decimal",
+    "dep:writeable",
+    "dep:sys-locale",
+    "dep:yoke",
+    "dep:zerofrom",
+    "dep:fixed_decimal",
+    "dep:tinystr",
+    "dep:timezone_provider",
+    "timezone_provider/experimental_tzif",
+]
+fuzz = ["boa_ast/arbitrary", "boa_interner/arbitrary"]
+flowgraph = []
+trace = ["js"]
+annex-b = ["boa_ast/annex-b", "boa_parser/annex-b"]
+temporal = ["dep:icu_calendar", "dep:temporal_rs", "dep:timezone_provider", "timezone_provider/experimental_tzif"]
+system-time-zone = ["dep:iana-time-zone"]
+experimental = []
+js = ["dep:web-time", "dep:getrandom", "getrandom/wasm_js", "time/wasm-bindgen"]
+float16 = ["dep:float16"]
+xsum = ["dep:xsum"]
+native-backtrace = []
+
+[dependencies]
+tag_ptr = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
+boa_interner = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
+boa_gc = { path = "../gc", features = ["thin-vec", "boa_string", "arrayvec"] }
+boa_macros = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
+boa_ast = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
+boa_parser = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
+boa_string = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
+cow-utils = "0.1.3"
+futures-lite = "2.6.1"
+float16 = { version = "0.1", optional = true }
+lz4_flex = { version = "0.13.0", optional = true }
+xsum = { version = "0.1.6", optional = true }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde_json = "1.0.149"
+rand = "0.10.0"
+num-traits = "0.2.19"
+regress = { version = "0.11.0", features = ["utf16"] }
+rustc-hash = { version = "2.1.1", default-features = false, features = ["std"] }
+num-bigint = { version = "0.4.6", features = ["serde"] }
+num-integer = "0.1.46"
+bitflags = "2.11.0"
+indexmap = { version = "2.13.0", default-features = false, features = ["std"] }
+ryu-js = "1.0.2"
+fast-float2 = "0.2.3"
+tap = "1.0.1"
+small_btree = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6" }
+paste = "1.0"
+thiserror = { version = "2.0.18", default-features = false }
+dashmap = "6.1.0"
+num_enum = "0.7.6"
+thin-vec = "0.2.14"
+itertools = { version = "0.14.0", default-features = false, features = ["use_alloc"] }
+icu_normalizer = { version = "~2.1.1", default-features = false, features = ["compiled_data", "utf16_iter"] }
+portable-atomic = "1.13.1"
+bytemuck = { version = "1.25.0", default-features = false, features = ["derive"] }
+arrayvec = "0.7.6"
+intrusive-collections = "0.10.0"
+cfg-if = "1.0.4"
+time = { version = "0.3.47", default-features = false, features = ["local-offset", "large-dates", "parsing", "formatting", "macros"] }
+hashbrown = "0.16.1"
+either = { version = "1.15.0", optional = true }
+static_assertions = "1.1.0"
+aligned-vec = "0.6.4"
+dynify = { version = "0.1.2", features = ["macros"] }
+futures-concurrency = "7.7.1"
+oneshot = { version = "0.2.1", features = ["async"] }
+async-channel = "2.5.0"
+boa_icu_provider = { git = "https://github.com/boa-dev/boa", rev = "f5e88de558e038f0ae675a012d59917a098f44b6", features = ["std"], optional = true }
+sys-locale = { version = "0.3.2", optional = true }
+icu_provider = { version = "~2.1.1", default-features = false, optional = true }
+icu_locale = { version = "~2.1.1", default-features = false, features = ["serde"], optional = true }
+icu_datetime = { version = "~2.1.1", default-features = false, features = ["serde"], optional = true }
+icu_time = { version = "~2.1.1", default-features = false, features = ["serde"], optional = true }
+icu_calendar = { version = "~2.1.1", default-features = false, optional = true }
+icu_collator = { version = "~2.1.1", default-features = false, features = ["serde"], optional = true }
+icu_plurals = { version = "~2.1.1", default-features = false, features = ["serde", "experimental"], optional = true }
+icu_list = { version = "~2.1.1", default-features = false, features = ["serde", "alloc"], optional = true }
+icu_casemap = { version = "~2.1.1", default-features = false, features = ["serde"], optional = true }
+icu_segmenter = { version = "~2.1.2", default-features = false, features = ["auto", "serde"], optional = true }
+icu_decimal = { version = "~2.1.1", default-features = false, features = ["serde"], optional = true }
+writeable = { version = "~0.6.2", optional = true }
+yoke = { version = "~0.8.1", optional = true }
+zerofrom = { version = "~0.1.6", optional = true }
+fixed_decimal = { version = "~0.7.1", features = ["ryu"], optional = true }
+tinystr = { version = "~0.8.2", optional = true }
+temporal_rs = { version = "0.2.0", default-features = false, features = ["float64_representable_durations"], optional = true }
+timezone_provider = { version = "0.2.0", optional = true }
+iana-time-zone = { version = "0.1.65", optional = true }
+
+[target.'cfg(all(target_family = "wasm", not(any(target_os = "emscripten", target_os = "wasi"))))'.dependencies]
+web-time = { version = "1.1.0", optional = true }
+getrandom = { version = "0.4.2", features = ["wasm_js"], optional = true }
+
+[dev-dependencies]
+criterion = "0.8.1"
+float-cmp = "0.10.0"
+indoc = "2.0.7"
+textwrap = "0.16.2"
+test-case = "3.3.1"
+husky-rs = "0.3.2"
+
+[target.x86_64-unknown-linux-gnu.dev-dependencies]
+jemallocator = "0.5.4"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "boa_engine"
+bench = false
+
+[[bench]]
+name = "full"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true

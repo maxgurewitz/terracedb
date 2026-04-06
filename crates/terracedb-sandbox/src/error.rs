@@ -104,8 +104,8 @@ pub enum SandboxError {
     Vfs(#[from] VfsError),
 }
 
-impl From<boa_engine::JsError> for SandboxError {
-    fn from(error: boa_engine::JsError) -> Self {
+impl From<terracedb_js::boa::engine::JsError> for SandboxError {
+    fn from(error: terracedb_js::boa::engine::JsError) -> Self {
         Self::Execution {
             entrypoint: "<node-runtime>".to_string(),
             message: error.to_string(),

@@ -1,3 +1,9 @@
+extern crate self as boa_engine;
+extern crate self as boa_gc;
+
+pub use terracedb_js::boa::engine::*;
+pub use terracedb_js::boa::gc::*;
+
 pub mod base_layers;
 pub mod bash;
 pub mod capabilities;

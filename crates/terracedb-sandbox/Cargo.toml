@@ -8,11 +8,6 @@ arc-swap = "1.7.1"
 async-recursion = "1.1.1"
 async-trait = "0.1.89"
 base64 = "0.22.1"
-boa_ast = { path = "/Users/maxwellgurewitz/dev/boa/core/ast" }
-boa_engine = { path = "/Users/maxwellgurewitz/dev/boa/core/engine", features = ["annex-b"] }
-boa_gc = { path = "/Users/maxwellgurewitz/dev/boa/core/gc" }
-boa_interner = { path = "/Users/maxwellgurewitz/dev/boa/core/interner" }
-boa_parser = { path = "/Users/maxwellgurewitz/dev/boa/core/parser" }
 brotli = "8.0.2"
 clap = { version = "4.5.40", features = ["derive"] }
 clap_lex = "0.7.6"
