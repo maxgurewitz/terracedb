@@ -28,7 +28,15 @@ fn resume_set_setter(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match continuation.call(completion, context)? {
-        NativeFunctionResult::Value(_) => context.continue_interruptible_vm(),
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                context.continue_interruptible_vm()
+            }
+            CompletionRecord::Throw(err) => context.continue_interruptible_vm_with_throw(err),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("setter continuation resumed with unexpected suspend completion")
+                .into()),
+        },
         NativeFunctionResult::Suspend(next) => {
             Ok(NativeFunctionResult::Suspend(wrap_set_setter_resume(next)))
         }
@@ -52,20 +60,26 @@ fn resume_set_result(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
-            let succeeded = value.to_boolean();
-            if !succeeded && captures.1 {
-                return Err(JsNativeError::typ()
-                    .with_message(
-                        captures
-                            .2
-                            .clone()
-                            .unwrap_or_else(|| "cannot set non-writable property".to_owned()),
-                    )
-                    .into());
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(value) | CompletionRecord::Return(value) => {
+                let succeeded = value.to_boolean();
+                if !succeeded && captures.1 {
+                    return Err(JsNativeError::typ()
+                        .with_message(
+                            captures
+                                .2
+                                .clone()
+                                .unwrap_or_else(|| "cannot set non-writable property".to_owned()),
+                        )
+                        .into());
+                }
+                context.continue_interruptible_vm()
             }
-            context.continue_interruptible_vm()
-        }
+            CompletionRecord::Throw(err) => context.continue_interruptible_vm_with_throw(err),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("set result continuation resumed with unexpected suspend completion")
+                .into()),
+        },
         NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
             wrap_set_result_resume(next, captures.1, captures.2.clone()),
         )),

@@ -396,14 +396,11 @@ impl BuiltInConstructor for BuiltInFunctionObject {
 
 impl BuiltInFunctionObject {
     fn resume_interruptible_invoke(
-        completion: Result<(), crate::JsError>,
+        completion: crate::vm::CompletionRecord,
         _captures: &(),
         context: &mut Context,
     ) -> JsResult<NativeFunctionResult> {
-        let outcome = match completion {
-            Ok(()) => context.resume_interruptible()?,
-            Err(error) => context.resume_interruptible_with_error(error)?,
-        };
+        let outcome = context.resume_interruptible_with(completion)?;
         Self::finish_interruptible_invoke(outcome, context)
     }
 

@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 ///
 /// [specification]: https://tc39.es/ecma262/#sec-completion-record-specification-type
 #[derive(Debug, Clone, Finalize)]
-pub(crate) enum CompletionRecord {
+pub enum CompletionRecord {
     Normal(JsValue),
     Return(JsValue),
     Throw(JsError),
@@ -44,7 +44,7 @@ impl CompletionRecord {
     //   - https://github.com/rust-lang/rust/issues/60964
     //   - https://github.com/rust-lang/rust/issues/73255
     #[allow(clippy::missing_const_for_fn)]
-    pub(crate) fn consume(self) -> JsResult<JsValue> {
+    pub fn consume(self) -> JsResult<JsValue> {
         match self {
             Self::Throw(error) => Err(error),
             Self::Normal(value) | Self::Return(value) => Ok(value),

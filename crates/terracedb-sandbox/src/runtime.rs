@@ -4401,9 +4401,28 @@ fn take_host_operation_completion_for_resume(
     node_take_host_operation_completion(&host, request_id)
 }
 
+fn node_resume_completion(
+    completion: boa_engine::vm::CompletionRecord,
+) -> JsResult<Option<boa_engine::vm::CompletionRecord>> {
+    match completion {
+        boa_engine::vm::CompletionRecord::Normal(_)
+        | boa_engine::vm::CompletionRecord::Return(_) => Ok(None),
+        boa_engine::vm::CompletionRecord::Throw(error) => {
+            Ok(Some(boa_engine::vm::CompletionRecord::Throw(error)))
+        }
+        boa_engine::vm::CompletionRecord::Suspend => Err(js_error(sandbox_execution_error(
+            "node resume callback received unexpected suspend completion",
+        ))),
+    }
+}
+
 fn node_suspend_host_operation(
     operation: NodePendingHostOperation,
-    resume: fn(Result<(), boa_engine::JsError>, &u64, &mut Context) -> JsResult<JsValue>,
+    resume: fn(
+        boa_engine::vm::CompletionRecord,
+        &u64,
+        &mut Context,
+    ) -> JsResult<boa_engine::vm::CompletionRecord>,
 ) -> JsResult<NativeFunctionResult> {
     let host = active_node_host().map_err(js_error)?;
     let request_id = node_queue_host_operation(&host, operation).map_err(js_error)?;
@@ -4413,58 +4432,83 @@ fn node_suspend_host_operation(
 }
 
 fn node_resume_string_host_operation(
-    completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     _context: &mut Context,
-) -> JsResult<JsValue> {
-    completion?;
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::String(value) => Ok(JsValue::from(JsString::from(value))),
+        NodeCompletedHostOperation::String(value) => {
+            Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::from(
+                JsString::from(value),
+            )))
+        }
         other => Err(node_unexpected_host_operation_result("string", &other)),
     }
 }
 
 fn node_resume_undefined_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::Undefined => Ok(JsValue::undefined()),
+        NodeCompletedHostOperation::Undefined => {
+            Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::undefined()))
+        }
         other => Err(node_unexpected_host_operation_result("undefined", &other)),
     }
 }
 
 fn node_resume_i32_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::I32(value) => Ok(JsValue::from(value)),
+        NodeCompletedHostOperation::I32(value) => {
+            Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::from(value)))
+        }
         other => Err(node_unexpected_host_operation_result("i32", &other)),
     }
 }
 
 fn node_resume_u32_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::U32(value) => Ok(JsValue::from(value)),
+        NodeCompletedHostOperation::U32(value) => {
+            Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::from(value)))
+        }
         other => Err(node_unexpected_host_operation_result("u32", &other)),
     }
 }
 
 fn node_resume_bytes_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Bytes(bytes) => JsUint8Array::from_iter(bytes, context)
             .map(Into::into)
+            .map(boa_engine::vm::CompletionRecord::Normal)
             .map_err(sandbox_execution_error)
             .map_err(js_error),
         other => Err(node_unexpected_host_operation_result("bytes", &other)),
@@ -4472,26 +4516,33 @@ fn node_resume_bytes_host_operation(
 }
 
 fn node_resume_stats_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Stats(stats) => match stats {
             Some(stats) => JsValue::from_json(&node_stats_to_json(stats), context)
+                .map(boa_engine::vm::CompletionRecord::Normal)
                 .map_err(sandbox_execution_error)
                 .map_err(js_error),
-            None => Ok(JsValue::null()),
+            None => Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::null())),
         },
         other => Err(node_unexpected_host_operation_result("stats", &other)),
     }
 }
 
 fn node_resume_dir_entries_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::DirEntries(entries) => {
             let json = JsonValue::Array(
@@ -4506,6 +4557,7 @@ fn node_resume_dir_entries_host_operation(
                     .collect(),
             );
             JsValue::from_json(&json, context)
+                .map(boa_engine::vm::CompletionRecord::Normal)
                 .map_err(sandbox_execution_error)
                 .map_err(js_error)
         }
@@ -4514,10 +4566,13 @@ fn node_resume_dir_entries_host_operation(
 }
 
 fn node_resume_resolved_module_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::ResolvedModule(resolved) => JsValue::from_json(
             &serde_json::to_value(resolved)
@@ -4525,6 +4580,7 @@ fn node_resume_resolved_module_host_operation(
                 .map_err(js_error)?,
             context,
         )
+        .map(boa_engine::vm::CompletionRecord::Normal)
         .map_err(sandbox_execution_error)
         .map_err(js_error),
         other => Err(node_unexpected_host_operation_result("resolved module", &other)),
@@ -4532,12 +4588,16 @@ fn node_resume_resolved_module_host_operation(
 }
 
 fn node_resume_json_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Json(value) => JsValue::from_json(&value, context)
+            .map(boa_engine::vm::CompletionRecord::Normal)
             .map_err(sandbox_execution_error)
             .map_err(js_error),
         other => Err(node_unexpected_host_operation_result("json", &other)),
@@ -4545,39 +4605,58 @@ fn node_resume_json_host_operation(
 }
 
 fn node_resume_json_or_undefined_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Json(value) => JsValue::from_json(&value, context)
+            .map(boa_engine::vm::CompletionRecord::Normal)
             .map_err(sandbox_execution_error)
             .map_err(js_error),
-        NodeCompletedHostOperation::Undefined => Ok(JsValue::undefined()),
+        NodeCompletedHostOperation::Undefined => {
+            Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::undefined()))
+        }
         other => Err(node_unexpected_host_operation_result("json|undefined", &other)),
     }
 }
 
 fn node_resume_string_or_undefined_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::String(value) => Ok(JsValue::from(JsString::from(value))),
-        NodeCompletedHostOperation::Undefined => Ok(JsValue::undefined()),
+        NodeCompletedHostOperation::String(value) => Ok(boa_engine::vm::CompletionRecord::Normal(
+            JsValue::from(JsString::from(value)),
+        )),
+        NodeCompletedHostOperation::Undefined => {
+            Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::undefined()))
+        }
         other => Err(node_unexpected_host_operation_result("string|undefined", &other)),
     }
 }
 
 fn node_resume_string_or_json_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::String(value) => Ok(JsValue::from(JsString::from(value))),
+        NodeCompletedHostOperation::String(value) => Ok(boa_engine::vm::CompletionRecord::Normal(
+            JsValue::from(JsString::from(value)),
+        )),
         NodeCompletedHostOperation::Json(value) => JsValue::from_json(&value, context)
+            .map(boa_engine::vm::CompletionRecord::Normal)
             .map_err(sandbox_execution_error)
             .map_err(js_error),
         other => Err(node_unexpected_host_operation_result("string|json", &other)),
@@ -4585,21 +4664,29 @@ fn node_resume_string_or_json_host_operation(
 }
 
 fn node_resume_js_value_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::JsValue(value) => Ok(value),
+        NodeCompletedHostOperation::JsValue(value) => {
+            Ok(boa_engine::vm::CompletionRecord::Normal(value))
+        }
         other => Err(node_unexpected_host_operation_result("js value", &other)),
     }
 }
 
 fn node_resume_require_resolve_host_operation(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let host = active_node_host().map_err(js_error)?;
     let completion = node_take_host_operation_completion(&host, *request_id);
     let report = match completion {
@@ -4627,6 +4714,7 @@ fn node_resume_require_resolve_host_operation(
         }
     };
     JsValue::from_json(&report, context)
+        .map(boa_engine::vm::CompletionRecord::Normal)
         .map_err(sandbox_execution_error)
         .map_err(js_error)
 }
@@ -5812,14 +5900,17 @@ async fn resolve_import_meta_target_async(
 }
 
 fn node_resume_import_meta_resolve(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeImportMetaResolveResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let result = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::String(value) => value,
         NodeCompletedHostOperation::Undefined => {
-            return Err(node_error_with_code(
+            return Ok(boa_engine::vm::CompletionRecord::Throw(node_error_with_code(
                 context,
                 JsNativeError::error(),
                 format!(
@@ -5827,11 +5918,13 @@ fn node_resume_import_meta_resolve(
                     capture.request, capture.module_path
                 ),
                 "ERR_MODULE_NOT_FOUND",
-            ));
+            )));
         }
         other => return Err(node_unexpected_host_operation_result("string|undefined", &other)),
     };
-    Ok(JsValue::from(JsString::from(result)))
+    Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::from(
+        JsString::from(result),
+    )))
 }
 
 fn node_import_meta_resolve_for_module_suspend(
@@ -7385,19 +7478,23 @@ fn node_wrapped_builtin_source(
     Ok((wrapped, path))
 }
 
-fn node_compile_builtin_wrapper_from_source(
+fn node_compile_builtin_wrapper_from_source_interruptible(
     context: &mut Context,
     specifier: &str,
     source: &str,
     parameters: &[&str],
     suffix: Option<&str>,
-) -> Result<JsValue, SandboxError> {
-    let (wrapped, path) = node_wrapped_builtin_source(specifier, source, parameters, suffix)?;
-    context
-        .eval(
-            Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(path)),
-        )
-        .map_err(sandbox_execution_error)
+) -> JsResult<InterruptibleCallOutcome<JsValue>> {
+    let (wrapped, path) =
+        node_wrapped_builtin_source(specifier, source, parameters, suffix).map_err(js_error)?;
+    let script = Script::parse(
+        Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(path)),
+        None,
+        context,
+    )
+    .map_err(sandbox_execution_error)
+    .map_err(js_error)?;
+    script.evaluate_interruptible(context)
 }
 
 async fn node_compile_builtin_wrapper_async(
@@ -7409,17 +7506,16 @@ async fn node_compile_builtin_wrapper_async(
 ) -> Result<JsValue, SandboxError> {
     node_check_execution_timeout(&host)?;
     let source = node_read_builtin_source_text_async(&host, specifier).await?;
-    let (wrapped, path) = node_wrapped_builtin_source(specifier, &source, parameters, suffix)?;
-    let script = Script::parse(
-        Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(path)),
-        None,
-        context,
-    )
-    .map_err(sandbox_execution_error)?;
     node_drive_interruptible_value(context, host, |context| {
-        script.evaluate_interruptible(context)
+        node_compile_builtin_wrapper_from_source_interruptible(
+            context,
+            specifier,
+            &source,
+            parameters,
+            suffix,
+        )
     })
-        .await
+    .await
 }
 
 fn node_get_linked_binding(
@@ -10736,10 +10832,13 @@ fn node_process_wrap_spawn_suspend(
 }
 
 fn node_process_wrap_spawn_resume(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeProcessWrapSpawnResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let host = active_node_host().map_err(js_error)?;
     let result = take_child_process_result_for_resume(capture.request_id).map_err(js_error)?;
     let pid = result.pid.unwrap_or(0);
@@ -10781,7 +10880,7 @@ fn node_process_wrap_spawn_resume(
             context,
         );
     }
-    Ok(JsValue::from(errno))
+    Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::from(errno)))
 }
 
 fn node_process_wrap_kill(
@@ -11094,17 +11193,23 @@ fn node_fs_dir_make_handle(
 }
 
 fn node_resume_fs_dir_opendir(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeFsDirOpendirResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let entries = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::DirEntries(entries) => entries,
         other => return Err(node_unexpected_host_operation_result("dir entries", &other)),
     };
     let host = active_node_host().map_err(js_error)?;
     let handle = node_fs_dir_make_handle(&host, context, &capture.path, &entries).map_err(js_error)?;
-    node_fs_req_complete(capture.req.as_ref(), context, JsValue::from(handle)).map_err(js_error)
+    match node_fs_req_complete(capture.req.as_ref(), context, JsValue::from(handle)).map_err(js_error) {
+        Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+        Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+    }
 }
 
 fn node_fs_dir_opendir_suspend(
@@ -11328,6 +11433,11 @@ struct NodeBuiltinCompileResume {
 }
 
 #[derive(Clone, Trace, Finalize)]
+struct NodeBuiltinCompileEvalResume {
+    continuation: boa_engine::native_function::NativeResume,
+}
+
+#[derive(Clone, Trace, Finalize)]
 struct NodeProcessLoadEnvFileResume {
     request_id: u64,
     display_path: String,
@@ -11363,7 +11473,11 @@ fn node_internal_fs_complete_req(
 fn node_internal_fs_queue_req_operation(
     operation: NodePendingHostOperation,
     req: Option<JsValue>,
-    resume: fn(Result<(), boa_engine::JsError>, &NodeInternalFsReqResume, &mut Context) -> JsResult<JsValue>,
+    resume: fn(
+        boa_engine::vm::CompletionRecord,
+        &NodeInternalFsReqResume,
+        &mut Context,
+    ) -> JsResult<boa_engine::vm::CompletionRecord>,
 ) -> JsResult<NativeFunctionResult> {
     let host = active_node_host().map_err(js_error)?;
     let request_id = node_queue_host_operation(&host, operation).map_err(js_error)?;
@@ -11374,10 +11488,13 @@ fn node_internal_fs_queue_req_operation(
 }
 
 fn node_resume_internal_fs_internal_module_stat(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let code = match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Stats(Some(stats)) => match stats.kind {
             FileKind::File | FileKind::Symlink => 0,
@@ -11386,73 +11503,107 @@ fn node_resume_internal_fs_internal_module_stat(
         NodeCompletedHostOperation::Stats(None) => -1,
         other => return Err(node_unexpected_host_operation_result("stats", &other)),
     };
-    Ok(JsValue::from(code))
+    Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::from(code)))
 }
 
 fn node_resume_internal_fs_stat_like(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReqResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Stats(Some(stats)) => {
             let stat_values = node_fs_binding_stat_values(context).map_err(js_error)?;
             node_fill_fs_stat_values(context, &stat_values, &stats).map_err(js_error)?;
-            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(stat_values))
+            match node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(stat_values)) {
+                Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+                Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+            }
         }
         NodeCompletedHostOperation::Stats(None) => {
-            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::undefined())
+            match node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::undefined()) {
+                Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+                Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+            }
         }
         other => Err(node_unexpected_host_operation_result("stats", &other)),
     }
 }
 
 fn node_resume_internal_fs_string_req(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReqResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::String(value) => node_internal_fs_complete_req(
+        NodeCompletedHostOperation::String(value) => match node_internal_fs_complete_req(
             capture.req.as_ref(),
             context,
             JsValue::from(JsString::from(value)),
-        ),
+        ) {
+            Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+            Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+        },
         other => Err(node_unexpected_host_operation_result("string", &other)),
     }
 }
 
 fn node_resume_internal_fs_i32_req(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReqResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::I32(value) => {
-            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(value))
-        }
+        NodeCompletedHostOperation::I32(value) => match node_internal_fs_complete_req(
+            capture.req.as_ref(),
+            context,
+            JsValue::from(value),
+        ) {
+            Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+            Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+        },
         other => Err(node_unexpected_host_operation_result("i32", &other)),
     }
 }
 
 fn node_resume_internal_fs_undefined_req(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReqResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
-        NodeCompletedHostOperation::Undefined => {
-            node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::undefined())
-        }
+        NodeCompletedHostOperation::Undefined => match node_internal_fs_complete_req(
+            capture.req.as_ref(),
+            context,
+            JsValue::undefined(),
+        ) {
+            Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+            Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+        },
         other => Err(node_unexpected_host_operation_result("undefined", &other)),
     }
 }
 
 fn node_resume_internal_fs_read(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsReadResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let bytes = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Bytes(bytes) => bytes,
         other => return Err(node_unexpected_host_operation_result("bytes", &other)),
@@ -11465,14 +11616,20 @@ fn node_resume_internal_fs_read(
         dest.set((capture.offset + index) as u32, byte, true, context)?;
         written = written.saturating_add(1);
     }
-    node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written as u32))
+    match node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written as u32)) {
+        Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+        Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+    }
 }
 
 fn node_resume_internal_fs_write(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInternalFsWriteResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let written = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::U32(value) => value,
         other => return Err(node_unexpected_host_operation_result("u32", &other)),
@@ -11483,7 +11640,10 @@ fn node_resume_internal_fs_write(
             .map_err(sandbox_execution_error)
             .map_err(js_error)?;
     }
-    node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written))
+    match node_internal_fs_complete_req(capture.req.as_ref(), context, JsValue::from(written)) {
+        Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+        Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+    }
 }
 
 fn node_internal_fs_internal_module_stat(
@@ -15616,14 +15776,11 @@ fn node_internal_binding_watchdog(context: &mut Context) -> Result<JsObject, San
 }
 
 fn node_resume_interruptible_native_call(
-    completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     _capture: &NodeInterruptibleResume,
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
-    let outcome = match completion {
-        Ok(()) => context.resume_interruptible()?,
-        Err(error) => context.resume_interruptible_with_error(error)?,
-    };
+    let outcome = context.resume_interruptible_with(completion)?;
     match outcome {
         InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
         InterruptibleCallOutcome::Suspend(continuation) => Ok(NativeFunctionResult::Suspend(continuation)),
@@ -15656,7 +15813,7 @@ fn node_start_inspector_console_node_method(
 }
 
 fn node_resume_inspector_console_call_after_suspend(
-    completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &(NodeInspectorConsoleCallResume, boa_engine::native_function::NativeResume),
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
@@ -15666,14 +15823,11 @@ fn node_resume_inspector_console_call_after_suspend(
 }
 
 fn node_resume_inspector_console_call(
-    completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeInspectorConsoleCallResume,
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
-    let outcome = match completion {
-        Ok(()) => context.resume_interruptible()?,
-        Err(error) => context.resume_interruptible_with_error(error)?,
-    };
+    let outcome = context.resume_interruptible_with(completion)?;
     match capture.phase {
         NodeInspectorConsoleCallPhase::AfterInspector => match outcome {
             InterruptibleCallOutcome::Complete(_) => {
@@ -16451,13 +16605,18 @@ fn node_sea_get_asset_keys(
 }
 
 fn node_resume_report_write_report(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeReportWriteResume,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Undefined => {
-            Ok(JsValue::from(JsString::from(capture.resolved_path.clone())))
+            Ok(boa_engine::vm::CompletionRecord::Normal(JsValue::from(
+                JsString::from(capture.resolved_path.clone()),
+            )))
         }
         other => Err(node_unexpected_host_operation_result("undefined", &other)),
     }
@@ -17970,17 +18129,22 @@ fn node_process_methods_execve_suspend(
 }
 
 fn node_process_methods_execve_resume(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let host = active_node_host().map_err(js_error)?;
     let result = take_child_process_result_for_resume(*request_id).map_err(js_error)?;
     if let Some(error) = result.error {
-        return Err(js_error(SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: error.message,
-        }));
+        return Ok(boa_engine::vm::CompletionRecord::Throw(js_error(
+            SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: error.message,
+            },
+        )));
     }
     let mut process = host.process.borrow_mut();
     process.stdout.push_str(&result.stdout);
@@ -17988,7 +18152,9 @@ fn node_process_methods_execve_resume(
     process.exit_code = result.status.unwrap_or_default();
     drop(process);
     node_sync_live_process_state_budget(&host).map_err(js_error)?;
-    Err(js_error(SandboxError::ExecveReplaced))
+    Ok(boa_engine::vm::CompletionRecord::Throw(js_error(
+        SandboxError::ExecveReplaced,
+    )))
 }
 
 fn node_process_methods_constrained_memory(
@@ -18030,20 +18196,25 @@ fn node_process_methods_available_memory(
 }
 
 fn node_resume_process_methods_load_env_file(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeProcessLoadEnvFileResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let text = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::String(text) => text,
         NodeCompletedHostOperation::Undefined => {
-            return Err(js_error(SandboxError::Execution {
-                entrypoint: "<node-runtime>".to_string(),
-                message: format!(
-                    "ENOENT: no such file or directory, open '{}'",
-                    capture.display_path
-                ),
-            }));
+            return Ok(boa_engine::vm::CompletionRecord::Throw(js_error(
+                SandboxError::Execution {
+                    entrypoint: "<node-runtime>".to_string(),
+                    message: format!(
+                        "ENOENT: no such file or directory, open '{}'",
+                        capture.display_path
+                    ),
+                },
+            )));
         }
         other => return Err(node_unexpected_host_operation_result("string|undefined", &other)),
     };
@@ -18056,12 +18227,15 @@ fn node_resume_process_methods_load_env_file(
             ),
         })
     })?;
-    node_with_host_js(context, |host, context| {
+    match node_with_host_js(context, |host, context| {
         for (key, value) in &parsed {
             node_set_process_env_value(key, value, host, context)?;
         }
         Ok(JsValue::undefined())
-    })
+    }) {
+        Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+        Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+    }
 }
 
 fn node_process_methods_load_env_file_suspend(
@@ -18124,29 +18298,38 @@ fn node_process_methods_cwd(
 }
 
 fn node_resume_process_methods_chdir(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeProcessChdirResume,
     _context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Stats(Some(stats)) => {
             if !matches!(stats.kind, FileKind::Directory) {
-                return Err(js_error(SandboxError::Execution {
-                    entrypoint: "<node-runtime>".to_string(),
-                    message: format!("ENOTDIR: not a directory, chdir '{}'", capture.next_path),
-                }));
+                return Ok(boa_engine::vm::CompletionRecord::Throw(js_error(
+                    SandboxError::Execution {
+                        entrypoint: "<node-runtime>".to_string(),
+                        message: format!("ENOTDIR: not a directory, chdir '{}'", capture.next_path),
+                    },
+                )));
             }
-            node_with_host(|host| {
+            match node_with_host(|host| {
                 host.process.borrow_mut().cwd = capture.next_path.clone();
                 node_sync_live_process_state_budget(host)?;
                 Ok(JsValue::undefined())
-            })
-            .map_err(js_error)
+            }) {
+                Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+                Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(js_error(error))),
+            }
         }
-        NodeCompletedHostOperation::Stats(None) => Err(js_error(SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: format!("ENOENT: no such file or directory, chdir '{}'", capture.next_path),
-        })),
+        NodeCompletedHostOperation::Stats(None) => Ok(boa_engine::vm::CompletionRecord::Throw(
+            js_error(SandboxError::Execution {
+                entrypoint: "<node-runtime>".to_string(),
+                message: format!("ENOENT: no such file or directory, chdir '{}'", capture.next_path),
+            }),
+        )),
         other => Err(node_unexpected_host_operation_result("stats", &other)),
     }
 }
@@ -19622,15 +19805,18 @@ fn node_contextify_script_create_cached_data(
 }
 
 fn node_resume_builtins_compile_function(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeBuiltinCompileResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(NativeFunctionResult::from_completion(completion));
+    }
     let source = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
         NodeCompletedHostOperation::String(value) => value,
         other => return Err(node_unexpected_host_operation_result("string", &other)),
     };
-    node_compile_builtin_wrapper_from_source(
+    match node_compile_builtin_wrapper_from_source_interruptible(
         context,
         &capture.specifier,
         &source,
@@ -19643,8 +19829,35 @@ fn node_resume_builtins_compile_function(
             "primordials",
         ],
         None,
-    )
-    .map_err(js_error)
+    ) {
+        Ok(InterruptibleCallOutcome::Complete(value)) => Ok(NativeFunctionResult::complete(value)),
+        Ok(InterruptibleCallOutcome::Suspend(continuation)) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_builtins_compile_function_after_suspend,
+                NodeBuiltinCompileEvalResume { continuation },
+            ),
+        ),
+        Err(error) => Ok(NativeFunctionResult::from_completion(
+            boa_engine::vm::CompletionRecord::Throw(error),
+        )),
+    }
+}
+
+fn node_resume_builtins_compile_function_after_suspend(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeBuiltinCompileEvalResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_builtins_compile_function_after_suspend,
+                NodeBuiltinCompileEvalResume { continuation },
+            ),
+        ),
+    }
 }
 
 fn node_builtins_compile_function_suspend(
@@ -20764,23 +20977,31 @@ fn node_blob_create_blob(
 }
 
 fn node_resume_blob_create_from_file_path(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     request_id: &u64,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     match take_host_operation_completion_for_resume(*request_id).map_err(js_error)? {
         NodeCompletedHostOperation::Bytes(bytes) => {
             let length = bytes.len() as u32;
-            node_with_host_js(context, |host, context| {
+            match node_with_host_js(context, |host, context| {
                 let blob_id = node_blob_register_bytes(host, bytes);
                 let handle = node_blob_make_handle(context, blob_id)?;
                 Ok(JsValue::from(JsArray::from_iter(
                     [JsValue::from(handle), JsValue::from(length)],
                     context,
                 )?))
-            })
+            }) {
+                Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+                Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(error)),
+            }
         }
-        NodeCompletedHostOperation::Undefined => Ok(JsValue::undefined()),
+        NodeCompletedHostOperation::Undefined => Ok(boa_engine::vm::CompletionRecord::Normal(
+            JsValue::undefined(),
+        )),
         other => Err(node_unexpected_host_operation_result("bytes|undefined", &other)),
     }
 }
@@ -23865,6 +24086,18 @@ fn node_finish_lazy_property_getter(
     capture: &NodeUtilLazyPropertyCapture,
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
+    if let Ok(host) = active_node_host() {
+        let _ = node_debug_event(
+            &host,
+            "lazy_property",
+            format!(
+                "finish id={:?} key={:?} exports_is_object={}",
+                capture.id,
+                capture.key,
+                exports.is_object()
+            ),
+        );
+    }
     Ok(NativeFunctionResult::complete(
         exports
             .as_object()
@@ -23874,14 +24107,18 @@ fn node_finish_lazy_property_getter(
 }
 
 fn node_resume_util_lazy_property_getter(
-    completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeUtilLazyPropertyCapture,
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
-    let outcome = match completion {
-        Ok(()) => context.resume_interruptible()?,
-        Err(error) => context.resume_interruptible_with_error(error)?,
-    };
+    if let Ok(host) = active_node_host() {
+        let _ = node_debug_event(
+            &host,
+            "lazy_property",
+            format!("resume id={:?} key={:?}", capture.id, capture.key),
+        );
+    }
+    let outcome = context.resume_interruptible_with(completion)?;
     match outcome {
         InterruptibleCallOutcome::Complete(exports) => {
             node_finish_lazy_property_getter(exports, capture, context)
@@ -23901,6 +24138,13 @@ fn node_util_lazy_property_getter_suspend(
     capture: &NodeUtilLazyPropertyCapture,
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
+    if let Ok(host) = active_node_host() {
+        let _ = node_debug_event(
+            &host,
+            "lazy_property",
+            format!("start id={:?} key={:?}", capture.id, capture.key),
+        );
+    }
     match capture
         .builtin_require
         .call_interruptible(
@@ -23922,16 +24166,20 @@ fn node_util_lazy_property_getter_suspend(
 }
 
 fn node_resume_util_lazy_property_getter_after_suspend(
-    completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &(NodeUtilLazyPropertyCapture, boa_engine::native_function::NativeResume),
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     let (capture, continuation) = capture;
+    if let Ok(host) = active_node_host() {
+        let _ = node_debug_event(
+            &host,
+            "lazy_property",
+            format!("resume_after_suspend id={:?} key={:?}", capture.id, capture.key),
+        );
+    }
     context.install_interruptible_resume(continuation.clone());
-    let outcome = match completion {
-        Ok(()) => context.resume_interruptible()?,
-        Err(error) => context.resume_interruptible_with_error(error)?,
-    };
+    let outcome = context.resume_interruptible_with(completion)?;
     match outcome {
         InterruptibleCallOutcome::Complete(exports) => {
             node_finish_lazy_property_getter(exports, capture, context)
@@ -26686,13 +26934,19 @@ fn node_spawn_sync_spawn_suspend(
 }
 
 fn node_spawn_sync_spawn_resume(
-    _completion: Result<(), boa_engine::JsError>,
+    completion: boa_engine::vm::CompletionRecord,
     capture: &NodeSpawnSyncResume,
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<boa_engine::vm::CompletionRecord> {
+    if let Some(completion) = node_resume_completion(completion)? {
+        return Ok(completion);
+    }
     let host = active_node_host().map_err(js_error)?;
     let result = take_child_process_result_for_resume(capture.request_id).map_err(js_error)?;
-    node_spawn_sync_result_to_js(&host, &result, &capture.options, context).map_err(js_error)
+    match node_spawn_sync_result_to_js(&host, &result, &capture.options, context) {
+        Ok(value) => Ok(boa_engine::vm::CompletionRecord::Normal(value)),
+        Err(error) => Ok(boa_engine::vm::CompletionRecord::Throw(js_error(error))),
+    }
 }
 
 fn node_spawn_sync_request_from_options(

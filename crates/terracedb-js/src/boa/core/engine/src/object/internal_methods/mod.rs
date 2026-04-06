@@ -13,6 +13,7 @@ use super::{
 };
 use crate::{
     Context, JsExpect, JsNativeError, JsResult,
+    context::interrupt_trace,
     context::ExecutionOutcome,
     context::intrinsics::{StandardConstructor, StandardConstructors},
     native_function::{NativeFunctionResult, NativeResume},
@@ -305,6 +306,7 @@ impl JsObject {
         receiver: JsValue,
         context: &mut InternalMethodPropertyContext<'_>,
     ) -> JsResult<JsValue> {
+        interrupt_trace(|| format!("JsObject::__get__ key={key}"));
         match self.__get_interruptible__(key, receiver, context)? {
             ExecutionOutcome::Complete(value) => Ok(value),
             ExecutionOutcome::Suspend(_) => Err(Self::suspended_internal_method_error(
@@ -319,6 +321,7 @@ impl JsObject {
         receiver: JsValue,
         context: &mut InternalMethodPropertyContext<'_>,
     ) -> JsResult<ExecutionOutcome<JsValue>> {
+        interrupt_trace(|| format!("JsObject::__get_interruptible__ key={key}"));
         (self.vtable().__get_interruptible__)(self, key, receiver, context)
     }
 
@@ -1139,7 +1142,17 @@ fn resume_ordinary_set_suspend(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match continuation.call(completion, context)? {
-        NativeFunctionResult::Value(_) => Ok(NativeFunctionResult::complete(true.into())),
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                Ok(NativeFunctionResult::complete(true))
+            }
+            CompletionRecord::Throw(err) => Ok(NativeFunctionResult::from_completion(
+                CompletionRecord::Throw(err),
+            )),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("ordinary set continuation resumed with unexpected suspend completion")
+                .into()),
+        },
         NativeFunctionResult::Suspend(next) => {
             Ok(NativeFunctionResult::Suspend(wrap_ordinary_set_suspend(next)))
         }

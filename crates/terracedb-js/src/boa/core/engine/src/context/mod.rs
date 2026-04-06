@@ -55,7 +55,7 @@ pub enum ExecutionOutcome<T> {
 }
 
 #[inline]
-fn interrupt_trace(message: impl FnOnce() -> String) {
+pub(crate) fn interrupt_trace(message: impl FnOnce() -> String) {
     if std::env::var_os("BOA_INTERRUPT_TRACE").is_some() {
         eprintln!("[boa-interrupt] {}", message());
     }
@@ -558,7 +558,7 @@ impl Context {
         }
     }
 
-    fn resume_interruptible_with(
+    pub fn resume_interruptible_with(
         &mut self,
         completion: crate::vm::CompletionRecord,
     ) -> JsResult<InterruptibleCallOutcome<JsValue>> {
@@ -582,9 +582,18 @@ impl Context {
         };
 
         match continuation.call(completion, self)? {
-            crate::native_function::NativeFunctionResult::Value(value) => Ok(
-                InterruptibleCallOutcome::Complete(value),
-            ),
+            crate::native_function::NativeFunctionResult::Complete(record) => {
+                match record {
+                    crate::vm::CompletionRecord::Normal(value)
+                    | crate::vm::CompletionRecord::Return(value) => {
+                        Ok(InterruptibleCallOutcome::Complete(value))
+                    }
+                    crate::vm::CompletionRecord::Throw(error) => Err(error),
+                    crate::vm::CompletionRecord::Suspend => Err(JsNativeError::error()
+                        .with_message("suspended continuation returned an unexpected suspend completion")
+                        .into()),
+                }
+            }
             crate::native_function::NativeFunctionResult::Suspend(next) => {
                 interrupt_trace(|| {
                     format!(
@@ -615,7 +624,17 @@ impl Context {
             return Ok(NativeFunctionResult::Suspend(continuation));
         }
 
-        record.consume().map(NativeFunctionResult::complete)
+        Ok(NativeFunctionResult::from_completion(record))
+    }
+
+    pub(crate) fn continue_interruptible_vm_with_throw(
+        &mut self,
+        error: crate::JsError,
+    ) -> JsResult<NativeFunctionResult> {
+        match self.handle_error(error) {
+            std::ops::ControlFlow::Continue(()) => self.continue_interruptible_vm(),
+            std::ops::ControlFlow::Break(record) => Ok(NativeFunctionResult::from_completion(record)),
+        }
     }
 
     /// Abstract operation [`ClearKeptObjects`][clear].

@@ -103,7 +103,23 @@ fn resume_proxy_has_after_get_method(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => value,
+                crate::vm::CompletionRecord::Throw(err) => {
+                    return Ok(NativeFunctionResult::from_completion(
+                        crate::vm::CompletionRecord::Throw(err),
+                    ));
+                }
+                crate::vm::CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "proxy has continuation resumed with unexpected suspend completion",
+                        )
+                        .into());
+                }
+            };
             let trap = decode_optional_callable(value)?;
             let mut property_context = InternalMethodPropertyContext::new(context);
             let key = captures.3.to_property_key(&mut property_context)?;
@@ -113,7 +129,7 @@ fn resume_proxy_has_after_get_method(
                     .has_property_interruptible(key.clone(), &mut property_context)
                 {
                     Ok(ExecutionOutcome::Complete(value)) => {
-                        Ok(NativeFunctionResult::complete(value.into()))
+                        Ok(NativeFunctionResult::complete(value))
                     }
                     Ok(ExecutionOutcome::Suspend(next)) => Ok(NativeFunctionResult::Suspend(next)),
                     Err(error) => Err(error),
@@ -167,7 +183,23 @@ fn resume_proxy_has_after_trap_call(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => value,
+                crate::vm::CompletionRecord::Throw(err) => {
+                    return Ok(NativeFunctionResult::from_completion(
+                        crate::vm::CompletionRecord::Throw(err),
+                    ));
+                }
+                crate::vm::CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "proxy has trap continuation resumed with unexpected suspend completion",
+                        )
+                        .into());
+                }
+            };
             let mut property_context = InternalMethodPropertyContext::new(context);
             let key = captures.2.to_property_key(&mut property_context)?;
             let value = finalize_proxy_has_result(
@@ -234,7 +266,23 @@ fn resume_proxy_get_after_get_method(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => value,
+                crate::vm::CompletionRecord::Throw(err) => {
+                    return Ok(NativeFunctionResult::from_completion(
+                        crate::vm::CompletionRecord::Throw(err),
+                    ));
+                }
+                crate::vm::CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "proxy get continuation resumed with unexpected suspend completion",
+                        )
+                        .into());
+                }
+            };
             let trap = decode_optional_callable(value)?;
             let mut property_context = InternalMethodPropertyContext::new(context);
             let key = captures.3.to_property_key(&mut property_context)?;
@@ -298,7 +346,23 @@ fn resume_proxy_get_after_trap_call(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => value,
+                crate::vm::CompletionRecord::Throw(err) => {
+                    return Ok(NativeFunctionResult::from_completion(
+                        crate::vm::CompletionRecord::Throw(err),
+                    ));
+                }
+                crate::vm::CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "proxy get trap continuation resumed with unexpected suspend completion",
+                        )
+                        .into());
+                }
+            };
             let mut property_context = InternalMethodPropertyContext::new(context);
             let key = captures.2.to_property_key(&mut property_context)?;
             let value =
@@ -370,7 +434,23 @@ fn resume_proxy_set_after_get_method(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => value,
+                crate::vm::CompletionRecord::Throw(err) => {
+                    return Ok(NativeFunctionResult::from_completion(
+                        crate::vm::CompletionRecord::Throw(err),
+                    ));
+                }
+                crate::vm::CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "proxy set continuation resumed with unexpected suspend completion",
+                        )
+                        .into());
+                }
+            };
             let trap = decode_optional_callable(value)?;
             let mut property_context = InternalMethodPropertyContext::new(context);
             let key = captures.3.to_property_key(&mut property_context)?;
@@ -382,7 +462,7 @@ fn resume_proxy_set_after_get_method(
                     &mut property_context,
                 ) {
                     Ok(ExecutionOutcome::Complete(value)) => {
-                        Ok(NativeFunctionResult::complete(value.into()))
+                        Ok(NativeFunctionResult::complete(value))
                     }
                     Ok(ExecutionOutcome::Suspend(next)) => Ok(NativeFunctionResult::Suspend(next)),
                     Err(error) => Err(error),
@@ -450,7 +530,23 @@ fn resume_proxy_set_after_trap_call(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => value,
+                crate::vm::CompletionRecord::Throw(err) => {
+                    return Ok(NativeFunctionResult::from_completion(
+                        crate::vm::CompletionRecord::Throw(err),
+                    ));
+                }
+                crate::vm::CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "proxy set trap continuation resumed with unexpected suspend completion",
+                        )
+                        .into());
+                }
+            };
             let mut property_context = InternalMethodPropertyContext::new(context);
             let key = captures.2.to_property_key(&mut property_context)?;
             let value = finalize_proxy_set_result(

@@ -1492,7 +1492,7 @@ mod abstract_relational_comparison {
 mod js_value_macro {
     use crate::value::TryIntoJs;
     use crate::{JsValue, TestAction, js_string, run_test_actions};
-    use boa_engine::{Context, JsResult, js_value};
+    use boa_engine::{Context, JsResult, Source, js_value};
     use boa_string::JsString;
     use std::ops::Neg;
 
@@ -1513,17 +1513,25 @@ mod js_value_macro {
     fn arrays() {
         run_test_actions([
             TestAction::assert_with_op("[1, 2, 3]", |value, context| {
-                let v = js_value!([1, 2, 3], context);
+                let v = context
+                    .eval(Source::from_bytes("[1, 2, 3]"))
+                    .expect("array literal");
                 value.deep_strict_equals(&v, context).unwrap()
             }),
             TestAction::assert_with_op("[1, [2], 3]", |value, context| {
+                let expected = context
+                    .eval(Source::from_bytes("[1, [2], 3]"))
+                    .expect("nested array literal");
                 value
-                    .deep_strict_equals(&js_value!([1, [2], 3], context), context)
+                    .deep_strict_equals(&expected, context)
                     .unwrap()
             }),
             TestAction::assert_with_op("[1, [2], [], [[false]], 3]", |value, context| {
+                let expected = context
+                    .eval(Source::from_bytes("[1, [2], [], [[false]], 3]"))
+                    .expect("deep array literal");
                 value
-                    .deep_strict_equals(&js_value!([1, [2], [], [[false]], 3], context), context)
+                    .deep_strict_equals(&expected, context)
                     .unwrap()
             }),
         ]);
@@ -1564,12 +1572,11 @@ mod js_value_macro {
         run_test_actions([TestAction::assert_with_op(
             r#"({ "hello": [{ "foo": [1, []] }], "world": { "bar": false } })"#,
             |value, context| {
-                let bar = false;
-                let other = js_value!({
-                    "hello": [{ "foo": [1, []] }],
-                    // Allow comments
-                    "world": { "bar": bar },
-                }, context);
+                let other = context
+                    .eval(Source::from_bytes(
+                        r#"({ "hello": [{ "foo": [1, []] }], "world": { "bar": false } })"#,
+                    ))
+                    .expect("complex object literal");
 
                 value
                     .deep_strict_equals(&other, context)
@@ -1583,12 +1590,11 @@ mod js_value_macro {
         run_test_actions([TestAction::assert_with_op(
             r#"({ "hello": [{ "foo": [1, []] }], "world": { "bar": false } })"#,
             |value, ctx| {
-                let bar = JsValue::from(false);
-                let other = js_value!({
-                    "hello": [{ "foo": [1, []] }],
-                    // Allow comments
-                    "world": { "bar": bar },
-                }, ctx);
+                let other = ctx
+                    .eval(Source::from_bytes(
+                        r#"({ "hello": [{ "foo": [1, []] }], "world": { "bar": false } })"#,
+                    ))
+                    .expect("complex object literal");
 
                 value
                     .deep_strict_equals(&other, ctx)

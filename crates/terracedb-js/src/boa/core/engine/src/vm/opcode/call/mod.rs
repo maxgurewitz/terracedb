@@ -27,10 +27,19 @@ fn resume_call_operation(
     context: &mut Context,
 ) -> crate::JsResult<NativeFunctionResult> {
     match continuation.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
-            context.vm.stack.push(value);
-            context.continue_interruptible_vm()
-        }
+        NativeFunctionResult::Complete(record) => match record {
+            crate::vm::CompletionRecord::Normal(value)
+            | crate::vm::CompletionRecord::Return(value) => {
+                context.vm.stack.push(value);
+                context.continue_interruptible_vm()
+            }
+            crate::vm::CompletionRecord::Throw(err) => {
+                context.continue_interruptible_vm_with_throw(err)
+            }
+            crate::vm::CompletionRecord::Suspend => Err(crate::JsNativeError::error()
+                .with_message("call continuation resumed with unexpected suspend completion")
+                .into()),
+        },
         NativeFunctionResult::Suspend(next) => {
             Ok(NativeFunctionResult::Suspend(wrap_call_resume(next)))
         }

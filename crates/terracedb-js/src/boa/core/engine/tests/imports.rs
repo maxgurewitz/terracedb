@@ -31,6 +31,7 @@ fn subdirectories() {
 
             let foo_value = module
                 .namespace(&mut context)
+                .unwrap()
                 .get(js_string!("file1"), &mut context)
                 .unwrap()
                 .as_callable()

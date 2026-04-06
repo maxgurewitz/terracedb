@@ -33,7 +33,6 @@ pub(crate) use {
     code_block::{
         CodeBlockFlags, Constant, Handler, create_function_object, create_function_object_fast,
     },
-    completion_record::CompletionRecord,
     inline_cache::InlineCache,
 };
 
@@ -41,6 +40,7 @@ pub use runtime_limits::RuntimeLimits;
 pub use {
     call_frame::{CallFrame, GeneratorResumeKind},
     code_block::CodeBlock,
+    completion_record::CompletionRecord,
     source_info::{NativeSourceInfo, SourcePath},
 };
 

@@ -37,9 +37,9 @@ fn resume_script_suspend(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match continuation.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
+        NativeFunctionResult::Complete(record) => {
             context.vm.pop_frame();
-            Ok(NativeFunctionResult::complete(value))
+            Ok(NativeFunctionResult::from_completion(record))
         }
         NativeFunctionResult::Suspend(next) => {
             Ok(NativeFunctionResult::Suspend(wrap_script_suspend(next)))

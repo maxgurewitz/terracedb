@@ -18,10 +18,16 @@ fn resume_has_property_operation(
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
-            context.vm.set_register(captures.1, value);
-            context.continue_interruptible_vm()
-        }
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(value) | CompletionRecord::Return(value) => {
+                context.vm.set_register(captures.1, value);
+                context.continue_interruptible_vm()
+            }
+            CompletionRecord::Throw(err) => context.continue_interruptible_vm_with_throw(err),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("binary op continuation resumed with unexpected suspend completion")
+                .into()),
+        },
         NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
             wrap_has_property_resume(next, captures.1),
         )),

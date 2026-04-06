@@ -1,4 +1,5 @@
 use super::internal_methods::InternalMethodPropertyContext;
+use crate::context::interrupt_trace;
 use crate::js_error;
 use crate::value::JsVariant;
 use crate::{
@@ -32,15 +33,25 @@ fn resume_get_method(
     context: &mut Context,
 ) -> JsResult<crate::native_function::NativeFunctionResult> {
     match continuation.call(completion, context)? {
-        crate::native_function::NativeFunctionResult::Value(func) => match func.variant() {
-            JsVariant::Undefined | JsVariant::Null => {
-                Ok(crate::native_function::NativeFunctionResult::complete(JsValue::undefined()))
-            }
-            JsVariant::Object(obj) if obj.is_callable() => Ok(
-                crate::native_function::NativeFunctionResult::complete(obj.clone().into()),
+        crate::native_function::NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(func) | CompletionRecord::Return(func) => match func.variant() {
+                JsVariant::Undefined | JsVariant::Null => Ok(
+                    crate::native_function::NativeFunctionResult::complete(JsValue::undefined()),
+                ),
+                JsVariant::Object(obj) if obj.is_callable() => Ok(
+                    crate::native_function::NativeFunctionResult::complete(obj.clone()),
+                ),
+                _ => Err(JsNativeError::typ()
+                    .with_message("value returned for property of object is not a function")
+                    .into()),
+            },
+            CompletionRecord::Throw(err) => Ok(
+                crate::native_function::NativeFunctionResult::from_completion(
+                    CompletionRecord::Throw(err),
+                ),
             ),
-            _ => Err(JsNativeError::typ()
-                .with_message("value returned for property of object is not a function")
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("get method continuation resumed with unexpected suspend completion")
                 .into()),
         },
         crate::native_function::NativeFunctionResult::Suspend(next) => Ok(
@@ -86,9 +97,9 @@ fn resume_running_call_suspend(
     context: &mut Context,
 ) -> JsResult<crate::native_function::NativeFunctionResult> {
     match continuation.call(completion, context)? {
-        crate::native_function::NativeFunctionResult::Value(value) => {
+        crate::native_function::NativeFunctionResult::Complete(record) => {
             context.vm.pop_frame().js_expect("frame must exist")?;
-            Ok(crate::native_function::NativeFunctionResult::complete(value))
+            Ok(crate::native_function::NativeFunctionResult::from_completion(record))
         }
         crate::native_function::NativeFunctionResult::Suspend(next) => Ok(
             crate::native_function::NativeFunctionResult::Suspend(wrap_running_call_suspend(next)),
@@ -142,11 +153,13 @@ impl JsObject {
     where
         K: Into<PropertyKey>,
     {
+        let key = key.into();
+        interrupt_trace(|| format!("JsObject::get key={key}"));
         // 1. Assert: Type(O) is Object.
         // 2. Assert: IsPropertyKey(P) is true.
         // 3. Return ? O.[[Get]](P, O).
         self.__get__(
-            &key.into(),
+            &key,
             self.clone().into(),
             &mut InternalMethodPropertyContext::new(context),
         )

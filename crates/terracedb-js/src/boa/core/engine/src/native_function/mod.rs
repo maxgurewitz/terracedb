@@ -23,6 +23,7 @@ use crate::{
         },
     },
     realm::Realm,
+    vm::CompletionRecord,
 };
 
 mod continuation;
@@ -179,7 +180,7 @@ enum Inner {
 
 #[derive(Clone)]
 pub enum NativeFunctionResult {
-    Value(JsValue),
+    Complete(CompletionRecord),
     Suspend(NativeResume),
 }
 
@@ -189,7 +190,13 @@ trait IntoNativeFunctionResult {
 
 impl IntoNativeFunctionResult for JsValue {
     fn into_native_function_result(self) -> NativeFunctionResult {
-        NativeFunctionResult::Value(self)
+        NativeFunctionResult::complete(self)
+    }
+}
+
+impl IntoNativeFunctionResult for CompletionRecord {
+    fn into_native_function_result(self) -> NativeFunctionResult {
+        NativeFunctionResult::from_completion(self)
     }
 }
 
@@ -266,31 +273,14 @@ impl NativeFunction {
 
     fn suspend_with_copy_closure<F, T, R>(resume: F, captures: T) -> NativeFunctionResult
     where
-        F: Fn(Result<(), crate::JsError>, &T, &mut Context) -> JsResult<R> + Copy + 'static,
+        F: Fn(crate::vm::CompletionRecord, &T, &mut Context) -> JsResult<R> + Copy + 'static,
         R: IntoNativeFunctionResult,
         T: Trace + 'static,
     {
         NativeFunctionResult::Suspend(NativeResume::from_copy_closure_with_captures(
             move |completion, captures, context| {
-                let completion = match completion {
-                    crate::vm::CompletionRecord::Normal(_) => Ok(()),
-                    crate::vm::CompletionRecord::Throw(error) => Err(error),
-                    crate::vm::CompletionRecord::Return(_) => Err(
-                        JsNativeError::error()
-                            .with_message(
-                                "native suspend continuation resumed with unexpected return",
-                            )
-                            .into(),
-                    ),
-                    crate::vm::CompletionRecord::Suspend => Err(
-                        JsNativeError::error()
-                            .with_message(
-                                "native suspend continuation resumed with unexpected suspension",
-                            )
-                            .into(),
-                    ),
-                };
-                resume(completion, captures, context).map(IntoNativeFunctionResult::into_native_function_result)
+                resume(completion, captures, context)
+                    .map(IntoNativeFunctionResult::into_native_function_result)
             },
             captures,
         ))
@@ -500,7 +490,7 @@ impl NativeFunction {
         context: &mut Context,
     ) -> JsResult<JsValue> {
         match self.call_result(this, args, context)? {
-            NativeFunctionResult::Value(value) => Ok(value),
+            NativeFunctionResult::Complete(record) => record.consume(),
             NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
                 .with_message("suspendable native function requires interruptible execution")
                 .into()),
@@ -515,9 +505,9 @@ impl NativeFunction {
         context: &mut Context,
     ) -> JsResult<NativeFunctionResult> {
         match self.inner {
-            Inner::PointerFn(f) => f(this, args, context).map(NativeFunctionResult::Value),
+            Inner::PointerFn(f) => f(this, args, context).map(NativeFunctionResult::complete),
             Inner::SuspendPointerFn(f) => f(this, args, context),
-            Inner::Closure(ref c) => c.call(this, args, context).map(NativeFunctionResult::Value),
+            Inner::Closure(ref c) => c.call(this, args, context).map(NativeFunctionResult::complete),
             Inner::SuspendClosure(ref c) => c.call(this, args, context),
         }
     }
@@ -537,13 +527,17 @@ impl NativeFunction {
 }
 
 impl NativeFunctionResult {
-    pub fn complete(value: JsValue) -> Self {
-        Self::Value(value)
+    pub fn complete(value: impl Into<JsValue>) -> Self {
+        Self::Complete(CompletionRecord::Normal(value.into()))
+    }
+
+    pub fn from_completion(record: CompletionRecord) -> Self {
+        Self::Complete(record)
     }
 
     pub fn suspend_with_copy_closure<F, T, R>(resume: F, captures: T) -> Self
     where
-        F: Fn(Result<(), crate::JsError>, &T, &mut Context) -> JsResult<R> + Copy + 'static,
+        F: Fn(crate::vm::CompletionRecord, &T, &mut Context) -> JsResult<R> + Copy + 'static,
         R: IntoNativeFunctionResult,
         T: Trace + 'static,
     {
@@ -609,8 +603,8 @@ pub(crate) fn native_function_call(
     context.vm.shadow_stack.pop();
 
     match result? {
-        NativeFunctionResult::Value(value) => {
-            context.vm.stack.push(value);
+        NativeFunctionResult::Complete(record) => {
+            context.vm.stack.push(record.consume()?);
             Ok(CallValue::Complete)
         }
         NativeFunctionResult::Suspend(continuation) => Ok(CallValue::Suspended(continuation)),
@@ -667,13 +661,25 @@ fn native_function_construct(
         .call_result(&new_target, &args, context)
         .map_err(|err| err.inject_realm(context.realm().clone()))
         .and_then(|result| match result {
-            NativeFunctionResult::Value(v) => native_construct_result_to_object(
-                &new_target,
-                constructor.expect("must be a constructor"),
-                v,
-                context,
-            )
-            .map(NativeFunctionResult::Value),
+            NativeFunctionResult::Complete(record) => match record {
+                CompletionRecord::Normal(v) | CompletionRecord::Return(v) => {
+                    native_construct_result_to_object(
+                        &new_target,
+                        constructor.expect("must be a constructor"),
+                        v,
+                        context,
+                    )
+                    .map(NativeFunctionResult::complete)
+                }
+                CompletionRecord::Throw(err) => {
+                    Ok(NativeFunctionResult::from_completion(CompletionRecord::Throw(err)))
+                }
+                CompletionRecord::Suspend => Err(
+                    JsNativeError::error()
+                        .with_message("native constructor resumed with unexpected suspension")
+                        .into(),
+                ),
+            },
             NativeFunctionResult::Suspend(continuation) => {
                 let constructor_kind = constructor.expect("must be a constructor");
                 let new_target = new_target.clone();
@@ -681,15 +687,36 @@ fn native_function_construct(
                     NativeResume::from_copy_closure_with_captures(
                         move |completion, captures, context| {
                             let result = captures.0.call(completion, context)?;
-                            let NativeFunctionResult::Value(value) = result else {
-                                return Ok(result);
-                            };
-                            Ok(NativeFunctionResult::complete(native_construct_result_to_object(
-                                &captures.1,
-                                constructor_kind,
-                                value,
-                                context,
-                            )?))
+                            match result {
+                                NativeFunctionResult::Complete(record) => match record {
+                                    CompletionRecord::Normal(value)
+                                    | CompletionRecord::Return(value) => Ok(
+                                        NativeFunctionResult::complete(
+                                            native_construct_result_to_object(
+                                                &captures.1,
+                                                constructor_kind,
+                                                value,
+                                                context,
+                                            )?,
+                                        ),
+                                    ),
+                                    CompletionRecord::Throw(err) => Ok(
+                                        NativeFunctionResult::from_completion(
+                                            CompletionRecord::Throw(err),
+                                        ),
+                                    ),
+                                    CompletionRecord::Suspend => Err(
+                                        JsNativeError::error()
+                                            .with_message(
+                                                "native constructor continuation resumed with unexpected suspension",
+                                            )
+                                            .into(),
+                                    ),
+                                },
+                                NativeFunctionResult::Suspend(next) => {
+                                    Ok(NativeFunctionResult::Suspend(next))
+                                }
+                            }
                         },
                         (continuation, new_target),
                     ),
@@ -703,8 +730,8 @@ fn native_function_construct(
     context.vm.shadow_stack.pop();
 
     match result? {
-        NativeFunctionResult::Value(value) => {
-            context.vm.stack.push(value);
+        NativeFunctionResult::Complete(record) => {
+            context.vm.stack.push(record.consume()?);
             Ok(CallValue::Complete)
         }
         NativeFunctionResult::Suspend(continuation) => Ok(CallValue::Suspended(continuation)),

@@ -31,13 +31,19 @@ fn resume_get_into_register(
     context: &mut Context,
 ) -> crate::JsResult<NativeFunctionResult> {
     match captures.0.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
-            if let Some((key, key_value)) = &captures.2 {
-                context.vm.set_register(*key, key_value.clone());
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(value) | CompletionRecord::Return(value) => {
+                if let Some((key, key_value)) = &captures.2 {
+                    context.vm.set_register(*key, key_value.clone());
+                }
+                context.vm.set_register(captures.1, value);
+                context.continue_interruptible_vm()
             }
-            context.vm.set_register(captures.1, value);
-            context.continue_interruptible_vm()
-        }
+            CompletionRecord::Throw(err) => context.continue_interruptible_vm_with_throw(err),
+            CompletionRecord::Suspend => Err(crate::JsNativeError::error()
+                .with_message("get property continuation resumed with unexpected suspend completion")
+                .into()),
+        },
         NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
             wrap_get_resume(next, captures.1, captures.2.clone()),
         )),

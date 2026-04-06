@@ -4,6 +4,7 @@ use crate::{
     Context, JsResult, JsValue,
     context::ExecutionOutcome,
     error::JsNativeError,
+    native_function::{NativeFunctionResult, NativeResume},
     object::{
         InterruptibleCallOutcome,
         internal_methods::InternalMethodPropertyContext,
@@ -12,6 +13,32 @@ use crate::{
     property::PropertyKey,
     vm::{CompletionRecord, opcode::{IndexOperand, Operation, RegisterOperand}},
 };
+
+fn wrap_get_name_resume(continuation: NativeResume, dst: usize) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_get_name, (continuation, dst))
+}
+
+fn resume_get_name(
+    completion: CompletionRecord,
+    captures: &(NativeResume, usize),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match captures.0.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(value) | CompletionRecord::Return(value) => {
+                context.vm.set_register(captures.1, value);
+                context.continue_interruptible_vm()
+            }
+            CompletionRecord::Throw(err) => context.continue_interruptible_vm_with_throw(err),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("get name continuation resumed with unexpected suspend completion")
+                .into()),
+        },
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_get_name_resume(next, captures.1),
+        )),
+    }
+}
 
 /// `GetName` implements the Opcode Operation for `Opcode::GetName`
 ///
@@ -87,7 +114,10 @@ impl GetNameGlobal {
                     {
                         Ok(InterruptibleCallOutcome::Complete(value)) => result = value,
                         Ok(InterruptibleCallOutcome::Suspend(continuation)) => {
-                            context.install_interruptible_resume(continuation);
+                            context.install_interruptible_resume(wrap_get_name_resume(
+                                continuation,
+                                usize::from(dst),
+                            ));
                             return ControlFlow::Break(CompletionRecord::Suspend);
                         }
                         Err(error) => return context.handle_error(error),
@@ -105,7 +135,10 @@ impl GetNameGlobal {
             let result = match object.__try_get_interruptible__(&key, object.clone().into(), context) {
                 Ok(ExecutionOutcome::Complete(result)) => result,
                 Ok(ExecutionOutcome::Suspend(continuation)) => {
-                    context.install_interruptible_resume(continuation);
+                    context.install_interruptible_resume(wrap_get_name_resume(
+                        continuation,
+                        usize::from(dst),
+                    ));
                     return ControlFlow::Break(CompletionRecord::Suspend);
                 }
                 Err(error) => return context.handle_error(error),

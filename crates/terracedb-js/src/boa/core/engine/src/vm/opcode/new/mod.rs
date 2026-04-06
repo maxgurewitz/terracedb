@@ -18,10 +18,16 @@ fn resume_construct_operation(
     context: &mut Context,
 ) -> crate::JsResult<NativeFunctionResult> {
     match continuation.call(completion, context)? {
-        NativeFunctionResult::Value(value) => {
-            context.vm.stack.push(value);
-            context.continue_interruptible_vm()
-        }
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(value) | CompletionRecord::Return(value) => {
+                context.vm.stack.push(value);
+                context.continue_interruptible_vm()
+            }
+            CompletionRecord::Throw(err) => context.continue_interruptible_vm_with_throw(err),
+            CompletionRecord::Suspend => Err(crate::error::JsNativeError::error()
+                .with_message("construct continuation resumed with unexpected suspend completion")
+                .into()),
+        },
         NativeFunctionResult::Suspend(next) => {
             Ok(NativeFunctionResult::Suspend(wrap_construct_resume(next)))
         }

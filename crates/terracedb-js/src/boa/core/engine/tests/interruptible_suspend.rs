@@ -3,6 +3,7 @@ use boa_engine::{
     native_function::NativeFunctionResult,
     object::InterruptibleCallOutcome,
     script::Script,
+    vm::CompletionRecord,
 };
 use indoc::indoc;
 
@@ -19,12 +20,15 @@ fn suspend_once(
 }
 
 fn resume_suspended_value(
-    completion: Result<(), JsError>,
+    completion: CompletionRecord,
     value: &JsValue,
     _context: &mut Context,
 ) -> JsResult<JsValue> {
-    completion?;
-    Ok(value.clone())
+    match completion {
+        CompletionRecord::Normal(_) | CompletionRecord::Return(_) => Ok(value.clone()),
+        CompletionRecord::Throw(err) => Err(err),
+        CompletionRecord::Suspend => unreachable!("resume callback cannot receive suspend"),
+    }
 }
 
 fn install_suspend_once(context: &mut Context) {
