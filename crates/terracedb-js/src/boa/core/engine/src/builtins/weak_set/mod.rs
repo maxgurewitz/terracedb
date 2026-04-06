@@ -12,7 +12,7 @@ use crate::{
     builtins::{BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject},
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     js_error, js_string,
-    object::{ErasedVTableObject, JsObject, internal_methods::get_prototype_from_constructor},
+    object::{InterruptibleCallOutcome, ErasedVTableObject, JsObject, internal_methods::get_prototype_from_constructor},
     property::Attribute,
     realm::Realm,
     string::StaticJsStrings,
@@ -113,9 +113,17 @@ impl BuiltInConstructor for WeakSet {
         //     a. Let next be ? IteratorStepValue(iteratorRecord).
         while let Some(next) = iterator_record.step_value(context)? {
             //     c. Let status be Completion(Call(adder, set, « next »)).
-            if let Err(status) = adder.call(&weak_set.clone().into(), &[next], context) {
-                //     d. IfAbruptCloseIterator(status, iteratorRecord).
-                return iterator_record.close(Err(status), context);
+            match adder.call_interruptible(&weak_set.clone().into(), &[next], context)? {
+                InterruptibleCallOutcome::Complete(_) => {}
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return iterator_record.close(
+                        Err(js_error!(
+                            TypeError:
+                                "suspendable WeakSet constructor requires interruptible execution"
+                        )),
+                        context,
+                    );
+                }
             }
         }
 

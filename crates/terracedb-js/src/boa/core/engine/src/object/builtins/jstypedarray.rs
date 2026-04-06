@@ -7,6 +7,7 @@ use crate::{
         typed_array::{BuiltinTypedArray, TypedArray, TypedArrayKind},
     },
     error::JsNativeError,
+    native_function::NativeFunctionResult,
     object::{JsArrayBuffer, JsFunction, JsObject, JsSharedArrayBuffer},
     value::{IntoOrUndefined, TryFromJs},
 };
@@ -22,6 +23,18 @@ pub struct JsTypedArray {
 }
 
 impl JsTypedArray {
+    fn consume_interruptible_result(
+        result: NativeFunctionResult,
+        message: &'static str,
+    ) -> JsResult<JsValue> {
+        match result {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message(message)
+                .into()),
+        }
+    }
+
     /// Create a [`JsTypedArray`] from a [`JsObject`], if the object is not a typed array throw a
     /// `TypeError`.
     ///
@@ -239,15 +252,30 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<bool> {
-        let result = BuiltinTypedArray::every(
-            &self.inner.clone().into(),
-            &[predicate.into(), this_arg.into_or_undefined()],
-            context,
+        let result = Self::consume_interruptible_result(
+            self.every_interruptible(predicate, this_arg, context)?,
+            "suspendable TypedArray.prototype.every requires interruptible execution",
         )?
         .as_boolean()
         .js_expect("TypedArray.prototype.every should always return boolean")?;
 
         Ok(result)
+    }
+
+    /// Calls `TypedArray.prototype.every()` preserving suspension.
+    #[inline]
+    pub fn every_interruptible(
+        &self,
+        predicate: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        BuiltinTypedArray::every(
+            &self.inner.clone().into(),
+            &[predicate.into(), this_arg.into_or_undefined()],
+            context,
+        )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Calls `TypedArray.prototype.some()`.
@@ -258,15 +286,30 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<bool> {
-        let result = BuiltinTypedArray::some(
-            &self.inner.clone().into(),
-            &[callback.into(), this_arg.into_or_undefined()],
-            context,
+        let result = Self::consume_interruptible_result(
+            self.some_interruptible(callback, this_arg, context)?,
+            "suspendable TypedArray.prototype.some requires interruptible execution",
         )?
         .as_boolean()
         .js_expect("TypedArray.prototype.some should always return boolean")?;
 
         Ok(result)
+    }
+
+    /// Calls `TypedArray.prototype.some()` preserving suspension.
+    #[inline]
+    pub fn some_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        BuiltinTypedArray::some(
+            &self.inner.clone().into(),
+            &[callback.into(), this_arg.into_or_undefined()],
+            context,
+        )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Calls `TypedArray.prototype.sort()`.
@@ -347,17 +390,37 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<Self> {
-        let object = BuiltinTypedArray::filter(
+        let object = match self.filter_interruptible(callback, this_arg, context)? {
+            NativeFunctionResult::Complete(record) => record
+                .consume()?
+                .as_object()
+                .js_expect("`filter` must always return a `TypedArray` on success")?,
+            NativeFunctionResult::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("suspendable TypedArray.prototype.filter requires interruptible execution")
+                    .into())
+            }
+        };
+
+        Ok(Self {
+            inner: object,
+        })
+    }
+
+    /// Calls `TypedArray.prototype.filter()` preserving suspension.
+    #[inline]
+    pub fn filter_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        BuiltinTypedArray::filter(
             &self.inner.clone().into(),
             &[callback.into(), this_arg.into_or_undefined()],
             context,
-        )?;
-
-        Ok(Self {
-            inner: object
-                .as_object()
-                .js_expect("`filter` must always return a `TypedArray` on success")?,
-        })
+        )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Calls `TypedArray.prototype.map()`.
@@ -368,17 +431,37 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<Self> {
-        let object = BuiltinTypedArray::map(
+        let object = match self.map_interruptible(callback, this_arg, context)? {
+            NativeFunctionResult::Complete(record) => record
+                .consume()?
+                .as_object()
+                .js_expect("`map` must always return a `TypedArray` on success")?,
+            NativeFunctionResult::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("suspendable TypedArray.prototype.map requires interruptible execution")
+                    .into())
+            }
+        };
+
+        Ok(Self {
+            inner: object,
+        })
+    }
+
+    /// Calls `TypedArray.prototype.map()` preserving suspension.
+    #[inline]
+    pub fn map_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        BuiltinTypedArray::map(
             &self.inner.clone().into(),
             &[callback.into(), this_arg.into_or_undefined()],
             context,
-        )?;
-
-        Ok(Self {
-            inner: object
-                .as_object()
-                .js_expect("`map` must always return a `TypedArray` on success")?,
-        })
+        )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Calls `TypedArray.prototype.reduce()`.
@@ -389,11 +472,28 @@ impl JsTypedArray {
         initial_value: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
+        match self.reduce_interruptible(callback, initial_value, context)? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable TypedArray.prototype.reduce requires interruptible execution")
+                .into()),
+        }
+    }
+
+    /// Calls `TypedArray.prototype.reduce()` preserving suspension.
+    #[inline]
+    pub fn reduce_interruptible(
+        &self,
+        callback: JsFunction,
+        initial_value: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         BuiltinTypedArray::reduce(
             &self.inner.clone().into(),
             &[callback.into(), initial_value.into_or_undefined()],
             context,
         )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Calls `TypedArray.prototype.reduceRight()`.
@@ -404,11 +504,28 @@ impl JsTypedArray {
         initial_value: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
+        match self.reduce_right_interruptible(callback, initial_value, context)? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable TypedArray.prototype.reduceRight requires interruptible execution")
+                .into()),
+        }
+    }
+
+    /// Calls `TypedArray.prototype.reduceRight()` preserving suspension.
+    #[inline]
+    pub fn reduce_right_interruptible(
+        &self,
+        callback: JsFunction,
+        initial_value: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         BuiltinTypedArray::reduceright(
             &self.inner.clone().into(),
             &[callback.into(), initial_value.into_or_undefined()],
             context,
         )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Calls `TypedArray.prototype.reverse()`.
@@ -493,11 +610,28 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
+        match self.find_interruptible(predicate, this_arg, context)? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable TypedArray.prototype.find requires interruptible execution")
+                .into()),
+        }
+    }
+
+    /// Calls `TypedArray.prototype.find()` preserving suspension.
+    #[inline]
+    pub fn find_interruptible(
+        &self,
+        predicate: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         BuiltinTypedArray::find(
             &self.inner.clone().into(),
             &[predicate.into(), this_arg.into_or_undefined()],
             context,
         )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Returns the index of the first element in an array that satisfies the
@@ -543,19 +677,39 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<Option<u64>> {
-        let index = BuiltinTypedArray::find_index(
-            &self.inner.clone().into(),
-            &[predicate.into(), this_arg.into_or_undefined()],
-            context,
-        )?
-        .as_number()
-        .js_expect("TypedArray.prototype.findIndex() should always return number")?;
+        let index = match self.find_index_interruptible(predicate, this_arg, context)? {
+            NativeFunctionResult::Complete(record) => record
+                .consume()?
+                .as_number()
+                .js_expect("TypedArray.prototype.findIndex() should always return number")?,
+            NativeFunctionResult::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("suspendable TypedArray.prototype.findIndex requires interruptible execution")
+                    .into())
+            }
+        };
 
         if index >= 0.0 {
             Ok(Some(index as u64))
         } else {
             Ok(None)
         }
+    }
+
+    /// Calls `TypedArray.prototype.findIndex()` preserving suspension.
+    #[inline]
+    pub fn find_index_interruptible(
+        &self,
+        predicate: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        BuiltinTypedArray::find_index(
+            &self.inner.clone().into(),
+            &[predicate.into(), this_arg.into_or_undefined()],
+            context,
+        )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Iterates the typed array in reverse order and returns the value of
@@ -601,11 +755,28 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
+        match self.find_last_interruptible(predicate, this_arg, context)? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable TypedArray.prototype.findLast requires interruptible execution")
+                .into()),
+        }
+    }
+
+    /// Calls `TypedArray.prototype.findLast()` preserving suspension.
+    #[inline]
+    pub fn find_last_interruptible(
+        &self,
+        predicate: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         BuiltinTypedArray::find_last(
             &self.inner.clone().into(),
             &[predicate.into(), this_arg.into_or_undefined()],
             context,
         )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Iterates the typed array in reverse order and returns the index of
@@ -651,19 +822,39 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<Option<u64>> {
-        let index = BuiltinTypedArray::find_last_index(
-            &self.inner.clone().into(),
-            &[predicate.into(), this_arg.into_or_undefined()],
-            context,
-        )?
-        .as_number()
-        .js_expect("TypedArray.prototype.findLastIndex() should always return number")?;
+        let index = match self.find_last_index_interruptible(predicate, this_arg, context)? {
+            NativeFunctionResult::Complete(record) => record
+                .consume()?
+                .as_number()
+                .js_expect("TypedArray.prototype.findLastIndex() should always return number")?,
+            NativeFunctionResult::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("suspendable TypedArray.prototype.findLastIndex requires interruptible execution")
+                    .into())
+            }
+        };
 
         if index >= 0.0 {
             Ok(Some(index as u64))
         } else {
             Ok(None)
         }
+    }
+
+    /// Calls `TypedArray.prototype.findLastIndex()` preserving suspension.
+    #[inline]
+    pub fn find_last_index_interruptible(
+        &self,
+        predicate: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        BuiltinTypedArray::find_last_index(
+            &self.inner.clone().into(),
+            &[predicate.into(), this_arg.into_or_undefined()],
+            context,
+        )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Executes a provided function once for each typed array element.
@@ -712,11 +903,28 @@ impl JsTypedArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
+        match self.for_each_interruptible(callback, this_arg, context)? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable TypedArray.prototype.forEach requires interruptible execution")
+                .into()),
+        }
+    }
+
+    /// Calls `TypedArray.prototype.forEach()` preserving suspension.
+    #[inline]
+    pub fn for_each_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         BuiltinTypedArray::for_each(
             &self.inner.clone().into(),
             &[callback.into(), this_arg.into_or_undefined()],
             context,
         )
+        .map(NativeFunctionResult::complete)
     }
 
     /// Determines whether a typed array includes a certain value among its entries,

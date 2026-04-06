@@ -1,9 +1,10 @@
 use crate::{
-    Context, JsResult, JsString, JsValue,
+    Context, JsNativeError, JsResult, JsString, JsValue,
     builtins::{Promise, promise::OperationType},
+    context::ExecutionOutcome,
     context::intrinsics::Intrinsics,
     job::JobCallback,
-    object::{JsFunction, JsObject},
+    object::{InterruptibleCallOutcome, JsFunction, JsObject},
     realm::Realm,
 };
 use time::{OffsetDateTime, UtcOffset};
@@ -87,12 +88,28 @@ pub trait HostHooks {
         args: &[JsValue],
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        // The default implementation of HostCallJobCallback performs the following steps when called:
+        match self.call_job_callback_interruptible(job, this, args, context)? {
+            InterruptibleCallOutcome::Complete(value) => Ok(value),
+            InterruptibleCallOutcome::Suspend(_) => Err(JsNativeError::error()
+                .with_message("job callback suspended during synchronous execution")
+                .into()),
+        }
+    }
 
+    #[cfg_attr(feature = "native-backtrace", track_caller)]
+    fn call_job_callback_interruptible(
+        &self,
+        job: &JobCallback,
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<InterruptibleCallOutcome<JsValue>> {
+        // The default implementation of HostCallJobCallback performs the following steps when called:
+        //
         // 1. Assert: IsCallable(jobCallback.[[Callback]]) is true.
         // already asserted by `Call`.
-        // 2. Return ? Call(jobCallback.[[Callback]], V, argumentsList).
-        job.callback().call(this, args, context)
+        // 2. Return ? Call(jobCallback.[[Callback]], V, argumentsList).
+        job.callback().call_interruptible(this, args, context)
     }
 
     /// [`HostPromiseRejectionTracker ( promise, operation )`][spec]
@@ -109,7 +126,21 @@ pub trait HostHooks {
         _operation: OperationType,
         _context: &mut Context,
     ) {
+        let result =
+            self.promise_rejection_tracker_interruptible(_promise, _operation, _context);
+        if let Ok(ExecutionOutcome::Complete(())) = result {
+            return;
+        }
+    }
+
+    fn promise_rejection_tracker_interruptible(
+        &self,
+        _promise: &JsObject<Promise>,
+        _operation: OperationType,
+        _context: &mut Context,
+    ) -> JsResult<ExecutionOutcome<()>> {
         // The default implementation of HostPromiseRejectionTracker is to return unused.
+        Ok(ExecutionOutcome::Complete(()))
     }
 
     /// [`HostEnsureCanCompileStrings ( calleeRealm, parameterStrings, bodyString, direct )`][spec]

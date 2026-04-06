@@ -222,16 +222,27 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        match Array::find(
-            &self.inner.clone().into(),
-            &[predicate.into(), this_arg.into_or_undefined()],
-            context,
-        )? {
+        match self.find_interruptible(predicate, this_arg, context)? {
             NativeFunctionResult::Complete(record) => record.consume(),
             NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
                 .with_message("suspendable Array.prototype.find requires interruptible execution")
                 .into()),
         }
+    }
+
+    /// Calls `Array.prototype.find()` preserving suspension.
+    #[inline]
+    pub fn find_interruptible(
+        &self,
+        predicate: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        Array::find(
+            &self.inner.clone().into(),
+            &[predicate.into(), this_arg.into_or_undefined()],
+            context,
+        )
     }
 
     /// Calls `Array.prototype.filter()`.
@@ -242,11 +253,7 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<Self> {
-        let object = match Array::filter(
-            &self.inner.clone().into(),
-            &[callback.into(), this_arg.into_or_undefined()],
-            context,
-        )? {
+        let object = match self.filter_interruptible(callback, this_arg, context)? {
             NativeFunctionResult::Complete(record) => record
                 .consume()?
                 .as_object()
@@ -263,6 +270,21 @@ impl JsArray {
         Self::from_object(object)
     }
 
+    /// Calls `Array.prototype.filter()` preserving suspension.
+    #[inline]
+    pub fn filter_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        Array::filter(
+            &self.inner.clone().into(),
+            &[callback.into(), this_arg.into_or_undefined()],
+            context,
+        )
+    }
+
     /// Calls `Array.prototype.map()`.
     #[inline]
     pub fn map(
@@ -271,11 +293,7 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<Self> {
-        let object = match Array::map(
-            &self.inner.clone().into(),
-            &[callback.into(), this_arg.into_or_undefined()],
-            context,
-        )? {
+        let object = match self.map_interruptible(callback, this_arg, context)? {
             NativeFunctionResult::Complete(record) => record
                 .consume()?
                 .as_object()
@@ -290,6 +308,21 @@ impl JsArray {
         Self::from_object(object)
     }
 
+    /// Calls `Array.prototype.map()` preserving suspension.
+    #[inline]
+    pub fn map_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        Array::map(
+            &self.inner.clone().into(),
+            &[callback.into(), this_arg.into_or_undefined()],
+            context,
+        )
+    }
+
     /// Calls `Array.prototype.every()`.
     #[inline]
     pub fn every(
@@ -298,11 +331,7 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<bool> {
-        let result = match Array::every(
-            &self.inner.clone().into(),
-            &[callback.into(), this_arg.into_or_undefined()],
-            context,
-        )? {
+        let result = match self.every_interruptible(callback, this_arg, context)? {
             NativeFunctionResult::Complete(record) => record
                 .consume()?
                 .as_boolean()
@@ -317,6 +346,21 @@ impl JsArray {
         Ok(result)
     }
 
+    /// Calls `Array.prototype.every()` preserving suspension.
+    #[inline]
+    pub fn every_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        Array::every(
+            &self.inner.clone().into(),
+            &[callback.into(), this_arg.into_or_undefined()],
+            context,
+        )
+    }
+
     /// Calls `Array.prototype.some()`.
     #[inline]
     pub fn some(
@@ -325,11 +369,7 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<bool> {
-        let result = match Array::some(
-            &self.inner.clone().into(),
-            &[callback.into(), this_arg.into_or_undefined()],
-            context,
-        )? {
+        let result = match self.some_interruptible(callback, this_arg, context)? {
             NativeFunctionResult::Complete(record) => record
                 .consume()?
                 .as_boolean()
@@ -342,6 +382,21 @@ impl JsArray {
         };
 
         Ok(result)
+    }
+
+    /// Calls `Array.prototype.some()` preserving suspension.
+    #[inline]
+    pub fn some_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        Array::some(
+            &self.inner.clone().into(),
+            &[callback.into(), this_arg.into_or_undefined()],
+            context,
+        )
     }
 
     /// Calls `Array.prototype.sort()`.
@@ -435,16 +490,27 @@ impl JsArray {
         initial_value: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        match Array::reduce(
-            &self.inner.clone().into(),
-            &[callback.into(), initial_value.into_or_undefined()],
-            context,
-        )? {
+        match self.reduce_interruptible(callback, initial_value, context)? {
             NativeFunctionResult::Complete(record) => record.consume(),
             NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
                 .with_message("suspendable Array.prototype.reduce requires interruptible execution")
                 .into()),
         }
+    }
+
+    /// Calls `Array.prototype.reduce()` preserving suspension.
+    #[inline]
+    pub fn reduce_interruptible(
+        &self,
+        callback: JsFunction,
+        initial_value: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        Array::reduce(
+            &self.inner.clone().into(),
+            &[callback.into(), initial_value.into_or_undefined()],
+            context,
+        )
     }
 
     /// Calls `Array.prototype.reduceRight()`.
@@ -455,16 +521,27 @@ impl JsArray {
         initial_value: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        match Array::reduce_right(
-            &self.inner.clone().into(),
-            &[callback.into(), initial_value.into_or_undefined()],
-            context,
-        )? {
+        match self.reduce_right_interruptible(callback, initial_value, context)? {
             NativeFunctionResult::Complete(record) => record.consume(),
             NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
                 .with_message("suspendable Array.prototype.reduceRight requires interruptible execution")
                 .into()),
         }
+    }
+
+    /// Calls `Array.prototype.reduceRight()` preserving suspension.
+    #[inline]
+    pub fn reduce_right_interruptible(
+        &self,
+        callback: JsFunction,
+        initial_value: Option<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        Array::reduce_right(
+            &self.inner.clone().into(),
+            &[callback.into(), initial_value.into_or_undefined()],
+            context,
+        )
     }
 
     /// Calls `Array.prototype.toReversed`.

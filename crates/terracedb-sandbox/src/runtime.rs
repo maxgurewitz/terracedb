@@ -868,15 +868,30 @@ impl HostHooks for NodeRuntimeHostHooks {
         args: &[JsValue],
         context: &mut Context,
     ) -> JsResult<JsValue> {
+        match self.call_job_callback_interruptible(job, this, args, context)? {
+            InterruptibleCallOutcome::Complete(value) => Ok(value),
+            InterruptibleCallOutcome::Suspend(_) => Err(js_error(sandbox_execution_error(
+                "job callback suspended during synchronous execution",
+            ))),
+        }
+    }
+
+    fn call_job_callback_interruptible(
+        &self,
+        job: &JobCallback,
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<InterruptibleCallOutcome<JsValue>> {
         let Ok(host) = active_node_host() else {
-            return job.callback().call(this, args, context);
+            return job.callback().call_interruptible(this, args, context);
         };
         let trampoline = host.bootstrap.borrow().async_callback_trampoline.clone();
         let Some(trampoline) = trampoline else {
-            return job.callback().call(this, args, context);
+            return job.callback().call_interruptible(this, args, context);
         };
         let Some(trampoline) = JsValue::from(trampoline).as_callable() else {
-            return job.callback().call(this, args, context);
+            return job.callback().call_interruptible(this, args, context);
         };
         let state = job
             .host_defined()
@@ -891,7 +906,7 @@ impl HostHooks for NodeRuntimeHostHooks {
         trampoline_args.push(state.resource.clone());
         trampoline_args.push(JsValue::from(job.callback().clone()));
         trampoline_args.extend_from_slice(args);
-        trampoline.call(this, &trampoline_args, context)
+        trampoline.call_interruptible(this, &trampoline_args, context)
     }
 
     fn promise_rejection_tracker(
@@ -900,15 +915,24 @@ impl HostHooks for NodeRuntimeHostHooks {
         operation: OperationType,
         context: &mut Context,
     ) {
+        let _ = self.promise_rejection_tracker_interruptible(promise, operation, context);
+    }
+
+    fn promise_rejection_tracker_interruptible(
+        &self,
+        promise: &JsObject<Promise>,
+        operation: OperationType,
+        context: &mut Context,
+    ) -> JsResult<boa_engine::context::ExecutionOutcome<()>> {
         let Ok(host) = active_node_host() else {
-            return;
+            return Ok(boa_engine::context::ExecutionOutcome::Complete(()));
         };
         let callback = host.bootstrap.borrow().promise_reject_callback.clone();
         let Some(callback) = callback else {
-            return;
+            return Ok(boa_engine::context::ExecutionOutcome::Complete(()));
         };
         let Some(callable) = JsValue::from(callback).as_callable() else {
-            return;
+            return Ok(boa_engine::context::ExecutionOutcome::Complete(()));
         };
         let event_type = match operation {
             OperationType::Reject => 0.0,
@@ -921,7 +945,7 @@ impl HostHooks for NodeRuntimeHostHooks {
             },
             OperationType::Handle => JsValue::undefined(),
         };
-        let _ = callable.call(
+        match callable.call_interruptible(
             &JsValue::undefined(),
             &[
                 JsValue::from(event_type),
@@ -929,7 +953,14 @@ impl HostHooks for NodeRuntimeHostHooks {
                 reason,
             ],
             context,
-        );
+        )? {
+            InterruptibleCallOutcome::Complete(_) => {
+                Ok(boa_engine::context::ExecutionOutcome::Complete(()))
+            }
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                Ok(boa_engine::context::ExecutionOutcome::Suspend(continuation))
+            }
+        }
     }
 }
 
@@ -3725,9 +3756,9 @@ fn node_install_base_process_global(
     node_store_global(context, "process", JsValue::from(process_object))
 }
 
-fn node_prepare_process_for_bootstrap(
+async fn node_prepare_process_for_bootstrap(
     context: &mut Context,
-    host: &NodeRuntimeHost,
+    host: Rc<NodeRuntimeHost>,
     process: &JsValue,
     internal_binding: &JsValue,
 ) -> Result<(), SandboxError> {
@@ -3738,13 +3769,14 @@ fn node_prepare_process_for_bootstrap(
                 entrypoint: "<node-runtime>".to_string(),
                 message: "internalBinding is not callable".to_string(),
             })?;
-    let util_binding = internal_binding
-        .call(
+    let util_binding = node_drive_interruptible_value(context, host.clone(), |context| {
+        internal_binding.call_interruptible(
             &JsValue::undefined(),
             &[JsValue::from(JsString::from("util"))],
             context,
         )
-        .map_err(sandbox_execution_error)?;
+    })
+    .await?;
     let util_binding = util_binding
         .as_object()
         .ok_or_else(|| SandboxError::Execution {
@@ -3778,7 +3810,7 @@ fn node_prepare_process_for_bootstrap(
     process_object
         .set(exit_info_symbol, fields, true, context)
         .map_err(sandbox_execution_error)?;
-    node_debug_event(host, "bootstrap", "process-prepared".to_string())?;
+    node_debug_event(&host, "bootstrap", "process-prepared".to_string())?;
     Ok(())
 }
 
@@ -3827,7 +3859,7 @@ async fn node_execute_upstream_bootstrap_and_main_async(
             message: "primordials not initialized".to_string(),
         })?;
 
-    node_prepare_process_for_bootstrap(context, &host, &process, &internal_binding)?;
+    node_prepare_process_for_bootstrap(context, host.clone(), &process, &internal_binding).await?;
     node_debug_event(&host, "stage", "bootstrap-realm-done".to_string())?;
 
     for specifier in [
@@ -20094,10 +20126,41 @@ fn node_resume_builtins_compile_function(
     capture: &NodeBuiltinCompileResume,
     context: &mut Context,
 ) -> JsResult<NativeFunctionResult> {
+    if let Ok(host) = active_node_host() {
+        let _ = node_debug_event(
+            &host,
+            "builtin",
+            format!("compile_function resume specifier={}", capture.specifier),
+        );
+    }
     if let Some(completion) = node_resume_completion(completion)? {
+        if let Ok(host) = active_node_host() {
+            let _ = node_debug_event(
+                &host,
+                "builtin",
+                format!(
+                    "compile_function resume_completion specifier={} kind={:?}",
+                    capture.specifier, completion
+                ),
+            );
+        }
         return Ok(NativeFunctionResult::from_completion(completion));
     }
-    let source = match take_host_operation_completion_for_resume(capture.request_id).map_err(js_error)? {
+    let source = match take_host_operation_completion_for_resume(capture.request_id).map_err(
+        |error| {
+            if let Ok(host) = active_node_host() {
+                let _ = node_debug_event(
+                    &host,
+                    "builtin",
+                    format!(
+                        "compile_function completion_err specifier={}: {}",
+                        capture.specifier, error
+                    ),
+                );
+            }
+            js_error(error)
+        },
+    )? {
         NodeCompletedHostOperation::String(value) => value,
         other => return Err(node_unexpected_host_operation_result("string", &other)),
     };
@@ -24413,12 +24476,46 @@ fn node_finish_lazy_property_getter(
             ),
         );
     }
-    Ok(NativeFunctionResult::complete(
-        exports
-            .as_object()
-            .and_then(|exports| exports.get(capture.key.clone(), context).ok())
-            .unwrap_or_else(JsValue::undefined),
-    ))
+    let Some(exports) = exports.as_object() else {
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
+    };
+    match exports.get_interruptible(capture.key.clone(), context)? {
+        boa_engine::context::ExecutionOutcome::Complete(value) => {
+            Ok(NativeFunctionResult::complete(value))
+        }
+        boa_engine::context::ExecutionOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_lazy_property_getter_value,
+                (capture.clone(), continuation),
+            ),
+        ),
+    }
+}
+
+fn node_resume_util_lazy_property_getter_value(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &(NodeUtilLazyPropertyCapture, boa_engine::native_function::NativeResume),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let (capture, continuation) = capture;
+    if let Ok(host) = active_node_host() {
+        let _ = node_debug_event(
+            &host,
+            "lazy_property",
+            format!("resume_value id={:?} key={:?}", capture.id, capture.key),
+        );
+    }
+    context.install_interruptible_resume(continuation.clone());
+    let outcome = context.resume_interruptible_with(completion)?;
+    match outcome {
+        InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_lazy_property_getter_value,
+                (capture.clone(), continuation),
+            ),
+        ),
+    }
 }
 
 fn node_resume_util_lazy_property_getter(

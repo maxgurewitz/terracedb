@@ -15,6 +15,7 @@ use crate::{
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     error::JsNativeError,
     js_string,
+    native_function::{NativeFunctionResult, NativeResume},
     object::{CONSTRUCTOR, JsObject, internal_methods::get_prototype_from_constructor},
     property::Attribute,
     realm::Realm,
@@ -34,6 +35,53 @@ mod regexp_string_iterator;
 pub(crate) use regexp_string_iterator::RegExpStringIterator;
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Debug, Trace, Finalize)]
+struct RegExpReplaceResumeState {
+    preserved: JsString,
+    string: JsString,
+    position: usize,
+    search_length: usize,
+}
+
+fn wrap_regexp_replace_resume(state: RegExpReplaceResumeState, continuation: NativeResume) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_regexp_replace_suspend,
+        (state, continuation),
+    )
+}
+
+fn resume_regexp_replace_suspend(
+    completion: crate::vm::CompletionRecord,
+    captures: &(RegExpReplaceResumeState, NativeResume),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let (state, continuation) = captures;
+    match continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            crate::vm::CompletionRecord::Normal(value)
+            | crate::vm::CompletionRecord::Return(value) => {
+                let replacement = value.to_string(context)?;
+                Ok(NativeFunctionResult::complete(JsValue::from(js_string!(
+                    &state.preserved,
+                    &replacement,
+                    &state.string.get_expect(state.position + state.search_length..)
+                ))))
+            }
+            crate::vm::CompletionRecord::Throw(err) => {
+                Ok(NativeFunctionResult::from_completion(crate::vm::CompletionRecord::Throw(
+                    err,
+                )))
+            }
+            crate::vm::CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("regexp replace continuation resumed with suspended completion")
+                .into()),
+        },
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_regexp_replace_resume(state.clone(), next),
+        )),
+    }
+}
 
 /// The internal representation of a `RegExp` object.
 #[derive(Debug, Clone, Trace, Finalize, JsData)]
@@ -111,7 +159,11 @@ impl IntrinsicObject for RegExp {
             .method(Self::to_string, js_string!("toString"), 0)
             .method(Self::r#match, JsSymbol::r#match(), 1)
             .method(Self::match_all, JsSymbol::match_all(), 1)
-            .method(Self::replace, JsSymbol::replace(), 2)
+            .method_native(
+                crate::NativeFunction::from_suspend_fn_ptr(Self::replace),
+                JsSymbol::replace(),
+                2,
+            )
             .method(Self::search, JsSymbol::search(), 1)
             .method(Self::split, JsSymbol::split(), 2)
             .accessor(
@@ -1587,7 +1639,7 @@ impl RegExp {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // Helper enum.
         enum CallableOrString {
             FunctionalReplace(JsObject),
@@ -1755,7 +1807,7 @@ impl RegExp {
                 // k. If functionalReplace is true, then
                 CallableOrString::FunctionalReplace(ref replace_value) => {
                     // i. Let replacerArgs be the list-concatenation of « matched », captures, and « 𝔽(position), S ».
-                    let mut replacer_args = vec![JsValue::new(matched)];
+                    let mut replacer_args = vec![JsValue::new(matched.clone())];
                     replacer_args.extend(captures);
                     replacer_args.push(position.into());
                     replacer_args.push(s.clone().into());
@@ -1767,8 +1819,24 @@ impl RegExp {
                     }
 
                     // iii. Let replValue be ? Call(replaceValue, undefined, replacerArgs).
-                    let repl_value =
-                        replace_value.call(&JsValue::undefined(), &replacer_args, context)?;
+                    let repl_value = match replace_value.call_interruptible(
+                        &JsValue::undefined(),
+                        &replacer_args,
+                        context,
+                    )? {
+                        crate::object::InterruptibleCallOutcome::Complete(value) => value,
+                        crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                            let state = RegExpReplaceResumeState {
+                                preserved: s.get_expect(..position),
+                                string: s.clone(),
+                                position,
+                                search_length: match_length,
+                            };
+                            return Ok(NativeFunctionResult::Suspend(
+                                wrap_regexp_replace_resume(state, continuation),
+                            ));
+                        }
+                    };
 
                     // iv. Let replacement be ? ToString(replValue).
                     repl_value.to_string(context)?
@@ -1812,15 +1880,18 @@ impl RegExp {
 
         // 16. If nextSourcePosition ≥ lengthS, return accumulatedResult.
         if next_source_position >= length_s {
-            return Ok(js_string!(&accumulated_result[..]).into());
+            return Ok(NativeFunctionResult::complete(
+                JsValue::from(js_string!(&accumulated_result[..])),
+            ));
         }
 
         // 17. Return the string-concatenation of accumulatedResult and the substring of S from nextSourcePosition.
-        Ok(js_string!(
-            &JsString::from(&accumulated_result[..]),
-            &s.get_expect(next_source_position..)
-        )
-        .into())
+        Ok(NativeFunctionResult::complete(
+            JsValue::from(js_string!(
+                &JsString::from(&accumulated_result[..]),
+                &s.get_expect(next_source_position..)
+            )),
+        ))
     }
 
     /// `RegExp.prototype[ @@search ]( string )`

@@ -2,7 +2,7 @@
 use crate::{
     Context, JsNativeError, JsResult, JsValue,
     builtins::function::OrdinaryFunction,
-    object::{JsObject, builtins::JsGenerator},
+    object::{InterruptibleCallOutcome, JsObject, builtins::JsGenerator},
     value::TryFromJs,
 };
 use boa_gc::{Finalize, Trace};
@@ -47,14 +47,32 @@ impl JsGeneratorFunction {
         args: &[JsValue],
         context: &mut Context,
     ) -> JsResult<JsGenerator> {
-        let value = self.inner.call(this, args, context)?;
-        let obj = value
-            .as_object()
-            .ok_or_else(|| {
-                JsNativeError::typ().with_message("generator function did not return an object")
-            })?
-            .clone();
-        JsGenerator::from_object(obj)
+        match self.call_interruptible(this, args.to_vec(), context)? {
+            InterruptibleCallOutcome::Complete(value) => {
+                let obj = value
+                    .as_object()
+                    .ok_or_else(|| {
+                        JsNativeError::typ()
+                            .with_message("generator function did not return an object")
+                    })?
+                    .clone();
+                JsGenerator::from_object(obj)
+            }
+            InterruptibleCallOutcome::Suspend(_) => Err(JsNativeError::error()
+                .with_message("generator function requires interruptible execution")
+                .into()),
+        }
+    }
+
+    /// Calls the generator function and preserves suspension.
+    #[inline]
+    pub fn call_interruptible(
+        &self,
+        this: &JsValue,
+        args: Vec<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<InterruptibleCallOutcome<JsValue>> {
+        self.inner.call_interruptible(this, &args, context)
     }
 }
 

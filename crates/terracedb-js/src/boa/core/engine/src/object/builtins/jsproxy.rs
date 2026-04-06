@@ -5,7 +5,7 @@ use crate::{
     builtins::Proxy,
     js_string,
     native_function::{NativeFunction, NativeFunctionPointer},
-    object::{FunctionObjectBuilder, JsObject},
+    object::{FunctionObjectBuilder, InterruptibleCallOutcome, JsObject},
     value::TryFromJs,
 };
 use boa_gc::{Finalize, Trace};
@@ -105,8 +105,31 @@ impl JsRevocableProxy {
     /// making it unusable and throwing `TypeError`s for all the traps.
     #[inline]
     pub fn revoke(self, context: &mut Context) -> JsResult<()> {
-        self.revoker.call(&JsValue::undefined(), &[], context)?;
+        match self.revoke_interruptible(context)? {
+            InterruptibleCallOutcome::Complete(()) => {}
+            InterruptibleCallOutcome::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("revoking a proxy requires interruptible execution")
+                    .into())
+            }
+        }
         Ok(())
+    }
+
+    /// Disables the traps of the internal `proxy` object, preserving suspension.
+    #[inline]
+    pub fn revoke_interruptible(
+        self,
+        context: &mut Context,
+    ) -> JsResult<InterruptibleCallOutcome<()>> {
+        match self.revoker.call_interruptible(&JsValue::undefined(), &[], context)? {
+            crate::object::InterruptibleCallOutcome::Complete(_) => {
+                Ok(InterruptibleCallOutcome::Complete(()))
+            }
+            crate::object::InterruptibleCallOutcome::Suspend(next) => {
+                Ok(InterruptibleCallOutcome::Suspend(next))
+            }
+        }
     }
 }
 

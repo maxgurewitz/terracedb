@@ -124,11 +124,7 @@ impl JsWeakMap {
         callback: JsValue,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        match WeakMap::get_or_insert_computed(
-            &self.inner.clone().into(),
-            &[key.clone().into(), callback],
-            context,
-        )? {
+        match self.get_or_insert_computed_interruptible(key, callback, context)? {
             NativeFunctionResult::Complete(record) => record.consume(),
             NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
                 .with_message(
@@ -136,6 +132,22 @@ impl JsWeakMap {
                 )
                 .into()),
         }
+    }
+
+    /// Returns the value associated with the key if it exists; otherwise calls the provided
+    /// callback with the key, inserts the result, and returns it, preserving suspension.
+    #[inline]
+    pub fn get_or_insert_computed_interruptible(
+        &self,
+        key: &JsObject,
+        callback: JsValue,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        WeakMap::get_or_insert_computed(
+            &self.inner.clone().into(),
+            &[key.clone().into(), callback],
+            context,
+        )
     }
 
     /// Creates a `JsWeakMap` from a `JsObject`, or returns the original object as `Err`

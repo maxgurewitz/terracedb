@@ -175,10 +175,17 @@ impl JsPromise {
 
         if let Err(e) = executor(&resolvers, context) {
             let e = e.into_opaque(context)?;
-            resolvers
+            match resolvers
                 .reject
-                .call(&JsValue::undefined(), &[e], context)
-                .js_expect("default `reject` function cannot throw")?;
+                .call_interruptible(&JsValue::undefined(), &[e], context)?
+            {
+                crate::object::InterruptibleCallOutcome::Complete(_) => {}
+                crate::object::InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message("Promise executor rejection requires interruptible execution")
+                        .into());
+                }
+            }
         }
 
         Ok(Self { inner: promise })
@@ -309,10 +316,36 @@ impl JsPromise {
 
                 let context = &mut context.borrow_mut();
                 match result {
-                    Ok(v) => resolvers.resolve.call(&JsValue::undefined(), &[v], context),
+                    Ok(v) => match resolvers
+                        .resolve
+                        .call_interruptible(&JsValue::undefined(), &[v], context)?
+                    {
+                        crate::object::InterruptibleCallOutcome::Complete(_) => Ok(JsValue::undefined()),
+                        crate::object::InterruptibleCallOutcome::Suspend(_) => Err(
+                            JsNativeError::error()
+                                .with_message(
+                                    "Promise async resolution requires interruptible execution",
+                                )
+                                .into(),
+                        ),
+                    },
                     Err(e) => {
                         let e = e.into_opaque(context)?;
-                        resolvers.reject.call(&JsValue::undefined(), &[e], context)
+                        match resolvers
+                            .reject
+                            .call_interruptible(&JsValue::undefined(), &[e], context)?
+                        {
+                            crate::object::InterruptibleCallOutcome::Complete(_) => {
+                                Ok(JsValue::undefined())
+                            }
+                            crate::object::InterruptibleCallOutcome::Suspend(_) => Err(
+                                JsNativeError::error()
+                                    .with_message(
+                                        "Promise async rejection requires interruptible execution",
+                                    )
+                                    .into(),
+                            ),
+                        }
                     }
                 }
             })

@@ -384,6 +384,29 @@ impl JsObject {
         )
     }
 
+    /// Get property from object through the interruptible execution path.
+    ///
+    /// More information:
+    ///  - [ECMAScript reference][spec]
+    ///
+    /// [spec]: https://tc39.es/ecma262/#sec-get-o-p
+    pub fn get_interruptible<K>(
+        &self,
+        key: K,
+        context: &mut Context,
+    ) -> JsResult<ExecutionOutcome<JsValue>>
+    where
+        K: Into<PropertyKey>,
+    {
+        let key = key.into();
+        interrupt_trace(|| format!("JsObject::get_interruptible key={key}"));
+        self.__get_interruptible__(
+            &key,
+            self.clone().into(),
+            &mut InternalMethodPropertyContext::new(context),
+        )
+    }
+
     /// set property of object or throw if bool flag is passed.
     ///
     /// More information:

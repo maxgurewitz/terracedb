@@ -139,16 +139,27 @@ impl JsSet {
         this_arg: JsValue,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        match Set::for_each(
-            &self.inner.clone().into(),
-            &[callback.into(), this_arg],
-            context,
-        )? {
+        match self.for_each_interruptible(callback, this_arg, context)? {
             NativeFunctionResult::Complete(record) => record.consume(),
             NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
                 .with_message("suspendable Set.prototype.forEach requires interruptible execution")
                 .into()),
         }
+    }
+
+    /// Calls callbackFn once for each value present in the Set object, preserving suspension.
+    #[inline]
+    pub fn for_each_interruptible(
+        &self,
+        callback: JsFunction,
+        this_arg: JsValue,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        Set::for_each(
+            &self.inner.clone().into(),
+            &[callback.into(), this_arg],
+            context,
+        )
     }
 
     /// Executes the provided callback function for each key-value pair within the [`JsSet`].

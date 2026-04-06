@@ -74,8 +74,26 @@ impl<A: TryIntoJsArguments, R: TryFromJs> TypedJsFunction<A, R> {
     #[cfg_attr(feature = "native-backtrace", track_caller)]
     pub fn call_with_this(&self, this: &JsValue, context: &mut Context, args: A) -> JsResult<R> {
         let arguments = args.into_js_args(context)?;
-        let result = self.inner.call(this, &arguments, context)?;
-        R::try_from_js(&result, context)
+        match self.call_interruptible(this, context, arguments)? {
+            crate::object::InterruptibleCallOutcome::Complete(result) => {
+                R::try_from_js(&result, context)
+            }
+            crate::object::InterruptibleCallOutcome::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable function call requires interruptible execution")
+                .into()),
+        }
+    }
+
+    /// Call the function with the given argument and `this`, preserving suspension.
+    #[inline]
+    #[cfg_attr(feature = "native-backtrace", track_caller)]
+    pub fn call_interruptible(
+        &self,
+        this: &JsValue,
+        context: &mut Context,
+        args: Vec<JsValue>,
+    ) -> JsResult<crate::object::InterruptibleCallOutcome<JsValue>> {
+        self.inner.call_interruptible(this, &args, context)
     }
 }
 

@@ -345,6 +345,39 @@ fn wrap_promise_try_resume(continuation: NativeResume, capability: PromiseCapabi
     )
 }
 
+fn wrap_promise_try_settlement_resume(
+    continuation: NativeResume,
+    capability: PromiseCapability,
+) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_promise_try_after_settlement,
+        (continuation, capability),
+    )
+}
+
+fn resume_promise_try_after_settlement(
+    completion: CompletionRecord,
+    captures: &(NativeResume, PromiseCapability),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match captures.0.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Throw(err) => {
+                Ok(NativeFunctionResult::from_completion(CompletionRecord::Throw(err)))
+            }
+            CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                Ok(NativeFunctionResult::complete(captures.1.promise().clone()))
+            }
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("promise settlement continuation resumed with suspended completion")
+                .into()),
+        },
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_promise_try_settlement_resume(next, captures.1.clone()),
+        )),
+    }
+}
+
 fn resume_promise_try_after_callback(
     completion: CompletionRecord,
     captures: &(NativeResume, PromiseCapability),
@@ -564,19 +597,39 @@ impl Promise {
             // 5. If status is an abrupt completion, then
             Err(err) => {
                 let value: JsValue = err.into_opaque(context)?;
-                promise_capability.functions.reject.call(
+                match promise_capability.functions.reject.call_interruptible(
                     &JsValue::undefined(),
                     &[value],
                     context,
-                )?;
+                )? {
+                    InterruptibleCallOutcome::Complete(_) => {}
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::Suspend(
+                            wrap_promise_try_settlement_resume(
+                                continuation,
+                                promise_capability.clone(),
+                            ),
+                        ));
+                    }
+                }
             }
             Ok(InterruptibleCallOutcome::Complete(value)) => {
                 // a. Perform ? Call(promiseCapability.[[Resolve]], undefined, « status.[[Value]] »).
-                promise_capability.functions.resolve.call(
+                match promise_capability.functions.resolve.call_interruptible(
                     &JsValue::undefined(),
                     &[value],
                     context,
-                )?;
+                )? {
+                    InterruptibleCallOutcome::Complete(_) => {}
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::Suspend(
+                            wrap_promise_try_settlement_resume(
+                                continuation,
+                                promise_capability.clone(),
+                            ),
+                        ));
+                    }
+                }
             }
             Ok(InterruptibleCallOutcome::Suspend(continuation)) => {
                 return Ok(NativeFunctionResult::Suspend(wrap_promise_try_resume(

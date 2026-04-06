@@ -51,16 +51,32 @@ impl IntrinsicObject for Iterator {
             .static_method(Self::take, js_string!("take"), 1)
             .static_method(Self::drop, js_string!("drop"), 1)
             .static_method(Self::flat_map, js_string!("flatMap"), 1)
-            .static_method(Self::reduce, js_string!("reduce"), 1)
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::reduce),
+                js_string!("reduce"),
+                1,
+            )
             .static_method(Self::to_array, js_string!("toArray"), 0)
             .static_method_native(
                 NativeFunction::from_suspend_fn_ptr(Self::for_each),
                 js_string!("forEach"),
                 1,
             )
-            .static_method(Self::some, js_string!("some"), 1)
-            .static_method(Self::every, js_string!("every"), 1)
-            .static_method(Self::find, js_string!("find"), 1)
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::some),
+                js_string!("some"),
+                1,
+            )
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::every),
+                js_string!("every"),
+                1,
+            )
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::find),
+                js_string!("find"),
+                1,
+            )
             .static_accessor(
                 JsSymbol::to_string_tag(),
                 Some(get_to_string_tag),
@@ -457,7 +473,11 @@ impl Iterator {
     ///  - [ECMAScript reference][spec]
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-iterator.prototype.reduce
-    fn reduce(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn reduce(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. If O is not an Object, throw a TypeError exception.
         let o = this.as_object().ok_or_else(
@@ -471,12 +491,14 @@ impl Iterator {
         let Some(reducer) = args.get_or_undefined(0).as_callable() else {
             // a. Let error be ThrowCompletion(a newly created TypeError object).
             // b. Return ? IteratorClose(iterated, error).
-            return iterated.close(
+            return iterated
+                .close(
                 Err(js_error!(
                     TypeError: "Iterator.prototype.reduce: reducer is not callable"
                 )),
                 context,
-            );
+            )
+            .map(NativeFunctionResult::complete);
         };
 
         // 5. Set iterated to ? GetIteratorDirect(O).
@@ -504,22 +526,36 @@ impl Iterator {
         //    b. If value is done, return accumulator.
         while let Some(value) = iterated.step_value(context)? {
             // c. Let result be Completion(Call(reducer, undefined, « accumulator, value, 𝔽(counter) »)).
-            let result = reducer.call(
+            let result = reducer.call_interruptible(
                 &JsValue::undefined(),
-                &[accumulator, value, JsValue::new(counter)],
+                &[accumulator.clone(), value, JsValue::new(counter)],
                 context,
             );
-
-            // d. IfAbruptCloseIterator(result, iterated).
-            // e. Set accumulator to result.
-            accumulator = if_abrupt_close_iterator!(result, iterated, context);
+            match result? {
+                InterruptibleCallOutcome::Complete(value) => {
+                    accumulator = value;
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(
+                        wrap_iterator_reduce_suspend(IteratorReduceSuspendState {
+                            state: IteratorReduceState {
+                                iterated: Cell::new(Some(iterated)),
+                                callback: reducer,
+                                accumulator: Cell::new(Some(accumulator)),
+                                counter: Cell::new(counter),
+                            },
+                            continuation,
+                        }),
+                    ));
+                }
+            }
 
             // f. Set counter to counter + 1.
             counter += 1;
         }
 
         // Step 8.b
-        Ok(accumulator)
+        Ok(NativeFunctionResult::complete(accumulator))
     }
 
     /// `Iterator.prototype.toArray ( )`
@@ -599,7 +635,11 @@ impl Iterator {
     ///  - [ECMAScript reference][spec]
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-iterator.prototype.some
-    fn some(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn some(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. If O is not an Object, throw a TypeError exception.
         let o = this
@@ -613,12 +653,14 @@ impl Iterator {
         let Some(predicate) = args.get_or_undefined(0).as_callable() else {
             // a. Let error be ThrowCompletion(a newly created TypeError object).
             // b. Return ? IteratorClose(iterated, error).
-            return iterated.close(
+            return iterated
+                .close(
                 Err(js_error!(
                     TypeError: "Iterator.prototype.some: predicate is not callable"
                 )),
                 context,
-            );
+            )
+            .map(NativeFunctionResult::complete);
         };
 
         // 5. Set iterated to ? GetIteratorDirect(O).
@@ -631,17 +673,33 @@ impl Iterator {
         //    b. If value is done, return false.
         while let Some(value) = iterated.step_value(context)? {
             // c. Let result be Completion(Call(predicate, undefined, « value, 𝔽(counter) »)).
-            let result = predicate.call(
+            let result = predicate.call_interruptible(
                 &JsValue::undefined(),
                 &[value, JsValue::new(counter)],
                 context,
             );
-            // d. IfAbruptCloseIterator(result, iterated).
-            let result = if_abrupt_close_iterator!(result, iterated, context);
-
-            // e. If ToBoolean(result) is true, return ? IteratorClose(iterated, NormalCompletion(true)).
-            if result.to_boolean() {
-                return iterated.close(Ok(JsValue::new(true)), context);
+            match result? {
+                InterruptibleCallOutcome::Complete(result) => {
+                    // d. IfAbruptCloseIterator(result, iterated).
+                    if result.to_boolean() {
+                        return iterated
+                            .close(Ok(JsValue::new(true)), context)
+                            .map(NativeFunctionResult::complete);
+                    }
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(
+                        wrap_iterator_some_suspend(IteratorSomeSuspendState {
+                            state: IteratorSomeState {
+                                iterated: Cell::new(Some(iterated)),
+                                predicate,
+                                this_arg: JsValue::undefined(),
+                                counter: Cell::new(counter),
+                            },
+                            continuation,
+                        }),
+                    ));
+                }
             }
 
             // f. Set counter to counter + 1.
@@ -649,7 +707,7 @@ impl Iterator {
         }
 
         // Step 7.b
-        Ok(false.into())
+        Ok(NativeFunctionResult::complete(false))
     }
 
     /// `Iterator.prototype.every ( predicate )`
@@ -658,7 +716,11 @@ impl Iterator {
     ///  - [ECMAScript reference][spec]
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-iterator.prototype.every
-    fn every(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn every(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. If O is not an Object, throw a TypeError exception.
         let o = this
@@ -672,12 +734,14 @@ impl Iterator {
         let Some(predicate) = args.get_or_undefined(0).as_callable() else {
             // a. Let error be ThrowCompletion(a newly created TypeError object).
             // b. Return ? IteratorClose(iterated, error).
-            return iterated.close(
+            return iterated
+                .close(
                 Err(js_error!(
                     TypeError: "Iterator.prototype.every: predicate is not callable"
                 )),
                 context,
-            );
+            )
+            .map(NativeFunctionResult::complete);
         };
 
         // 5. Set iterated to ? GetIteratorDirect(O).
@@ -691,17 +755,33 @@ impl Iterator {
         //    b. If value is done, return true.
         while let Some(value) = iterated.step_value(context)? {
             // c. Let result be Completion(Call(predicate, undefined, « value, 𝔽(counter) »)).
-            let result = predicate.call(
+            let result = predicate.call_interruptible(
                 &JsValue::undefined(),
                 &[value, JsValue::new(counter)],
                 context,
             );
-            // d. IfAbruptCloseIterator(result, iterated).
-            let result = if_abrupt_close_iterator!(result, iterated, context);
-
-            // e. If ToBoolean(result) is false, return ? IteratorClose(iterated, NormalCompletion(false)).
-            if !result.to_boolean() {
-                return iterated.close(Ok(JsValue::new(false)), context);
+            match result? {
+                InterruptibleCallOutcome::Complete(result) => {
+                    // d. IfAbruptCloseIterator(result, iterated).
+                    if !result.to_boolean() {
+                        return iterated
+                            .close(Ok(JsValue::new(false)), context)
+                            .map(NativeFunctionResult::complete);
+                    }
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(
+                        wrap_iterator_every_suspend(IteratorEverySuspendState {
+                            state: IteratorEveryState {
+                                iterated: Cell::new(Some(iterated)),
+                                predicate,
+                                this_arg: JsValue::undefined(),
+                                counter: Cell::new(counter),
+                            },
+                            continuation,
+                        }),
+                    ));
+                }
             }
 
             // f. Set counter to counter + 1.
@@ -709,7 +789,7 @@ impl Iterator {
         }
 
         // Step 7.b
-        Ok(true.into())
+        Ok(NativeFunctionResult::complete(true))
     }
 
     /// `Iterator.prototype.find ( predicate )`
@@ -718,7 +798,11 @@ impl Iterator {
     ///  - [ECMAScript reference][spec]
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-iterator.prototype.find
-    fn find(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn find(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. If O is not an Object, throw a TypeError exception.
         let o = this
@@ -732,12 +816,14 @@ impl Iterator {
         let Some(predicate) = args.get_or_undefined(0).as_callable() else {
             // a. Let error be ThrowCompletion(a newly created TypeError object).
             // b. Return ? IteratorClose(iterated, error).
-            return iterated.close(
+            return iterated
+                .close(
                 Err(js_error!(
                     TypeError: "Iterator.prototype.find: predicate is not callable"
                 )),
                 context,
-            );
+            )
+            .map(NativeFunctionResult::complete);
         };
         // 5. Set iterated to ? GetIteratorDirect(O).
         let mut iterated = get_iterator_direct(iterated.iterator(), context)?;
@@ -750,18 +836,33 @@ impl Iterator {
         //    b. If value is done, return undefined.
         while let Some(value) = iterated.step_value(context)? {
             // c. Let result be Completion(Call(predicate, undefined, « value, 𝔽(counter) »)).
-            let result = predicate.call(
+            let result = predicate.call_interruptible(
                 &JsValue::undefined(),
                 &[value.clone(), JsValue::new(counter)],
                 context,
             );
-
-            // d. IfAbruptCloseIterator(result, iterated).
-            let result = if_abrupt_close_iterator!(result, iterated, context);
-
-            // e. If ToBoolean(result) is true, return ? IteratorClose(iterated, NormalCompletion(value)).
-            if result.to_boolean() {
-                return iterated.close(Ok(value), context);
+            match result? {
+                InterruptibleCallOutcome::Complete(result) => {
+                    // d. IfAbruptCloseIterator(result, iterated).
+                    if result.to_boolean() {
+                        return iterated
+                            .close(Ok(value), context)
+                            .map(NativeFunctionResult::complete);
+                    }
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(
+                        wrap_iterator_find_suspend(IteratorFindSuspendState {
+                            state: IteratorFindState {
+                                iterated: Cell::new(Some(iterated)),
+                                predicate,
+                                this_arg: JsValue::undefined(),
+                                counter: Cell::new(counter),
+                            },
+                            continuation,
+                        }),
+                    ));
+                }
             }
 
             // f. Set counter to counter + 1.
@@ -769,8 +870,406 @@ impl Iterator {
         }
 
         // Step 7.b
-        Ok(JsValue::undefined())
+        Ok(NativeFunctionResult::complete(JsValue::undefined()))
     }
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorReduceState {
+    iterated: Cell<Option<IteratorRecord>>,
+    callback: JsObject,
+    accumulator: Cell<Option<JsValue>>,
+    counter: Cell<u64>,
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorReduceSuspendState {
+    state: IteratorReduceState,
+    continuation: NativeResume,
+}
+
+fn clone_iterator_reduce_state(state: &IteratorReduceState) -> IteratorReduceState {
+    let iterated = state.iterated.take();
+    state.iterated.set(iterated.clone());
+    let accumulator = state.accumulator.take();
+    state.accumulator.set(accumulator.clone());
+    IteratorReduceState {
+        iterated: Cell::new(iterated),
+        callback: state.callback.clone(),
+        accumulator: Cell::new(accumulator),
+        counter: Cell::new(state.counter.get()),
+    }
+}
+
+fn wrap_iterator_reduce_suspend(state: IteratorReduceSuspendState) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_iterator_reduce_suspend, state)
+}
+
+fn resume_iterator_reduce_suspend(
+    completion: CompletionRecord,
+    state: &IteratorReduceSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            let accumulator = record.consume()?;
+            state.state.accumulator.set(Some(accumulator.clone()));
+            continue_iterator_reduce(&state.state, context)
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_iterator_reduce_suspend(IteratorReduceSuspendState {
+                state: clone_iterator_reduce_state(&state.state),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_iterator_reduce(
+    state: &IteratorReduceState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let Some(mut iterated) = state.iterated.take() else {
+        return Err(js_error!(
+            TypeError: "Iterator.prototype.reduce continuation lost iterator state"
+        ));
+    };
+    let mut accumulator = state
+        .accumulator
+        .take()
+        .expect("reduce accumulator must exist");
+    let mut counter = state.counter.get();
+
+    while let Some(value) = iterated.step_value(context)? {
+        let args = [accumulator.clone(), value, JsValue::new(counter)];
+        match state
+            .callback
+            .call_interruptible(&JsValue::undefined(), &args, context)?
+        {
+            InterruptibleCallOutcome::Complete(next) => {
+                accumulator = next;
+            }
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                state.iterated.set(Some(iterated));
+                state.accumulator.set(Some(accumulator.clone()));
+                state.counter.set(counter);
+                return Ok(NativeFunctionResult::Suspend(wrap_iterator_reduce_suspend(
+                    IteratorReduceSuspendState {
+                        state: clone_iterator_reduce_state(state),
+                        continuation,
+                    },
+                )));
+            }
+        }
+
+        counter += 1;
+        state.counter.set(counter);
+    }
+
+    state.iterated.set(Some(iterated));
+    Ok(NativeFunctionResult::complete(accumulator))
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorSomeState {
+    iterated: Cell<Option<IteratorRecord>>,
+    predicate: JsObject,
+    this_arg: JsValue,
+    counter: Cell<u64>,
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorSomeSuspendState {
+    state: IteratorSomeState,
+    continuation: NativeResume,
+}
+
+fn clone_iterator_some_state(state: &IteratorSomeState) -> IteratorSomeState {
+    let iterated = state.iterated.take();
+    state.iterated.set(iterated.clone());
+    IteratorSomeState {
+        iterated: Cell::new(iterated),
+        predicate: state.predicate.clone(),
+        this_arg: state.this_arg.clone(),
+        counter: Cell::new(state.counter.get()),
+    }
+}
+
+fn wrap_iterator_some_suspend(state: IteratorSomeSuspendState) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_iterator_some_suspend, state)
+}
+
+fn resume_iterator_some_suspend(
+    completion: CompletionRecord,
+    state: &IteratorSomeSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            if record.consume()?.to_boolean() {
+                let Some(iterated) = state.state.iterated.take() else {
+                    return Err(js_error!(
+                        TypeError: "Iterator.prototype.some continuation lost iterator state"
+                    ));
+                };
+                iterated
+                    .close(Ok(JsValue::new(true)), context)
+                    .map(NativeFunctionResult::complete)
+            } else {
+                continue_iterator_some(&state.state, context)
+            }
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_iterator_some_suspend(IteratorSomeSuspendState {
+                state: clone_iterator_some_state(&state.state),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_iterator_some(
+    state: &IteratorSomeState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let Some(mut iterated) = state.iterated.take() else {
+        return Err(js_error!(
+            TypeError: "Iterator.prototype.some continuation lost iterator state"
+        ));
+    };
+    let mut counter = state.counter.get();
+
+    while let Some(value) = iterated.step_value(context)? {
+        match state
+            .predicate
+            .call_interruptible(&state.this_arg, &[value, JsValue::new(counter)], context)?
+        {
+            InterruptibleCallOutcome::Complete(result) => {
+                if result.to_boolean() {
+                    state.iterated.set(Some(iterated));
+                    return Ok(NativeFunctionResult::complete(true));
+                }
+            }
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                state.iterated.set(Some(iterated));
+                state.counter.set(counter);
+                return Ok(NativeFunctionResult::Suspend(wrap_iterator_some_suspend(
+                    IteratorSomeSuspendState {
+                        state: clone_iterator_some_state(state),
+                        continuation,
+                    },
+                )));
+            }
+        }
+
+        counter += 1;
+        state.counter.set(counter);
+    }
+
+    state.iterated.set(Some(iterated));
+    Ok(NativeFunctionResult::complete(false))
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorEveryState {
+    iterated: Cell<Option<IteratorRecord>>,
+    predicate: JsObject,
+    this_arg: JsValue,
+    counter: Cell<u64>,
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorEverySuspendState {
+    state: IteratorEveryState,
+    continuation: NativeResume,
+}
+
+fn clone_iterator_every_state(state: &IteratorEveryState) -> IteratorEveryState {
+    let iterated = state.iterated.take();
+    state.iterated.set(iterated.clone());
+    IteratorEveryState {
+        iterated: Cell::new(iterated),
+        predicate: state.predicate.clone(),
+        this_arg: state.this_arg.clone(),
+        counter: Cell::new(state.counter.get()),
+    }
+}
+
+fn wrap_iterator_every_suspend(state: IteratorEverySuspendState) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_iterator_every_suspend, state)
+}
+
+fn resume_iterator_every_suspend(
+    completion: CompletionRecord,
+    state: &IteratorEverySuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            if !record.consume()?.to_boolean() {
+                let Some(iterated) = state.state.iterated.take() else {
+                    return Err(js_error!(
+                        TypeError: "Iterator.prototype.every continuation lost iterator state"
+                    ));
+                };
+                iterated
+                    .close(Ok(JsValue::new(false)), context)
+                    .map(NativeFunctionResult::complete)
+            } else {
+                continue_iterator_every(&state.state, context)
+            }
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_iterator_every_suspend(IteratorEverySuspendState {
+                state: clone_iterator_every_state(&state.state),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_iterator_every(
+    state: &IteratorEveryState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let Some(mut iterated) = state.iterated.take() else {
+        return Err(js_error!(
+            TypeError: "Iterator.prototype.every continuation lost iterator state"
+        ));
+    };
+    let mut counter = state.counter.get();
+
+    while let Some(value) = iterated.step_value(context)? {
+        match state
+            .predicate
+            .call_interruptible(&state.this_arg, &[value, JsValue::new(counter)], context)?
+        {
+            InterruptibleCallOutcome::Complete(result) => {
+                if !result.to_boolean() {
+                    state.iterated.set(Some(iterated));
+                    return Ok(NativeFunctionResult::complete(false));
+                }
+            }
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                state.iterated.set(Some(iterated));
+                state.counter.set(counter);
+                return Ok(NativeFunctionResult::Suspend(wrap_iterator_every_suspend(
+                    IteratorEverySuspendState {
+                        state: clone_iterator_every_state(state),
+                        continuation,
+                    },
+                )));
+            }
+        }
+
+        counter += 1;
+        state.counter.set(counter);
+    }
+
+    state.iterated.set(Some(iterated));
+    Ok(NativeFunctionResult::complete(true))
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorFindState {
+    iterated: Cell<Option<IteratorRecord>>,
+    predicate: JsObject,
+    this_arg: JsValue,
+    counter: Cell<u64>,
+}
+
+#[derive(Trace, Finalize)]
+struct IteratorFindSuspendState {
+    state: IteratorFindState,
+    continuation: NativeResume,
+}
+
+fn clone_iterator_find_state(state: &IteratorFindState) -> IteratorFindState {
+    let iterated = state.iterated.take();
+    state.iterated.set(iterated.clone());
+    IteratorFindState {
+        iterated: Cell::new(iterated),
+        predicate: state.predicate.clone(),
+        this_arg: state.this_arg.clone(),
+        counter: Cell::new(state.counter.get()),
+    }
+}
+
+fn wrap_iterator_find_suspend(state: IteratorFindSuspendState) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_iterator_find_suspend, state)
+}
+
+fn resume_iterator_find_suspend(
+    completion: CompletionRecord,
+    state: &IteratorFindSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            if record.consume()?.to_boolean() {
+                let Some(mut iterated) = state.state.iterated.take() else {
+                    return Err(js_error!(
+                        TypeError: "Iterator.prototype.find continuation lost iterator state"
+                    ));
+                };
+                let value = iterated.value(context)?;
+                iterated
+                    .close(Ok(value), context)
+                    .map(NativeFunctionResult::complete)
+            } else {
+                continue_iterator_find(&state.state, context)
+            }
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_iterator_find_suspend(IteratorFindSuspendState {
+                state: clone_iterator_find_state(&state.state),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_iterator_find(
+    state: &IteratorFindState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let Some(mut iterated) = state.iterated.take() else {
+        return Err(js_error!(
+            TypeError: "Iterator.prototype.find continuation lost iterator state"
+        ));
+    };
+    let mut counter = state.counter.get();
+
+    while let Some(value) = iterated.step_value(context)? {
+        match state
+            .predicate
+            .call_interruptible(&state.this_arg, &[value.clone(), JsValue::new(counter)], context)?
+        {
+                InterruptibleCallOutcome::Complete(result) => {
+                    if result.to_boolean() {
+                        let close_result = iterated.close(Ok(value), context);
+                        state.iterated.set(Some(iterated));
+                        return close_result.map(NativeFunctionResult::complete);
+                    }
+                }
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                state.iterated.set(Some(iterated));
+                state.counter.set(counter);
+                return Ok(NativeFunctionResult::Suspend(wrap_iterator_find_suspend(
+                    IteratorFindSuspendState {
+                        state: clone_iterator_find_state(state),
+                        continuation,
+                    },
+                )));
+            }
+        }
+
+        counter += 1;
+        state.counter.set(counter);
+    }
+
+    state.iterated.set(Some(iterated));
+    Ok(NativeFunctionResult::complete(JsValue::undefined()))
 }
 
 #[derive(Trace, Finalize)]
