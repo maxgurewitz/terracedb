@@ -31,7 +31,7 @@ use boa_engine::{
     NativeFunction, Script, Source, Trace,
     builtins::promise::{OperationType, Promise, PromiseState},
     class::{Class, ClassBuilder},
-    context::{ExecutionOutcome, HostHooks},
+    context::HostHooks,
     job::JobCallback,
     job::NativeAsyncJob,
     js_string,
@@ -42,7 +42,7 @@ use boa_engine::{
     object::builtins::{
         JsArray, JsArrayBuffer, JsFunction, JsPromise, JsProxy, JsSharedArrayBuffer, JsUint8Array,
     },
-    object::{FunctionObjectBuilder, JsObject, ObjectInitializer},
+    object::{FunctionObjectBuilder, InterruptibleCallOutcome, JsObject, ObjectInitializer},
     property::{Attribute, PropertyDescriptor, PropertyKey},
 };
 use boa_engine::native_function::NativeFunctionResult;
@@ -464,6 +464,36 @@ struct NodeProcessWrapSpawnResume {
 struct NodeSpawnSyncResume {
     request_id: u64,
     options: JsObject,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeInterruptibleResume;
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeInspectorConsoleCallResume {
+    phase: NodeInspectorConsoleCallPhase,
+    this_value: JsValue,
+    node_method: JsObject,
+    call_args: Vec<JsValue>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+enum NodeInspectorConsoleCallPhase {
+    AfterInspector,
+    AfterNode,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeUtilLazyPropertyCapture {
+    builtin_require: JsObject,
+    id: JsString,
+    key: JsString,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeSyntheticNamespaceCapture {
+    namespace: JsObject,
+    exports: Vec<JsString>,
 }
 
 impl Class for NodeContextifyScriptState {
@@ -904,10 +934,13 @@ impl HostHooks for NodeRuntimeHostHooks {
 struct NodeBootstrapState {
     per_context_exports: Option<JsObject>,
     primordials: Option<JsObject>,
+    builtin_require: Option<JsObject>,
     tick_info: Option<JsObject>,
     immediate_info: Option<JsObject>,
     timeout_info: Option<JsObject>,
     hrtime_buffer: Option<JsObject>,
+    fs_stat_values: Option<JsObject>,
+    encoding_encode_into_results: Option<JsObject>,
     stream_base_state: Option<JsObject>,
     microtask_queue: Vec<JsObject>,
     async_context_frame: Option<JsValue>,
@@ -3398,7 +3431,6 @@ async fn execute_node_command_inner(
             message: error.to_string(),
         })?;
     node_debug_event(&node_host, "stage", "context-built".to_string())?;
-    install_node_host_bindings(&mut context)?;
     node_debug_event(&node_host, "stage", "host-bindings-installed".to_string())?;
     node_install_base_process_global(&mut context, &node_host)?;
     node_debug_event(&node_host, "stage", "base-process-installed".to_string())?;
@@ -3770,6 +3802,17 @@ async fn node_execute_upstream_bootstrap_and_main_async(
     let require_builtin = realm_object
         .get(js_string!("requireBuiltin"), context)
         .map_err(sandbox_execution_error)?;
+    node_debug_event(
+        &host,
+        "bootstrap",
+        format!(
+            "realm exports internalBinding_type={} internalBinding_callable={} requireBuiltin_type={} requireBuiltin_callable={}",
+            internal_binding.type_of(),
+            internal_binding.as_callable().is_some(),
+            require_builtin.type_of(),
+            require_builtin.as_callable().is_some(),
+        ),
+    )?;
     let primordials = host
         .bootstrap
         .borrow()
@@ -4247,186 +4290,6 @@ fn node_command_report_json(host: &NodeRuntimeHost) -> Option<JsonValue> {
     }))
 }
 
-fn install_node_host_bindings(context: &mut Context) -> Result<(), SandboxError> {
-    register_global_native(context, "escape", 1, node_global_escape)?;
-    register_global_native(context, "unescape", 1, node_global_unescape)?;
-    register_global_native(context, "__terraceNodeDebugEvent", 2, node_trace_event)?;
-    register_global_native(context, "__terraceGetProcessInfo", 0, node_get_process_info)?;
-    register_global_native(context, "__terraceGetCwd", 0, node_get_cwd)?;
-    register_global_native(context, "__terraceChdir", 1, node_chdir)?;
-    register_global_native(context, "__terraceSetExitCode", 1, node_set_exit_code)?;
-    register_global_native(context, "__terraceWriteStdout", 1, node_write_stdout)?;
-    register_global_native(context, "__terraceWriteStderr", 1, node_write_stderr)?;
-    register_global_suspend_native(
-        context,
-        "__terraceReadBuiltinSource",
-        1,
-        node_read_builtin_source_suspend,
-    )?;
-    register_global_suspend_native(context, "__terraceResolveModule", 3, node_resolve_module_suspend)?;
-    register_global_suspend_native(
-        context,
-        "__terraceRequireEsmNamespace",
-        1,
-        node_require_esm_namespace_suspend,
-    )?;
-    register_global_suspend_native(
-        context,
-        "__terraceRequireResolveImpl",
-        3,
-        node_require_resolve_suspend,
-    )?;
-    register_global_native(
-        context,
-        "__terraceRequireResolvePathsImpl",
-        2,
-        node_require_resolve_paths,
-    )?;
-    register_global_native(
-        context,
-        "__terraceReadModuleSource",
-        1,
-        node_read_module_source,
-    )?;
-    register_global_suspend_native(
-        context,
-        "__terraceFsReadTextFile",
-        1,
-        node_fs_read_text_file_suspend,
-    )?;
-    register_global_suspend_native(
-        context,
-        "__terraceFsWriteTextFile",
-        2,
-        node_fs_write_text_file_suspend,
-    )?;
-    register_global_suspend_native(context, "__terraceFsOpen", 3, node_fs_open_suspend)?;
-    register_global_suspend_native(context, "__terraceFsClose", 1, node_fs_close_suspend)?;
-    register_global_native(context, "__terraceFsReadFd", 3, node_fs_read_fd)?;
-    register_global_suspend_native(context, "__terraceFsWriteFd", 3, node_fs_write_fd_suspend)?;
-    register_global_suspend_native(context, "__terraceFsTruncateFd", 2, node_fs_truncate_fd_suspend)?;
-    register_global_suspend_native(context, "__terraceFsMkdir", 1, node_fs_mkdir_suspend)?;
-    register_global_suspend_native(context, "__terraceFsReaddir", 1, node_fs_readdir_suspend)?;
-    register_global_suspend_native(context, "__terraceFsStat", 1, node_fs_stat_suspend)?;
-    register_global_suspend_native(context, "__terraceFsLstat", 1, node_fs_lstat_suspend)?;
-    register_global_suspend_native(context, "__terraceFsReadlink", 1, node_fs_readlink_suspend)?;
-    register_global_native(context, "__terraceFsRealpath", 1, node_fs_realpath)?;
-    register_global_suspend_native(context, "__terraceFsLink", 2, node_fs_link_suspend)?;
-    register_global_suspend_native(context, "__terraceFsSymlink", 2, node_fs_symlink_suspend)?;
-    register_global_suspend_native(context, "__terraceFsUnlink", 1, node_fs_unlink_suspend)?;
-    register_global_suspend_native(context, "__terraceFsRename", 2, node_fs_rename_suspend)?;
-    register_global_native(
-        context,
-        "__terraceCryptoGetHashes",
-        0,
-        node_crypto_get_hashes,
-    )?;
-    register_global_native(context, "__terraceCryptoDigest", 1, node_crypto_digest)?;
-    register_global_native(context, "__terraceCryptoHmac", 1, node_crypto_hmac)?;
-    register_global_native(
-        context,
-        "__terraceCryptoRandomBytes",
-        1,
-        node_crypto_random_bytes,
-    )?;
-    register_global_native(
-        context,
-        "__terraceCryptoRandomInt",
-        2,
-        node_crypto_random_int,
-    )?;
-    register_global_native(
-        context,
-        "__terraceCryptoTimingSafeEqual",
-        2,
-        node_crypto_timing_safe_equal,
-    )?;
-    register_global_native(context, "__terraceCryptoPbkdf2", 1, node_crypto_pbkdf2)?;
-    register_global_native(context, "__terraceCryptoHkdf", 1, node_crypto_hkdf)?;
-    register_global_native(context, "__terraceCryptoScrypt", 1, node_crypto_scrypt)?;
-    register_global_native(context, "__terraceZlibProcess", 4, node_zlib_process)?;
-    register_global_native(context, "__terraceZlibCrc32", 2, node_zlib_crc32)?;
-    register_global_native(
-        context,
-        "__terraceZlibStreamCreate",
-        2,
-        node_zlib_stream_create,
-    )?;
-    register_global_native(
-        context,
-        "__terraceZlibStreamProcess",
-        3,
-        node_zlib_stream_process,
-    )?;
-    register_global_native(
-        context,
-        "__terraceZlibStreamReset",
-        1,
-        node_zlib_stream_reset,
-    )?;
-    register_global_native(
-        context,
-        "__terraceZlibStreamSetParams",
-        3,
-        node_zlib_stream_set_params,
-    )?;
-    register_global_native(
-        context,
-        "__terraceZlibStreamClose",
-        1,
-        node_zlib_stream_close,
-    )?;
-    register_global_suspend_native(
-        context,
-        "__terraceChildProcessRun",
-        1,
-        node_child_process_run_suspend,
-    )?;
-    Ok(())
-}
-
-fn register_global_native(
-    context: &mut Context,
-    name: &str,
-    length: usize,
-    function: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
-) -> Result<(), SandboxError> {
-    let function =
-        FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
-            .name(JsString::from(name))
-            .length(length)
-            .constructor(false)
-            .build();
-    context
-        .register_global_property(JsString::from(name), function, Attribute::all())
-        .map_err(|error| SandboxError::Service {
-            service: "runtime",
-            message: format!("failed to register node host binding `{name}`: {error}"),
-        })
-}
-
-fn register_global_suspend_native(
-    context: &mut Context,
-    name: &str,
-    length: usize,
-    function: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
-) -> Result<(), SandboxError> {
-    let function = FunctionObjectBuilder::new(
-        context.realm(),
-        NativeFunction::from_suspend_fn_ptr(function),
-    )
-    .name(JsString::from(name))
-    .length(length)
-    .constructor(false)
-    .build();
-    context
-        .register_global_property(JsString::from(name), function, Attribute::all())
-        .map_err(|error| SandboxError::Service {
-            service: "runtime",
-            message: format!("failed to register node host binding `{name}`: {error}"),
-        })
-}
-
 fn node_with_host<T>(
     f: impl FnOnce(&NodeRuntimeHost) -> Result<T, SandboxError>,
 ) -> Result<T, SandboxError> {
@@ -4783,7 +4646,7 @@ async fn node_drive_interruptible_value<F>(
     start: F,
 ) -> Result<JsValue, SandboxError>
 where
-    F: FnOnce(&mut Context) -> JsResult<ExecutionOutcome<JsValue>>,
+    F: FnOnce(&mut Context) -> JsResult<InterruptibleCallOutcome<JsValue>>,
 {
     let mut outcome = with_active_node_host(host.clone(), |host| {
         node_check_execution_timeout(host)?;
@@ -4792,8 +4655,16 @@ where
 
     loop {
         match outcome {
-            ExecutionOutcome::Complete(value) => return Ok(value),
-            ExecutionOutcome::Suspended => {
+            InterruptibleCallOutcome::Complete(value) => return Ok(value),
+            InterruptibleCallOutcome::DirectSuspend(continuation) => {
+                context.install_direct_resume(continuation);
+                node_execute_next_host_operation(context, host.clone()).await?;
+                outcome = with_active_node_host(host.clone(), |host| {
+                    node_check_execution_timeout(host)?;
+                    context.resume_interruptible().map_err(sandbox_execution_error)
+                })?;
+            }
+            InterruptibleCallOutcome::NativeSuspend => {
                 node_execute_next_host_operation(context, host.clone()).await?;
                 outcome = with_active_node_host(host.clone(), |host| {
                     node_check_execution_timeout(host)?;
@@ -4810,7 +4681,7 @@ async fn node_drive_interruptible_object<F>(
     start: F,
 ) -> Result<JsObject, SandboxError>
 where
-    F: FnOnce(&mut Context) -> JsResult<ExecutionOutcome<JsObject>>,
+    F: FnOnce(&mut Context) -> JsResult<InterruptibleCallOutcome<JsObject>>,
 {
     let mut outcome = with_active_node_host(host.clone(), |host| {
         node_check_execution_timeout(host)?;
@@ -4819,8 +4690,18 @@ where
 
     loop {
         match outcome {
-            ExecutionOutcome::Complete(value) => return Ok(value),
-            ExecutionOutcome::Suspended => {
+            InterruptibleCallOutcome::Complete(value) => return Ok(value),
+            InterruptibleCallOutcome::DirectSuspend(continuation) => {
+                context.install_direct_resume(continuation);
+                node_execute_next_host_operation(context, host.clone()).await?;
+                outcome = with_active_node_host(host.clone(), |host| {
+                    node_check_execution_timeout(host)?;
+                    context
+                        .resume_interruptible_construct()
+                        .map_err(sandbox_execution_error)
+                })?;
+            }
+            InterruptibleCallOutcome::NativeSuspend => {
                 node_execute_next_host_operation(context, host.clone()).await?;
                 outcome = with_active_node_host(host.clone(), |host| {
                     node_check_execution_timeout(host)?;
@@ -5411,7 +5292,7 @@ impl NodeCommandModuleLoader {
         Self { host }
     }
 
-    fn materialize(
+    async fn materialize_async(
         &self,
         resolved: &NodeResolvedModule,
         context: &mut Context,
@@ -5429,7 +5310,7 @@ impl NodeCommandModuleLoader {
 
         let module = match resolved.kind {
             NodeResolvedKind::Builtin | NodeResolvedKind::CommonJs | NodeResolvedKind::Json => {
-                synthetic_node_namespace_module(resolved, context)?
+                synthetic_node_namespace_module_async(self.host.clone(), resolved, context).await?
             }
             NodeResolvedKind::EsModule => {
                 let loaded = self
@@ -5481,7 +5362,9 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
         .await
         .map_err(js_error)?;
         let mut context = context.borrow_mut();
-        self.materialize(&resolved, &mut context).map_err(js_error)
+        self.materialize_async(&resolved, &mut context)
+            .await
+            .map_err(js_error)
     }
 
     fn init_import_meta(
@@ -5552,13 +5435,16 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
     }
 }
 
-fn synthetic_node_namespace_module(
+async fn synthetic_node_namespace_module_async(
+    host: Rc<NodeRuntimeHost>,
     resolved: &NodeResolvedModule,
     context: &mut Context,
 ) -> Result<Module, SandboxError> {
-    let namespace = node_namespace_for_resolved(resolved, context)?;
-    let exports = node_namespace_export_names(&namespace, context)?;
-    let capture = serde_json::to_string(resolved).map_err(sandbox_execution_error)?;
+    let namespace = node_namespace_for_resolved_async(context, host, resolved).await?;
+    let namespace = namespace.as_object().ok_or_else(|| {
+        sandbox_execution_error("namespace export is not an object")
+    })?;
+    let exports = node_namespace_export_names(&JsValue::from(namespace.clone()), context)?;
     let path = if matches!(resolved.kind, NodeResolvedKind::Builtin) {
         None
     } else {
@@ -5567,26 +5453,20 @@ fn synthetic_node_namespace_module(
     Ok(Module::synthetic(
         &exports,
         SyntheticModuleInitializer::from_copy_closure_with_captures(
-            |module, encoded, context| {
-                let encoded = encoded.to_std_string_escaped();
-                let resolved: NodeResolvedModule = serde_json::from_str(&encoded)
-                    .map_err(|error| js_error(sandbox_execution_error(error)))?;
-                let namespace =
-                    node_namespace_for_resolved(&resolved, context).map_err(js_error)?;
-                let namespace = namespace.as_object().ok_or_else(|| {
-                    js_error(sandbox_execution_error("namespace export is not an object"))
-                })?;
-                for export_name in node_namespace_export_names(&namespace.clone().into(), context)
-                    .map_err(js_error)?
-                {
-                    let value = namespace
+            |module, capture, context| {
+                for export_name in &capture.exports {
+                    let value = capture
+                        .namespace
                         .get(export_name.clone(), context)
                         .map_err(|error| js_error(sandbox_execution_error(error)))?;
                     module.set_export(&export_name, value)?;
                 }
                 Ok(())
             },
-            JsString::from(capture),
+            NodeSyntheticNamespaceCapture {
+                namespace,
+                exports: exports.clone(),
+            },
         ),
         path,
         None,
@@ -5595,25 +5475,172 @@ fn synthetic_node_namespace_module(
     .map_err(sandbox_execution_error)?)
 }
 
-fn node_namespace_for_resolved(
-    resolved: &NodeResolvedModule,
+fn node_builtin_require_object(host: &NodeRuntimeHost) -> Result<JsObject, SandboxError> {
+    host.bootstrap
+        .borrow()
+        .builtin_require
+        .clone()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: "builtin require is not initialized".to_string(),
+        })
+}
+
+async fn node_call_builtin_require_async(
     context: &mut Context,
+    host: Rc<NodeRuntimeHost>,
+    specifier: &str,
 ) -> Result<JsValue, SandboxError> {
-    let helper = context
-        .global_object()
-        .get(js_string!("__terraceNamespaceForResolved"), context)
-        .map_err(sandbox_execution_error)?;
-    let helper = helper
+    let builtin_require = JsValue::from(node_builtin_require_object(&host)?)
         .as_callable()
-        .ok_or_else(|| sandbox_execution_error("__terraceNamespaceForResolved is not callable"))?;
-    let resolved = JsValue::from_json(
-        &serde_json::to_value(resolved).map_err(sandbox_execution_error)?,
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: "<node-runtime>".to_string(),
+            message: "builtin require is not callable".to_string(),
+        })?
+        .clone();
+    let args = [JsValue::from(JsString::from(specifier))];
+    node_drive_interruptible_value(context, host, |context| {
+        builtin_require.call_interruptible(&JsValue::undefined(), &args, context)
+    })
+    .await
+}
+
+async fn node_call_cjs_module_load_async(
+    context: &mut Context,
+    host: Rc<NodeRuntimeHost>,
+    path: &str,
+) -> Result<JsValue, SandboxError> {
+    let loader_module = node_call_builtin_require_async(
         context,
+        host.clone(),
+        "internal/modules/cjs/loader",
     )
-    .map_err(sandbox_execution_error)?;
-    helper
-        .call(&JsValue::undefined(), &[resolved], context)
-        .map_err(sandbox_execution_error)
+    .await?;
+    let loader_module = loader_module.as_object().ok_or_else(|| SandboxError::Execution {
+        entrypoint: path.to_string(),
+        message: "internal/modules/cjs/loader did not return an object".to_string(),
+    })?;
+    let module_ctor = loader_module
+        .get(js_string!("Module"), context)
+        .map_err(sandbox_execution_error)?
+        .as_object()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: path.to_string(),
+            message: "internal/modules/cjs/loader.Module is not an object".to_string(),
+        })?;
+    let load = module_ctor
+        .get(js_string!("_load"), context)
+        .map_err(sandbox_execution_error)?
+        .as_callable()
+        .ok_or_else(|| SandboxError::Execution {
+            entrypoint: path.to_string(),
+            message: "Module._load is not callable".to_string(),
+        })?
+        .clone();
+    let parent = context
+        .global_object()
+        .get(js_string!("process"), context)
+        .map_err(sandbox_execution_error)?
+        .as_object()
+        .and_then(|process| process.get(js_string!("mainModule"), context).ok())
+        .unwrap_or_else(JsValue::null);
+    let args = [
+        JsValue::from(JsString::from(path)),
+        parent,
+        JsValue::from(false),
+    ];
+    node_drive_interruptible_value(context, host, |context| {
+        load.call_interruptible(&JsValue::from(module_ctor.clone()), &args, context)
+    })
+    .await
+}
+
+fn node_namespace_set_export(
+    namespace: &JsObject,
+    name: impl Into<PropertyKey>,
+    value: JsValue,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    let _ = namespace
+        .set(name, value, true, context)
+        .map_err(sandbox_execution_error)?;
+    Ok(())
+}
+
+async fn node_namespace_for_resolved_async(
+    context: &mut Context,
+    host: Rc<NodeRuntimeHost>,
+    resolved: &NodeResolvedModule,
+) -> Result<JsValue, SandboxError> {
+    let namespace = JsObject::with_null_proto();
+    match resolved.kind {
+        NodeResolvedKind::Builtin => {
+            let exports = node_call_builtin_require_async(context, host, &resolved.id).await?;
+            if let Some(exports_object) = exports.as_object() {
+                for key in exports_object
+                    .own_property_keys(context)
+                    .map_err(sandbox_execution_error)?
+                {
+                    let PropertyKey::String(name) = key else {
+                        continue;
+                    };
+                    let value = exports_object
+                        .get(name.clone(), context)
+                        .map_err(sandbox_execution_error)?;
+                    node_namespace_set_export(&namespace, name, value, context)?;
+                }
+            }
+            node_namespace_set_export(&namespace, js_string!("default"), exports, context)?;
+        }
+        NodeResolvedKind::Json => {
+            let exports = node_call_cjs_module_load_async(context, host, &resolved.id).await?;
+            node_namespace_set_export(&namespace, js_string!("default"), exports, context)?;
+        }
+        NodeResolvedKind::CommonJs => {
+            let exports = node_call_cjs_module_load_async(context, host.clone(), &resolved.id).await?;
+            let Some(exports_object) = exports.as_object() else {
+                return Err(SandboxError::Execution {
+                    entrypoint: resolved.id.clone(),
+                    message: "CommonJS module exports is not an object".to_string(),
+                });
+            };
+            let source = host
+                .loaded_modules
+                .borrow()
+                .get(&resolved.id)
+                .map(|module| strip_shebang(&module.source))
+                .ok_or_else(|| SandboxError::ModuleNotFound {
+                    specifier: resolved.id.clone(),
+                })?;
+            for export_name in node_cjs_lexer_collect_named_exports(&source) {
+                let key = JsString::from(export_name.clone());
+                if !exports_object
+                    .has_property(key.clone(), context)
+                    .map_err(sandbox_execution_error)?
+                {
+                    continue;
+                }
+                let value = exports_object
+                    .get(key.clone(), context)
+                    .map_err(sandbox_execution_error)?;
+                node_namespace_set_export(&namespace, key, value, context)?;
+            }
+            node_namespace_set_export(&namespace, js_string!("default"), exports.clone(), context)?;
+            node_namespace_set_export(
+                &namespace,
+                js_string!("module.exports"),
+                exports,
+                context,
+            )?;
+        }
+        NodeResolvedKind::EsModule => {
+            return Err(SandboxError::Execution {
+                entrypoint: resolved.id.clone(),
+                message: "namespace resolution expected a non-ESM module".to_string(),
+            });
+        }
+    }
+    Ok(JsValue::from(namespace))
 }
 
 fn node_namespace_export_names(
@@ -6542,10 +6569,13 @@ fn node_bootstrap_state_bytes(state: &NodeBootstrapState) -> u64 {
     let object_slot_bytes = ([
         state.per_context_exports.is_some(),
         state.primordials.is_some(),
+        state.builtin_require.is_some(),
         state.tick_info.is_some(),
         state.immediate_info.is_some(),
         state.timeout_info.is_some(),
         state.hrtime_buffer.is_some(),
+        state.fs_stat_values.is_some(),
+        state.encoding_encode_into_results.is_some(),
         state.stream_base_state.is_some(),
         state.promise_reject_callback.is_some(),
         state.tick_callback.is_some(),
@@ -7357,7 +7387,9 @@ async fn node_compile_builtin_wrapper_async(
         context,
     )
     .map_err(sandbox_execution_error)?;
-    node_drive_interruptible_value(context, host, |context| script.evaluate_interruptible(context))
+    node_drive_interruptible_value(context, host, |context| {
+        script.evaluate_interruptible(context)
+    })
         .await
 }
 
@@ -11136,11 +11168,8 @@ fn node_fs_dir_handle_close(
 }
 
 fn node_fs_binding_stat_values(context: &mut Context) -> Result<JsObject, SandboxError> {
-    let existing = context
-        .global_object()
-        .get(js_string!("__terraceNodeFsStatValues"), context)
-        .map_err(sandbox_execution_error)?;
-    if let Some(object) = existing.as_object() {
+    let host = active_node_host()?;
+    if let Some(object) = host.bootstrap.borrow().fs_stat_values.clone() {
         return Ok(object);
     }
     let stat_values = JsValue::from_json(&serde_json::json!(vec![0.0; 18]), context)
@@ -11151,7 +11180,7 @@ fn node_fs_binding_stat_values(context: &mut Context) -> Result<JsObject, Sandbo
             entrypoint: "<node-runtime>".to_string(),
             message: "failed to allocate fs statValues scratch array".to_string(),
         })?;
-    node_store_global(context, "__terraceNodeFsStatValues", stat_values)?;
+    host.bootstrap.borrow_mut().fs_stat_values = Some(object.clone());
     Ok(object)
 }
 
@@ -15030,64 +15059,108 @@ fn node_internal_binding_inspector(context: &mut Context) -> Result<JsObject, Sa
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
         (
-            "callAndPauseOnStart",
-            6usize,
-            node_inspector_call_and_pause_on_start
+            "open",
+            2usize,
+            node_inspector_open as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "url",
+            0usize,
+            node_inspector_url as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "waitForDebugger",
+            0usize,
+            node_inspector_wait_for_debugger
                 as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("consoleCall", 3usize, node_inspector_console_call),
-        ("open", 2usize, node_inspector_open),
-        ("url", 0usize, node_inspector_url),
-        ("waitForDebugger", 0usize, node_inspector_wait_for_debugger),
         (
             "asyncTaskScheduled",
             3usize,
-            node_inspector_async_task_scheduled,
+            node_inspector_async_task_scheduled
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "asyncTaskCanceled",
             1usize,
-            node_inspector_async_task_canceled,
+            node_inspector_async_task_canceled
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "asyncTaskStarted",
             1usize,
-            node_inspector_async_task_started,
+            node_inspector_async_task_started
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "asyncTaskFinished",
             1usize,
-            node_inspector_async_task_finished,
+            node_inspector_async_task_finished
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "registerAsyncHook",
             2usize,
-            node_inspector_register_async_hook,
+            node_inspector_register_async_hook
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("isEnabled", 0usize, node_inspector_is_enabled),
+        (
+            "isEnabled",
+            0usize,
+            node_inspector_is_enabled
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         (
             "emitProtocolEvent",
             2usize,
-            node_inspector_emit_protocol_event,
+            node_inspector_emit_protocol_event
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "setupNetworkTracking",
             2usize,
-            node_inspector_setup_network_tracking,
+            node_inspector_setup_network_tracking
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "setConsoleExtensionInstaller",
             1usize,
-            node_inspector_set_console_extension_installer,
+            node_inspector_set_console_extension_installer
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "putNetworkResource",
             2usize,
-            node_inspector_put_network_resource,
+            node_inspector_put_network_resource
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
     ] {
         let value =
             FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(length)
+                .constructor(false)
+                .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    for (name, length, function) in [
+        (
+            "callAndPauseOnStart",
+            6usize,
+            node_inspector_call_and_pause_on_start
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
+        ),
+        (
+            "consoleCall",
+            3usize,
+            node_inspector_console_call
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
+        ),
+    ] {
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_suspend_fn_ptr(function))
                 .name(JsString::from(name))
                 .length(length)
                 .constructor(false)
@@ -15513,33 +15586,176 @@ fn node_internal_binding_watchdog(context: &mut Context) -> Result<JsObject, San
     Ok(object)
 }
 
+fn node_resume_interruptible_native_call(
+    completion: Result<(), boa_engine::JsError>,
+    _capture: &NodeInterruptibleResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let outcome = match completion {
+        Ok(()) => context.resume_interruptible()?,
+        Err(error) => context.resume_interruptible_with_error(error)?,
+    };
+    match outcome {
+        InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
+        InterruptibleCallOutcome::DirectSuspend(continuation) => {
+            Ok(NativeFunctionResult::Suspend(continuation))
+        }
+        InterruptibleCallOutcome::NativeSuspend => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_interruptible_native_call,
+                NodeInterruptibleResume,
+            ),
+        ),
+    }
+}
+
+fn node_call_interruptible_native(
+    callable: &JsObject,
+    this_value: &JsValue,
+    call_args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match callable.call_interruptible(this_value, call_args, context)? {
+        InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
+        InterruptibleCallOutcome::DirectSuspend(continuation) => {
+            Ok(NativeFunctionResult::Suspend(continuation))
+        }
+        InterruptibleCallOutcome::NativeSuspend => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_interruptible_native_call,
+                NodeInterruptibleResume,
+            ),
+        ),
+    }
+}
+
+fn node_start_inspector_console_node_method(
+    capture: &NodeInspectorConsoleCallResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match capture
+        .node_method
+        .call_interruptible(&capture.this_value, &capture.call_args, context)?
+    {
+        InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
+        InterruptibleCallOutcome::DirectSuspend(continuation) => {
+            Ok(NativeFunctionResult::Suspend(continuation))
+        }
+        InterruptibleCallOutcome::NativeSuspend => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_inspector_console_call,
+                NodeInspectorConsoleCallResume {
+                    phase: NodeInspectorConsoleCallPhase::AfterNode,
+                    this_value: capture.this_value.clone(),
+                    node_method: capture.node_method.clone(),
+                    call_args: capture.call_args.clone(),
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_inspector_console_call_after_direct_suspend(
+    completion: Result<(), boa_engine::JsError>,
+    capture: &(NodeInspectorConsoleCallResume, boa_engine::native_function::NativeResume),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let (capture, continuation) = capture;
+    context.install_direct_resume(continuation.clone());
+    node_resume_inspector_console_call(completion, capture, context)
+}
+
+fn node_resume_inspector_console_call(
+    completion: Result<(), boa_engine::JsError>,
+    capture: &NodeInspectorConsoleCallResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let outcome = match completion {
+        Ok(()) => context.resume_interruptible()?,
+        Err(error) => context.resume_interruptible_with_error(error)?,
+    };
+    match capture.phase {
+        NodeInspectorConsoleCallPhase::AfterInspector => match outcome {
+            InterruptibleCallOutcome::Complete(_) => {
+                node_start_inspector_console_node_method(capture, context)
+            }
+            InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+                NativeFunctionResult::suspend_with_copy_closure(
+                    node_resume_inspector_console_call_after_direct_suspend,
+                    (capture.clone(), continuation),
+                ),
+            ),
+            InterruptibleCallOutcome::NativeSuspend => Ok(
+                NativeFunctionResult::suspend_with_copy_closure(
+                    node_resume_inspector_console_call,
+                    capture.clone(),
+                ),
+            ),
+        },
+        NodeInspectorConsoleCallPhase::AfterNode => match outcome {
+            InterruptibleCallOutcome::Complete(value) => {
+                Ok(NativeFunctionResult::complete(value))
+            }
+            InterruptibleCallOutcome::DirectSuspend(continuation) => {
+                Ok(NativeFunctionResult::Suspend(continuation))
+            }
+            InterruptibleCallOutcome::NativeSuspend => Ok(
+                NativeFunctionResult::suspend_with_copy_closure(
+                    node_resume_inspector_console_call,
+                    capture.clone(),
+                ),
+            ),
+        },
+    }
+}
+
 fn node_inspector_call_and_pause_on_start(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let function = args.first().and_then(JsValue::as_callable).ok_or_else(|| {
         JsNativeError::typ().with_message("inspector.callAndPauseOnStart requires callable")
     })?;
     let this_value = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
     let call_args = args.get(2..).unwrap_or(&[]);
-    function.call(&this_value, call_args, context)
+    node_call_interruptible_native(&function, &this_value, call_args, context)
 }
 
 fn node_inspector_console_call(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let inspector_method = args.first().and_then(JsValue::as_callable).ok_or_else(|| {
         JsNativeError::typ().with_message("inspector consoleCall requires inspector callable")
     })?;
     let node_method = args.get(1).and_then(JsValue::as_callable).ok_or_else(|| {
         JsNativeError::typ().with_message("inspector consoleCall requires node callable")
     })?;
-    let call_args = args.get(2..).unwrap_or(&[]);
-    let _ = inspector_method.call(this, call_args, context)?;
-    node_method.call(this, call_args, context)
+    let capture = NodeInspectorConsoleCallResume {
+        phase: NodeInspectorConsoleCallPhase::AfterInspector,
+        this_value: this.clone(),
+        node_method: node_method.clone(),
+        call_args: args.get(2..).unwrap_or(&[]).to_vec(),
+    };
+    match inspector_method.call_interruptible(this, &capture.call_args, context)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            node_start_inspector_console_node_method(&capture, context)
+        }
+        InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_inspector_console_call_after_direct_suspend,
+                (capture, continuation),
+            ),
+        ),
+        InterruptibleCallOutcome::NativeSuspend => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_inspector_console_call,
+                capture,
+            ),
+        ),
+    }
 }
 
 fn node_inspector_open(
@@ -19477,18 +19693,24 @@ fn node_builtins_compile_function_suspend(
 fn node_builtins_set_internal_loaders(
     _this: &JsValue,
     args: &[JsValue],
-    context: &mut Context,
+    _context: &mut Context,
 ) -> JsResult<JsValue> {
-    let internal_binding_loader = args.first().cloned().unwrap_or_else(JsValue::undefined);
-    let builtin_require = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
-    node_store_global(
-        context,
-        "__terraceInternalBindingLoader",
-        internal_binding_loader,
-    )
-    .map_err(js_error)?;
-    node_store_global(context, "__terraceBuiltinRequire", builtin_require).map_err(js_error)?;
-    Ok(JsValue::undefined())
+    node_with_host(|host| {
+        node_debug_event(
+            host,
+            "bootstrap",
+            format!(
+                "setInternalLoaders internalBinding_type={} internalBinding_callable={} requireBuiltin_type={} requireBuiltin_callable={}",
+                args.first().cloned().unwrap_or_else(JsValue::undefined).type_of(),
+                args.first().and_then(JsValue::as_callable).is_some(),
+                args.get(1).cloned().unwrap_or_else(JsValue::undefined).type_of(),
+                args.get(1).and_then(JsValue::as_callable).is_some(),
+            ),
+        )?;
+        host.bootstrap.borrow_mut().builtin_require = args.get(1).and_then(JsValue::as_object);
+        Ok(JsValue::undefined())
+    })
+    .map_err(js_error)
 }
 
 fn node_upstream_builtin_vfs_path(specifier: &str) -> Option<String> {
@@ -21859,154 +22081,6 @@ fn node_modules_save_compile_cache_entry(
     })
 }
 
-fn node_global_escape(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
-    fn is_unescaped(cp: u16) -> bool {
-        let Ok(cp) = u8::try_from(cp) else {
-            return false;
-        };
-        cp.is_ascii_alphanumeric() || [b'_', b'@', b'*', b'+', b'-', b'.', b'/'].contains(&cp)
-    }
-
-    let string = args
-        .first()
-        .cloned()
-        .unwrap_or_else(JsValue::undefined)
-        .to_string(context)?;
-    let mut utf16 = Vec::with_capacity(string.len());
-    for cp in &string {
-        if is_unescaped(cp) {
-            utf16.push(cp);
-            continue;
-        }
-        let escaped = if cp < 256 {
-            format!("%{cp:02X}")
-        } else {
-            format!("%u{cp:04X}")
-        };
-        utf16.extend(escaped.encode_utf16());
-    }
-    Ok(js_string!(&utf16[..]).into())
-}
-
-fn node_global_unescape(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
-    fn to_hex_digit(cp: u16) -> Option<u16> {
-        char::from_u32(u32::from(cp))
-            .and_then(|c| c.to_digit(16))
-            .and_then(|digit| u16::try_from(digit).ok())
-    }
-
-    #[derive(Clone)]
-    struct PeekableN<I, const N: usize>
-    where
-        I: Iterator,
-    {
-        iterator: I,
-        buffer: [I::Item; N],
-        buffered_end: usize,
-    }
-
-    impl<I, const N: usize> PeekableN<I, N>
-    where
-        I: Iterator,
-        I::Item: Default + Copy,
-    {
-        fn new(iterator: I) -> Self {
-            Self {
-                iterator,
-                buffer: [I::Item::default(); N],
-                buffered_end: 0,
-            }
-        }
-
-        fn peek_n(&mut self, count: usize) -> &[I::Item] {
-            if count <= self.buffered_end {
-                return &self.buffer[..count];
-            }
-            for _ in 0..(count - self.buffered_end) {
-                let Some(next) = self.iterator.next() else {
-                    return &self.buffer[..self.buffered_end];
-                };
-                self.buffer[self.buffered_end] = next;
-                self.buffered_end += 1;
-            }
-            &self.buffer[..count]
-        }
-    }
-
-    impl<I, const N: usize> Iterator for PeekableN<I, N>
-    where
-        I: Iterator,
-        I::Item: Copy,
-    {
-        type Item = I::Item;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.buffered_end > 0 {
-                let item = self.buffer[0];
-                self.buffer.rotate_left(1);
-                self.buffered_end -= 1;
-                return Some(item);
-            }
-            self.iterator.next()
-        }
-    }
-
-    let string = args
-        .first()
-        .cloned()
-        .unwrap_or_else(JsValue::undefined)
-        .to_string(context)?;
-    let mut utf16 = Vec::with_capacity(string.len());
-    let mut codepoints = PeekableN::<_, 6>::new(string.iter());
-
-    loop {
-        let Some(cp) = codepoints.next() else {
-            break;
-        };
-        if cp != u16::from(b'%') {
-            utf16.push(cp);
-            continue;
-        }
-
-        let Some(unescaped_cp) = (|| match *codepoints.peek_n(5) {
-            [u, n1, n2, n3, n4] if u == u16::from(b'u') => {
-                let n1 = to_hex_digit(n1)?;
-                let n2 = to_hex_digit(n2)?;
-                let n3 = to_hex_digit(n3)?;
-                let n4 = to_hex_digit(n4)?;
-                for _ in 0..5 {
-                    codepoints.next();
-                }
-                Some((n1 << 12) + (n2 << 8) + (n3 << 4) + n4)
-            }
-            [n1, n2, ..] => {
-                let n1 = to_hex_digit(n1)?;
-                let n2 = to_hex_digit(n2)?;
-                for _ in 0..2 {
-                    codepoints.next();
-                }
-                Some((n1 << 4) + n2)
-            }
-            _ => None,
-        })() else {
-            utf16.push(u16::from(b'%'));
-            continue;
-        };
-
-        utf16.push(unescaped_cp);
-    }
-
-    Ok(js_string!(&utf16[..]).into())
-}
-
 fn node_options_get_cli_options_values(
     _this: &JsValue,
     _args: &[JsValue],
@@ -23806,25 +23880,107 @@ fn node_util_construct_shared_array_buffer(
     Ok(JsValue::from(JsSharedArrayBuffer::new(size, context)?))
 }
 
-fn node_util_lazy_property_getter(
+fn node_finish_lazy_property_getter(
+    exports: JsValue,
+    capture: &NodeUtilLazyPropertyCapture,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    Ok(NativeFunctionResult::complete(
+        exports
+            .as_object()
+            .and_then(|exports| exports.get(capture.key.clone(), context).ok())
+            .unwrap_or_else(JsValue::undefined),
+    ))
+}
+
+fn node_resume_util_lazy_property_getter(
+    completion: Result<(), boa_engine::JsError>,
+    capture: &NodeUtilLazyPropertyCapture,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let outcome = match completion {
+        Ok(()) => context.resume_interruptible()?,
+        Err(error) => context.resume_interruptible_with_error(error)?,
+    };
+    match outcome {
+        InterruptibleCallOutcome::Complete(exports) => {
+            node_finish_lazy_property_getter(exports, capture, context)
+        }
+        InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_lazy_property_getter_after_direct_suspend,
+                (capture.clone(), continuation),
+            ),
+        ),
+        InterruptibleCallOutcome::NativeSuspend => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_lazy_property_getter,
+                capture.clone(),
+            ),
+        ),
+    }
+}
+
+fn node_util_lazy_property_getter_suspend(
     _this: &JsValue,
     _args: &[JsValue],
-    captures: &JsObject,
+    capture: &NodeUtilLazyPropertyCapture,
     context: &mut Context,
-) -> JsResult<JsValue> {
-    let builtin_require = captures
-        .get(js_string!("builtinRequire"), context)?
-        .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("builtin require is not callable"))?;
-    let id = captures.get(js_string!("id"), context)?;
-    let key = captures
-        .get(js_string!("key"), context)?
-        .to_string(context)?;
-    let exports = builtin_require.call(&JsValue::undefined(), &[id], context)?;
-    Ok(exports
-        .as_object()
-        .and_then(|exports| exports.get(key, context).ok())
-        .unwrap_or_else(JsValue::undefined))
+) -> JsResult<NativeFunctionResult> {
+    match capture
+        .builtin_require
+        .call_interruptible(
+            &JsValue::undefined(),
+            &[JsValue::from(capture.id.clone())],
+            context,
+        )?
+    {
+        InterruptibleCallOutcome::Complete(exports) => {
+            node_finish_lazy_property_getter(exports, capture, context)
+        }
+        InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_lazy_property_getter_after_direct_suspend,
+                (capture.clone(), continuation),
+            ),
+        ),
+        InterruptibleCallOutcome::NativeSuspend => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_lazy_property_getter,
+                capture.clone(),
+            ),
+        ),
+    }
+}
+
+fn node_resume_util_lazy_property_getter_after_direct_suspend(
+    completion: Result<(), boa_engine::JsError>,
+    capture: &(NodeUtilLazyPropertyCapture, boa_engine::native_function::NativeResume),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let (capture, continuation) = capture;
+    context.install_direct_resume(continuation.clone());
+    let outcome = match completion {
+        Ok(()) => context.resume_interruptible()?,
+        Err(error) => context.resume_interruptible_with_error(error)?,
+    };
+    match outcome {
+        InterruptibleCallOutcome::Complete(exports) => {
+            node_finish_lazy_property_getter(exports, capture, context)
+        }
+        InterruptibleCallOutcome::DirectSuspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_lazy_property_getter_after_direct_suspend,
+                (capture.clone(), continuation),
+            ),
+        ),
+        InterruptibleCallOutcome::NativeSuspend => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_lazy_property_getter,
+                capture.clone(),
+            ),
+        ),
+    }
 }
 
 fn node_util_guess_handle_type(
@@ -23875,10 +24031,14 @@ fn node_util_define_lazy_properties(
         return Ok(JsValue::undefined());
     };
     let enumerable = args.get(3).is_some_and(JsValue::to_boolean);
-    let builtin_require = context
-        .global_object()
-        .get(js_string!("__terraceBuiltinRequire"), context)?;
-    let builtin_require = builtin_require
+    let host = active_node_host().map_err(js_error)?;
+    let builtin_require = host
+        .bootstrap
+        .borrow()
+        .builtin_require
+        .clone()
+        .ok_or_else(|| JsNativeError::typ().with_message("builtin require is not initialized"))?;
+    let builtin_require = JsValue::from(builtin_require)
         .as_callable()
         .ok_or_else(|| JsNativeError::typ().with_message("builtin require is not callable"))?;
     let length = keys
@@ -23886,25 +24046,15 @@ fn node_util_define_lazy_properties(
         .to_length(context)?;
     for index in 0..length {
         let key = keys.get(index, context)?.to_string(context)?;
-        let captures = JsObject::with_null_proto();
-        captures.set(
-            js_string!("id"),
-            JsValue::from(JsString::from(id.clone())),
-            true,
-            context,
-        )?;
-        captures.set(js_string!("key"), JsValue::from(key.clone()), true, context)?;
-        captures.set(
-            js_string!("builtinRequire"),
-            JsValue::from(builtin_require.clone()),
-            true,
-            context,
-        )?;
         let getter = FunctionObjectBuilder::new(
             context.realm(),
-            NativeFunction::from_copy_closure_with_captures(
-                node_util_lazy_property_getter,
-                captures,
+            NativeFunction::from_suspend_copy_closure_with_captures(
+                node_util_lazy_property_getter_suspend,
+                NodeUtilLazyPropertyCapture {
+                    builtin_require: builtin_require.clone(),
+                    id: JsString::from(id.clone()),
+                    key: key.clone(),
+                },
             ),
         )
         .name(key.clone())
@@ -24273,14 +24423,8 @@ fn node_util_get_external_value(
 }
 
 fn node_encoding_encode_into_results(context: &mut Context) -> Result<JsObject, SandboxError> {
-    let existing = context
-        .global_object()
-        .get(
-            js_string!("__terraceNodeEncodingEncodeIntoResults"),
-            context,
-        )
-        .map_err(sandbox_execution_error)?;
-    if let Some(object) = existing.as_object() {
+    let host = active_node_host()?;
+    if let Some(object) = host.bootstrap.borrow().encoding_encode_into_results.clone() {
         return Ok(object);
     }
     let values =
@@ -24289,7 +24433,7 @@ fn node_encoding_encode_into_results(context: &mut Context) -> Result<JsObject, 
         entrypoint: "<node-runtime>".to_string(),
         message: "failed to allocate encoding encodeIntoResults scratch array".to_string(),
     })?;
-    node_store_global(context, "__terraceNodeEncodingEncodeIntoResults", values)?;
+    host.bootstrap.borrow_mut().encoding_encode_into_results = Some(object.clone());
     Ok(object)
 }
 
@@ -24795,7 +24939,7 @@ async fn node_require_esm_namespace_async(
     }
     node_debug_event(&host, "load", format!("require_esm {}", resolved.id))?;
     let loader = NodeCommandModuleLoader::new(host.clone());
-    let module = loader.materialize(&resolved, context)?;
+    let module = loader.materialize_async(&resolved, context).await?;
     let promise = module.load_link_evaluate(context);
     loop {
         node_check_execution_timeout(&host)?;
