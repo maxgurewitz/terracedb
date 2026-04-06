@@ -22,6 +22,7 @@ use crate::{
     value::Type,
     vm::CompletionRecord,
 };
+use boa_gc::{Finalize, Trace};
 
 fn wrap_get_method_resume(continuation: NativeResume) -> NativeResume {
     NativeResume::from_copy_closure_with_captures(resume_get_method, continuation)
@@ -103,6 +104,224 @@ fn resume_running_call_suspend(
         }
         crate::native_function::NativeFunctionResult::Suspend(next) => Ok(
             crate::native_function::NativeFunctionResult::Suspend(wrap_running_call_suspend(next)),
+        ),
+    }
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct DefineFieldResume {
+    continuation: NativeResume,
+    receiver: JsObject,
+    field_record: ClassFieldDefinition,
+}
+
+fn wrap_define_field_suspend(capture: DefineFieldResume) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_define_field_suspend, capture)
+}
+
+fn finish_define_field(
+    receiver: &JsObject,
+    field_record: &ClassFieldDefinition,
+    init_value: JsValue,
+    context: &mut Context,
+) -> JsResult<()> {
+    match field_record {
+        ClassFieldDefinition::Private(field_name, _) => {
+            receiver.private_field_add(field_name, init_value, context)?;
+        }
+        ClassFieldDefinition::Public(field_name, _, function_name) => {
+            if let Some(function_name) = function_name {
+                set_function_name(
+                    &init_value
+                        .as_object()
+                        .js_expect("init value must be a function object")?,
+                    function_name,
+                    None,
+                    context,
+                )?;
+            }
+
+            receiver.create_data_property_or_throw(field_name.clone(), init_value, context)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn resume_define_field_suspend(
+    completion: CompletionRecord,
+    capture: &DefineFieldResume,
+    context: &mut Context,
+) -> JsResult<crate::native_function::NativeFunctionResult> {
+    match capture.continuation.call(completion, context)? {
+        crate::native_function::NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(init_value) | CompletionRecord::Return(init_value) => {
+                finish_define_field(&capture.receiver, &capture.field_record, init_value, context)?;
+                Ok(crate::native_function::NativeFunctionResult::complete(
+                    JsValue::undefined(),
+                ))
+            }
+            CompletionRecord::Throw(err) => Ok(
+                crate::native_function::NativeFunctionResult::from_completion(
+                    CompletionRecord::Throw(err),
+                ),
+            ),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("define field continuation resumed with unexpected suspend completion")
+                .into()),
+        },
+        crate::native_function::NativeFunctionResult::Suspend(next) => Ok(
+            crate::native_function::NativeFunctionResult::Suspend(wrap_define_field_suspend(
+                DefineFieldResume {
+                    continuation: next,
+                    receiver: capture.receiver.clone(),
+                    field_record: capture.field_record.clone(),
+                },
+            )),
+        ),
+    }
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct InitializeInstanceElementsResume {
+    continuation: NativeResume,
+    receiver: JsObject,
+    constructor: JsObject,
+    next_field_index: usize,
+}
+
+fn wrap_initialize_instance_elements_suspend(capture: InitializeInstanceElementsResume) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_initialize_instance_elements_suspend,
+        capture,
+    )
+}
+
+fn continue_initialize_instance_elements_from_index(
+    receiver: &JsObject,
+    constructor: &JsObject,
+    start_index: usize,
+    context: &mut Context,
+) -> JsResult<ExecutionOutcome<()>> {
+    let constructor_function = constructor
+        .downcast_ref::<OrdinaryFunction>()
+        .js_expect("class constructor must be function object")?;
+
+    for (index, field_record) in constructor_function.get_fields().iter().enumerate().skip(start_index) {
+        match receiver.define_field_interruptible(field_record, context)? {
+            ExecutionOutcome::Complete(()) => {}
+            ExecutionOutcome::Suspend(continuation) => {
+                return Ok(ExecutionOutcome::Suspend(
+                    wrap_initialize_instance_elements_suspend(InitializeInstanceElementsResume {
+                        continuation,
+                        receiver: receiver.clone(),
+                        constructor: constructor.clone(),
+                        next_field_index: index + 1,
+                    }),
+                ));
+            }
+        }
+    }
+
+    Ok(ExecutionOutcome::Complete(()))
+}
+
+fn resume_initialize_instance_elements_suspend(
+    completion: CompletionRecord,
+    capture: &InitializeInstanceElementsResume,
+    context: &mut Context,
+) -> JsResult<crate::native_function::NativeFunctionResult> {
+    match capture.continuation.call(completion, context)? {
+        crate::native_function::NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                match continue_initialize_instance_elements_from_index(
+                    &capture.receiver,
+                    &capture.constructor,
+                    capture.next_field_index,
+                    context,
+                )? {
+                    ExecutionOutcome::Complete(()) => Ok(
+                        crate::native_function::NativeFunctionResult::complete(JsValue::undefined()),
+                    ),
+                    ExecutionOutcome::Suspend(continuation) => Ok(
+                        crate::native_function::NativeFunctionResult::Suspend(continuation),
+                    ),
+                }
+            }
+            CompletionRecord::Throw(err) => Ok(
+                crate::native_function::NativeFunctionResult::from_completion(
+                    CompletionRecord::Throw(err),
+                ),
+            ),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message(
+                    "initialize instance elements continuation resumed with unexpected suspend completion",
+                )
+                .into()),
+        },
+        crate::native_function::NativeFunctionResult::Suspend(next) => Ok(
+            crate::native_function::NativeFunctionResult::Suspend(
+                wrap_initialize_instance_elements_suspend(InitializeInstanceElementsResume {
+                    continuation: next,
+                    receiver: capture.receiver.clone(),
+                    constructor: capture.constructor.clone(),
+                    next_field_index: capture.next_field_index,
+                }),
+            ),
+        ),
+    }
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct ValueInvokeResume {
+    continuation: NativeResume,
+    this_value: JsValue,
+    args: Vec<JsValue>,
+}
+
+fn wrap_value_invoke_resume(capture: ValueInvokeResume) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_value_invoke, capture)
+}
+
+fn resume_value_invoke(
+    completion: CompletionRecord,
+    capture: &ValueInvokeResume,
+    context: &mut Context,
+) -> JsResult<crate::native_function::NativeFunctionResult> {
+    match capture.continuation.call(completion, context)? {
+        crate::native_function::NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(func) | CompletionRecord::Return(func) => {
+                let Some(object) = func.as_object() else {
+                    return Err(JsNativeError::typ()
+                        .with_message("value returned for property of object is not a function")
+                        .into());
+                };
+                match object.call_interruptible(&capture.this_value, &capture.args, context)? {
+                    InterruptibleCallOutcome::Complete(value) => Ok(
+                        crate::native_function::NativeFunctionResult::complete(value),
+                    ),
+                    InterruptibleCallOutcome::Suspend(continuation) => Ok(
+                        crate::native_function::NativeFunctionResult::Suspend(continuation),
+                    ),
+                }
+            }
+            CompletionRecord::Throw(err) => Ok(
+                crate::native_function::NativeFunctionResult::from_completion(
+                    CompletionRecord::Throw(err),
+                ),
+            ),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message("invoke continuation resumed with unexpected suspend completion")
+                .into()),
+        },
+        crate::native_function::NativeFunctionResult::Suspend(next) => Ok(
+            crate::native_function::NativeFunctionResult::Suspend(wrap_value_invoke_resume(
+                ValueInvokeResume {
+                    continuation: next,
+                    this_value: capture.this_value.clone(),
+                    args: capture.args.clone(),
+                },
+            )),
         ),
     }
 }
@@ -529,9 +748,17 @@ impl JsObject {
     ) -> JsResult<JsValue> {
         match self.call_interruptible(this, args, context)? {
             InterruptibleCallOutcome::Complete(value) => Ok(value),
-            InterruptibleCallOutcome::Suspend(_) => Err(JsNativeError::error()
-                .with_message("suspendable native function requires interruptible execution")
-                .into()),
+            InterruptibleCallOutcome::Suspend(_) => {
+                let caller = std::panic::Location::caller();
+                Err(JsNativeError::error()
+                    .with_message(format!(
+                        "suspendable native function requires interruptible execution at {}:{}:{}",
+                        caller.file(),
+                        caller.line(),
+                        caller.column(),
+                    ))
+                    .into())
+            }
         }
     }
 
@@ -1382,46 +1609,37 @@ impl JsObject {
         field_record: &ClassFieldDefinition,
         context: &mut Context,
     ) -> JsResult<()> {
-        // 2. Let initializer be fieldRecord.[[Initializer]].
+        match self.define_field_interruptible(field_record, context)? {
+            ExecutionOutcome::Complete(()) => Ok(()),
+            ExecutionOutcome::Suspend(_) => Err(JsNativeError::error()
+                .with_message("define field suspended during synchronous execution")
+                .into()),
+        }
+    }
+
+    pub(crate) fn define_field_interruptible(
+        &self,
+        field_record: &ClassFieldDefinition,
+        context: &mut Context,
+    ) -> JsResult<ExecutionOutcome<()>> {
         let initializer = match field_record {
             ClassFieldDefinition::Public(_, function, _)
             | ClassFieldDefinition::Private(_, function) => function,
         };
 
-        // 3. If initializer is not empty, then
-        // a. Let initValue be ? Call(initializer, receiver).
-        // 4. Else, let initValue be undefined.
-        let init_value = initializer.call(&self.clone().into(), &[], context)?;
-
-        match field_record {
-            // 1. Let fieldName be fieldRecord.[[Name]].
-            // 5. If fieldName is a Private Name, then
-            ClassFieldDefinition::Private(field_name, _) => {
-                // a. Perform ? PrivateFieldAdd(receiver, fieldName, initValue).
-                self.private_field_add(field_name, init_value, context)?;
+        match initializer.call_interruptible(&self.clone().into(), &[], context)? {
+            InterruptibleCallOutcome::Complete(init_value) => {
+                finish_define_field(self, field_record, init_value, context)?;
+                Ok(ExecutionOutcome::Complete(()))
             }
-            // 1. Let fieldName be fieldRecord.[[Name]].
-            // 6. Else,
-            ClassFieldDefinition::Public(field_name, _, function_name) => {
-                if let Some(function_name) = function_name {
-                    set_function_name(
-                        &init_value
-                            .as_object()
-                            .js_expect("init value must be a function object")?,
-                        function_name,
-                        None,
-                        context,
-                    )?;
-                }
-
-                // a. Assert: IsPropertyKey(fieldName) is true.
-                // b. Perform ? CreateDataPropertyOrThrow(receiver, fieldName, initValue).
-                self.create_data_property_or_throw(field_name.clone(), init_value, context)?;
-            }
+            InterruptibleCallOutcome::Suspend(continuation) => Ok(ExecutionOutcome::Suspend(
+                wrap_define_field_suspend(DefineFieldResume {
+                    continuation,
+                    receiver: self.clone(),
+                    field_record: field_record.clone(),
+                }),
+            )),
         }
-
-        // 7. Return unused.
-        Ok(())
     }
 
     /// Abstract operation `InitializeInstanceElements ( O, constructor )`
@@ -1437,6 +1655,19 @@ impl JsObject {
         constructor: &Self,
         context: &mut Context,
     ) -> JsResult<()> {
+        match self.initialize_instance_elements_interruptible(constructor, context)? {
+            ExecutionOutcome::Complete(()) => Ok(()),
+            ExecutionOutcome::Suspend(_) => Err(JsNativeError::error()
+                .with_message("initialize instance elements suspended during synchronous execution")
+                .into()),
+        }
+    }
+
+    pub(crate) fn initialize_instance_elements_interruptible(
+        &self,
+        constructor: &Self,
+        context: &mut Context,
+    ) -> JsResult<ExecutionOutcome<()>> {
         let constructor_function = constructor
             .downcast_ref::<OrdinaryFunction>()
             .js_expect("class constructor must be function object")?;
@@ -1448,15 +1679,7 @@ impl JsObject {
             self.private_method_or_accessor_add(name, method, context)?;
         }
 
-        // 3. Let fields be the value of constructor.[[Fields]].
-        // 4. For each element fieldRecord of fields, do
-        for field_record in constructor_function.get_fields() {
-            // a. Perform ? DefineField(O, fieldRecord).
-            self.define_field(field_record, context)?;
-        }
-
-        // 5. Return unused.
-        Ok(())
+        continue_initialize_instance_elements_from_index(self, constructor, 0, context)
     }
 
     /// Abstract operation `Invoke ( V, P [ , argumentsList ] )`
@@ -1716,6 +1939,25 @@ impl JsValue {
         object.call(this, args, context)
     }
 
+    #[inline]
+    pub(crate) fn call_interruptible(
+        &self,
+        this: &Self,
+        args: &[Self],
+        context: &mut Context,
+    ) -> JsResult<InterruptibleCallOutcome<Self>> {
+        let Some(object) = self.as_object() else {
+            return Err(JsNativeError::typ()
+                .with_message(format!(
+                    "value with type `{}` is not callable",
+                    self.type_of()
+                ))
+                .into());
+        };
+
+        object.call_interruptible(this, args, context)
+    }
+
     /// Abstract operation `( V, P [ , argumentsList ] )`
     ///
     /// Calls a method property of an ECMAScript language value.
@@ -1735,6 +1977,49 @@ impl JsValue {
 
         // 3. Return ? Call(func, V, argumentsList)
         func.call(self, args, context)
+    }
+
+    pub(crate) fn invoke_interruptible<K>(
+        &self,
+        key: K,
+        args: &[Self],
+        context: &mut Context,
+    ) -> JsResult<ExecutionOutcome<Self>>
+    where
+        K: Into<PropertyKey>,
+    {
+        match self.get_v_interruptible(key, context)? {
+            ExecutionOutcome::Complete(func) => {
+                Ok(self.call_interruptible_from_value(func, args, context)?)
+            }
+            ExecutionOutcome::Suspend(continuation) => Ok(ExecutionOutcome::Suspend(
+                wrap_value_invoke_resume(ValueInvokeResume {
+                    continuation,
+                    this_value: self.clone(),
+                    args: args.to_vec(),
+                }),
+            )),
+        }
+    }
+
+    fn call_interruptible_from_value(
+        &self,
+        func: JsValue,
+        args: &[Self],
+        context: &mut Context,
+    ) -> JsResult<ExecutionOutcome<Self>> {
+        let Some(object) = func.as_object() else {
+            return Err(JsNativeError::typ()
+                .with_message("value returned for property of object is not a function")
+                .into());
+        };
+
+        match object.call_interruptible(self, args, context)? {
+            InterruptibleCallOutcome::Complete(value) => Ok(ExecutionOutcome::Complete(value)),
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                Ok(ExecutionOutcome::Suspend(continuation))
+            }
+        }
     }
 
     /// Abstract operation `OrdinaryHasInstance ( C, O )`

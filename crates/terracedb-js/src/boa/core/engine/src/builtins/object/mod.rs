@@ -20,12 +20,12 @@ use crate::builtins::function::arguments::{MappedArguments, UnmappedArguments};
 use crate::value::JsVariant;
 use crate::{
     Context, JsArgs, JsData, JsExpect, JsResult, JsString,
-    builtins::{BuiltInObject, iterable::IteratorHint, map},
+    builtins::{BuiltInObject, Number, iterable::IteratorHint, map},
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     js_error, js_string,
-    native_function::NativeFunction,
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
     object::{
-        FunctionObjectBuilder, IntegrityLevel, JsObject,
+        FunctionObjectBuilder, IntegrityLevel, InterruptibleCallOutcome, JsObject,
         internal_methods::{InternalMethodPropertyContext, get_prototype_from_constructor},
     },
     property::{Attribute, PropertyDescriptor, PropertyKey, PropertyNameKind},
@@ -33,10 +33,12 @@ use crate::{
     string::StaticJsStrings,
     symbol::JsSymbol,
     value::JsValue,
+    vm::CompletionRecord,
 };
 use boa_gc::{Finalize, Trace};
 use boa_macros::js_str;
 use tap::{Conv, Pipe};
+use crate::builtins::iterable::IteratorRecord;
 
 pub(crate) mod for_in_iterator;
 #[cfg(test)]
@@ -46,6 +48,22 @@ mod tests;
 #[derive(Debug, Default, Clone, Copy, Trace, Finalize, JsData)]
 #[boa_gc(empty_trace)]
 pub struct OrdinaryObject;
+
+#[derive(Clone, Trace, Finalize)]
+struct ObjectFromEntriesState {
+    object: JsObject,
+    adder: JsObject,
+    iterator_record: IteratorRecord,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct ObjectGroupByState {
+    iterator: IteratorRecord,
+    callback: JsObject,
+    groups: Vec<(JsValue, Vec<JsValue>)>,
+    k: u64,
+    pending_value: JsValue,
+}
 
 impl IntrinsicObject for OrdinaryObject {
     fn init(realm: &Realm) -> crate::JsResult<()> {
@@ -133,8 +151,16 @@ impl IntrinsicObject for OrdinaryObject {
                 1,
             )
             .static_method(Self::has_own, js_string!("hasOwn"), 2)
-            .static_method(Self::from_entries, js_string!("fromEntries"), 1)
-            .static_method(Self::group_by, js_string!("groupBy"), 2)
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::from_entries),
+                js_string!("fromEntries"),
+                1,
+            )
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::group_by),
+                js_string!("groupBy"),
+                2,
+            )
             .build()?;
 
         Ok(())
@@ -1295,7 +1321,11 @@ impl OrdinaryObject {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-object.fromentries
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/fromEntries
-    pub fn from_entries(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    pub fn from_entries(
+        _: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Perform ? RequireObjectCoercible(iterable).
         let iterable = args.get_or_undefined(0).require_object_coercible()?;
 
@@ -1329,7 +1359,7 @@ impl OrdinaryObject {
         let adder = closure.length(2).name("").build();
 
         // 6. Return ? AddEntriesFromIterable(obj, iterable, adder).
-        map::add_entries_from_iterable(&obj, iterable, &adder, context)
+        map::add_entries_from_iterable_interruptible(&obj, iterable, &adder, context)
     }
 
     /// [`Object.groupBy ( items, callbackfn )`][spec]
@@ -1339,14 +1369,7 @@ impl OrdinaryObject {
         _: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
-        use std::hash::BuildHasherDefault;
-
-        use indexmap::IndexMap;
-        use rustc_hash::FxHasher;
-
-        use crate::builtins::{Number, iterable::if_abrupt_close_iterator};
-
+    ) -> JsResult<NativeFunctionResult> {
         let items = args.get_or_undefined(0);
         let callback = args.get_or_undefined(1);
         // 1. Let groups be ? GroupBy(items, callbackfn, property).
@@ -1363,72 +1386,121 @@ impl OrdinaryObject {
             .as_callable()
             .ok_or_else(|| js_error!(TypeError: "callback must be a callable object"))?;
 
-        // 3. Let groups be a new empty List.
-        let mut groups: IndexMap<PropertyKey, Vec<JsValue>, BuildHasherDefault<FxHasher>> =
-            IndexMap::default();
+        let state = ObjectGroupByState {
+            iterator: items.get_iterator(IteratorHint::Sync, context)?,
+            callback: callback.clone(),
+            groups: Vec::new(),
+            k: 0,
+            pending_value: JsValue::undefined(),
+        };
 
-        // 4. Let iteratorRecord be ? GetIterator(items, sync).
-        let mut iterator = items.get_iterator(IteratorHint::Sync, context)?;
+        Self::object_group_by_step(state, context)
+    }
 
-        // 5. Let k be 0.
-        let mut k = 0u64;
+    fn object_group_by_step(
+        mut state: ObjectGroupByState,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        use crate::builtins::Array;
 
-        // 6. Repeat,
         loop {
-            // a. If k ≥ 2^53 - 1, then
-            if k >= Number::MAX_SAFE_INTEGER as u64 {
-                // i. Let error be ThrowCompletion(a newly created TypeError object).
+            if state.k >= Number::MAX_SAFE_INTEGER as u64 {
                 let error = js_error!(TypeError: "exceeded maximum safe integer");
-
-                // ii. Return ? IteratorClose(iteratorRecord, error).
-                return iterator.close(Err(error), context);
+                return state
+                    .iterator
+                    .close(Err(error), context)
+                    .map(NativeFunctionResult::complete);
             }
 
-            // b. Let next be ? IteratorStepValue(iteratorRecord).
-            let Some(next) = iterator.step_value(context)? else {
-                // c. If next is false, then
-                // i. Return groups.
-                break;
+            let Some(next) = state.iterator.step_value(context)? else {
+                let obj = JsObject::try_with_null_proto()?;
+                for (key, elements) in std::mem::take(&mut state.groups) {
+                    let elements = Array::create_array_from_list(elements, context)?;
+                    obj.create_data_property_or_throw(key.to_property_key(context)?, elements, context)
+                        .js_expect("cannot fail for a newly created object")?;
+                }
+                return Ok(NativeFunctionResult::complete(obj));
             };
 
-            // d. Let value be next.
             let value = next;
-
-            // e. Let key be Completion(Call(callbackfn, undefined, « value, 𝔽(k) »)).
-            let key = callback.call(&JsValue::undefined(), &[value.clone(), k.into()], context);
-
-            // f. IfAbruptCloseIterator(key, iteratorRecord).
-            let key = if_abrupt_close_iterator!(key, iterator, context);
-
-            // g. If keyCoercion is property, then
-            //     i. Set key to Completion(ToPropertyKey(key)).
-            let key = key.to_property_key(context);
-
-            //     ii. IfAbruptCloseIterator(key, iteratorRecord).
-            let key = if_abrupt_close_iterator!(key, iterator, context);
-
-            // i. Perform AddValueToKeyedGroup(groups, key, value).
-            groups.entry(key).or_default().push(value);
-
-            // j. Set k to k + 1.
-            k += 1;
+            state.pending_value = value.clone();
+            match state.callback.call_interruptible(
+                &JsValue::undefined(),
+                &[value.clone(), state.k.into()],
+                context,
+            )? {
+                InterruptibleCallOutcome::Complete(key) => {
+                    let key = key.to_property_key(context)?;
+                    let key_value: JsValue = key.clone().into();
+                    if let Some((_, elements)) =
+                        state.groups.iter_mut().find(|(existing, _)| {
+                            existing
+                                .to_property_key(context)
+                                .map(|existing| existing == key)
+                                .unwrap_or(false)
+                        })
+                    {
+                        elements.push(value);
+                    } else {
+                        state.groups.push((key_value, vec![value]));
+                    }
+                    state.k += 1;
+                }
+                InterruptibleCallOutcome::Suspend(next) => {
+                    return Ok(NativeFunctionResult::Suspend(
+                        NativeResume::from_copy_closure_with_captures(
+                            Self::resume_object_group_by_after_callback,
+                            (next, state),
+                        ),
+                    ));
+                }
+            }
         }
+    }
 
-        // 2. Let obj be OrdinaryObjectCreate(null).
-        let obj = JsObject::try_with_null_proto()?;
-
-        // 3. For each Record { [[Key]], [[Elements]] } g of groups, do
-        for (key, elements) in groups {
-            // a. Let elements be CreateArrayFromList(g.[[Elements]]).
-            let elements = Array::create_array_from_list(elements, context)?;
-
-            // b. Perform ! CreateDataPropertyOrThrow(obj, g.[[Key]], elements).
-            obj.create_data_property_or_throw(key, elements, context)
-                .js_expect("cannot fail for a newly created object")?;
+    fn resume_object_group_by_after_callback(
+        completion: CompletionRecord,
+        captures: &(NativeResume, ObjectGroupByState),
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        match captures.0.call(completion, context)? {
+            NativeFunctionResult::Complete(record) => match record {
+                CompletionRecord::Normal(key) | CompletionRecord::Return(key) => {
+                    let mut state = captures.1.clone();
+                    let key = key.to_property_key(context)?;
+                    let key_value: JsValue = key.clone().into();
+                    if let Some((_, elements)) =
+                        state.groups.iter_mut().find(|(existing, _)| {
+                            existing
+                                .to_property_key(context)
+                                .map(|existing| existing == key)
+                                .unwrap_or(false)
+                        })
+                    {
+                        elements.push(state.pending_value.clone());
+                    } else {
+                        state
+                            .groups
+                            .push((key_value, vec![state.pending_value.clone()]));
+                    }
+                    state.k += 1;
+                    Self::object_group_by_step(state, context)
+                }
+                CompletionRecord::Throw(err) => {
+                    let _ = captures.1.iterator.clone().close(Err(err.clone()), context);
+                    Ok(NativeFunctionResult::from_completion(CompletionRecord::Throw(err)))
+                }
+                CompletionRecord::Suspend => Err(js_error!(
+                    TypeError: "Object.groupBy resumed with unexpected suspend completion"
+                )),
+            },
+            NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+                NativeResume::from_copy_closure_with_captures(
+                    Self::resume_object_group_by_after_callback,
+                    (next, captures.1.clone()),
+                ),
+            )),
         }
-
-        // 4. Return obj.
-        Ok(obj.into())
     }
 }
 

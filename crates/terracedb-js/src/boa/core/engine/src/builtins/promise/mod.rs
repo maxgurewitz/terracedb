@@ -18,9 +18,9 @@ use crate::{
     error::JsNativeError,
     job::{JobCallback, PromiseJob},
     js_string,
-    native_function::{NativeFunction, NativeFunctionResult},
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
     object::{
-        CONSTRUCTOR, FunctionObjectBuilder, JsFunction, JsObject,
+        CONSTRUCTOR, FunctionObjectBuilder, InterruptibleCallOutcome, JsFunction, JsObject,
         internal_methods::get_prototype_from_constructor,
     },
     property::Attribute,
@@ -28,6 +28,7 @@ use crate::{
     string::StaticJsStrings,
     symbol::JsSymbol,
     value::JsValue,
+    vm::CompletionRecord,
 };
 use boa_gc::{Finalize, Gc, GcRefCell, Trace, custom_trace};
 use boa_macros::JsData;
@@ -337,6 +338,49 @@ impl PromiseCapability {
     }
 }
 
+fn wrap_promise_try_resume(continuation: NativeResume, capability: PromiseCapability) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_promise_try_after_callback,
+        (continuation, capability),
+    )
+}
+
+fn resume_promise_try_after_callback(
+    completion: CompletionRecord,
+    captures: &(NativeResume, PromiseCapability),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match captures.0.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                CompletionRecord::Normal(value) | CompletionRecord::Return(value) => value,
+                CompletionRecord::Throw(err) => {
+                    let err: JsValue = err.into_opaque(context)?;
+                    captures
+                        .1
+                        .reject()
+                        .call(&JsValue::undefined(), &[err], context)?;
+                    return Ok(NativeFunctionResult::complete(captures.1.promise().clone()));
+                }
+                CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message("promise callback continuation resumed with unexpected suspend completion")
+                        .into());
+                }
+            };
+
+            captures
+                .1
+                .resolve()
+                .call(&JsValue::undefined(), &[value], context)?;
+            Ok(NativeFunctionResult::complete(captures.1.promise().clone()))
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_promise_try_resume(next, captures.1.clone()),
+        )),
+    }
+}
+
 impl IntrinsicObject for Promise {
     fn init(realm: &Realm) -> crate::JsResult<()> {
         let get_species = BuiltInBuilder::callable(realm, Self::get_species)
@@ -350,7 +394,11 @@ impl IntrinsicObject for Promise {
             .static_method(Self::race, js_string!("race"), 1)
             .static_method(Self::reject, js_string!("reject"), 1)
             .static_method(Self::resolve, js_string!("resolve"), 1)
-            .static_method(Self::r#try, js_string!("try"), 1)
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::r#try),
+                js_string!("try"),
+                1,
+            )
             .static_method(Self::with_resolvers, js_string!("withResolvers"), 0)
             .static_accessor(
                 JsSymbol::species(),
@@ -364,7 +412,11 @@ impl IntrinsicObject for Promise {
                 js_string!("catch"),
                 1,
             )
-            .method(Self::finally, js_string!("finally"), 1)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::finally),
+                js_string!("finally"),
+                1,
+            )
             // <https://tc39.es/ecma262/#sec-promise.prototype-@@tostringtag>
             .property(
                 JsSymbol::to_string_tag(),
@@ -490,8 +542,12 @@ impl Promise {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
-        let callback = args.get_or_undefined(0);
+    ) -> JsResult<NativeFunctionResult> {
+        let Some(callback) = args.get_or_undefined(0).as_callable() else {
+            return Err(JsNativeError::typ()
+                .with_message("Promise.try() callback is not callable")
+                .into());
+        };
         let callback_args = args.get(1..).unwrap_or(&[]);
 
         // 1. Let C be the this value.
@@ -504,22 +560,17 @@ impl Promise {
         let promise_capability = PromiseCapability::new(&c, context)?;
 
         // 4. Let status be Completion(Call(callbackfn, undefined, args)).
-        let status = callback.call(&JsValue::undefined(), callback_args, context);
-
-        match status {
+        match callback.call_interruptible(&JsValue::undefined(), callback_args, context) {
             // 5. If status is an abrupt completion, then
             Err(err) => {
-                let value = err.into_opaque(context)?;
-
-                // a. Perform ? Call(promiseCapability.[[Reject]], undefined, « status.[[Value]] »).
+                let value: JsValue = err.into_opaque(context)?;
                 promise_capability.functions.reject.call(
                     &JsValue::undefined(),
                     &[value],
                     context,
                 )?;
             }
-            // 6. Else,
-            Ok(value) => {
+            Ok(InterruptibleCallOutcome::Complete(value)) => {
                 // a. Perform ? Call(promiseCapability.[[Resolve]], undefined, « status.[[Value]] »).
                 promise_capability.functions.resolve.call(
                     &JsValue::undefined(),
@@ -527,10 +578,16 @@ impl Promise {
                     context,
                 )?;
             }
+            Ok(InterruptibleCallOutcome::Suspend(continuation)) => {
+                return Ok(NativeFunctionResult::Suspend(wrap_promise_try_resume(
+                    continuation,
+                    promise_capability.clone(),
+                )));
+            }
         }
 
         // 7. Return promiseCapability.[[Promise]].
-        Ok(promise_capability.promise.clone().into())
+        Ok(NativeFunctionResult::complete(promise_capability.promise.clone()))
     }
 
     /// [`Promise.withResolvers ( )`][spec]
@@ -1970,7 +2027,7 @@ impl Promise {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let promise be the this value.
         let promise = this;
 
@@ -1995,7 +2052,23 @@ impl Promise {
             //    b. Let catchFinally be onFinally.
             // 7. Return ? Invoke(promise, "then", « thenFinally, catchFinally »).
             let then = promise.get(js_string!("then"), context)?;
-            return then.call(this, &[on_finally.clone(), on_finally.clone()], context);
+            let Some(then) = then.as_callable() else {
+                return Err(JsNativeError::typ()
+                    .with_message("Promise.prototype.then is not callable")
+                    .into());
+            };
+            return match then.call_interruptible(
+                this,
+                &[on_finally.clone(), on_finally.clone()],
+                context,
+            )? {
+                InterruptibleCallOutcome::Complete(value) => {
+                    Ok(NativeFunctionResult::complete(value))
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    Ok(NativeFunctionResult::Suspend(continuation))
+                }
+            };
         };
 
         let (then_finally, catch_finally) =
@@ -2003,7 +2076,18 @@ impl Promise {
 
         // 7. Return ? Invoke(promise, "then", « thenFinally, catchFinally »).
         let then = promise.get(js_string!("then"), context)?;
-        then.call(this, &[then_finally.into(), catch_finally.into()], context)
+        let Some(then) = then.as_callable() else {
+            return Err(JsNativeError::typ()
+                .with_message("Promise.prototype.then is not callable")
+                .into());
+        };
+        match then.call_interruptible(this, &[then_finally.into(), catch_finally.into()], context)?
+        {
+            InterruptibleCallOutcome::Complete(value) => Ok(NativeFunctionResult::complete(value)),
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                Ok(NativeFunctionResult::Suspend(continuation))
+            }
+        }
     }
 
     pub(crate) fn then_catch_finally_closures(

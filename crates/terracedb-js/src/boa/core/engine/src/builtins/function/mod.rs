@@ -17,11 +17,12 @@ use crate::{
         BuiltInBuilder, BuiltInConstructor, BuiltInObject, IntrinsicObject, OrdinaryObject,
     },
     bytecompiler::FunctionCompiler,
+    context::ExecutionOutcome,
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     environments::{EnvironmentStack, FunctionSlots, PrivateEnvironment, ThisBindingStatus},
     error::JsNativeError,
     js_error, js_string,
-    native_function::{NativeFunction, NativeFunctionObject, NativeFunctionResult},
+    native_function::{NativeFunction, NativeFunctionObject, NativeFunctionResult, NativeResume},
     object::{
         InterruptibleCallOutcome, JsData, JsFunction, JsObject, PrivateElement, PrivateName,
         internal_methods::{
@@ -34,7 +35,7 @@ use crate::{
     string::StaticJsStrings,
     symbol::JsSymbol,
     value::IntegerOrInfinity,
-    vm::{ActiveRunnable, CallFrame, CallFrameFlags, CodeBlock},
+    vm::{ActiveRunnable, CallFrame, CallFrameFlags, CodeBlock, CompletionRecord},
 };
 use boa_ast::{
     Position, Span, Spanned, StatementList,
@@ -975,6 +976,156 @@ impl BuiltInFunctionObject {
     }
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct FunctionConstructInitializationResume {
+    continuation: NativeResume,
+    this_function_object: JsObject,
+    new_target: JsValue,
+    this: JsObject,
+    argument_count: usize,
+}
+
+fn wrap_function_construct_initialization_suspend(
+    capture: FunctionConstructInitializationResume,
+) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_function_construct_initialization,
+        capture,
+    )
+}
+
+fn prepare_function_construct_frame(
+    this_function_object: &JsObject,
+    new_target: &JsValue,
+    this: Option<JsObject>,
+    argument_count: usize,
+    context: &mut InternalMethodCallContext<'_>,
+) -> JsResult<()> {
+    let function = this_function_object
+        .downcast_ref::<OrdinaryFunction>()
+        .js_expect("not a function")?;
+    let realm = function.realm().clone();
+
+    debug_assert!(
+        function.is_ordinary(),
+        "only ordinary functions can be constructed"
+    );
+
+    let code = function.code.clone();
+    let environments = function.environments.clone();
+    let script_or_module = function.script_or_module.clone();
+    let env_fp = environments.len() as u32;
+    drop(function);
+
+    let mut frame = CallFrame::new(code, script_or_module, environments, realm)
+        .with_argument_count(argument_count as u32)
+        .with_env_fp(env_fp)
+        .with_flags(CallFrameFlags::CONSTRUCT);
+
+    frame
+        .flags
+        .set(CallFrameFlags::THIS_VALUE_CACHED, this.is_some());
+
+    #[cfg(feature = "native-backtrace")]
+    {
+        let native_source_info = context.native_source_info();
+        context
+            .vm
+            .shadow_stack
+            .patch_last_native(native_source_info);
+    }
+
+    context.vm.push_frame(frame);
+    context.vm.set_return_value(JsValue::undefined());
+
+    let mut last_env = 0;
+
+    let has_binding_identifier = context.vm.frame().code_block().has_binding_identifier();
+    let has_function_scope = context.vm.frame().code_block().has_function_scope();
+
+    if has_binding_identifier {
+        let frame = context.vm.frame_mut();
+        let global = frame.realm.environment();
+        let index = frame.environments.push_lexical(1, global)?;
+        frame.environments.put_lexical_value(
+            BindingLocatorScope::Stack(index),
+            0,
+            this_function_object.clone().into(),
+            global,
+        );
+        last_env += 1;
+    }
+
+    if has_function_scope {
+        let scope = context.vm.frame().code_block().constant_scope(last_env);
+        let frame = context.vm.frame_mut();
+        let global = frame.realm.environment();
+        frame.environments.push_function(
+            scope,
+            FunctionSlots::new(
+                this.clone().map_or(ThisBindingStatus::Uninitialized, |o| {
+                    ThisBindingStatus::Initialized(o.into())
+                }),
+                this_function_object.clone(),
+                Some(
+                    new_target
+                        .as_object()
+                        .js_expect("new.target should be an object")?
+                        .clone(),
+                ),
+            ),
+            global,
+        )?;
+    }
+
+    let context = context.context();
+    context.vm.stack.set_this(
+        context.vm.frames.last().js_expect("frame must exist")?,
+        this.map(JsValue::new).unwrap_or_default(),
+    );
+
+    Ok(())
+}
+
+fn resume_function_construct_initialization(
+    completion: CompletionRecord,
+    capture: &FunctionConstructInitializationResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match capture.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                let mut call_context = InternalMethodCallContext::new(context);
+                prepare_function_construct_frame(
+                    &capture.this_function_object,
+                    &capture.new_target,
+                    Some(capture.this.clone()),
+                    capture.argument_count,
+                    &mut call_context,
+                )?;
+                context.continue_interruptible_vm()
+            }
+            CompletionRecord::Throw(err) => context.continue_interruptible_vm_with_throw(err),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message(
+                    "function construct initialization resumed with unexpected suspend completion",
+                )
+                .into()),
+        },
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_function_construct_initialization_suspend(
+                FunctionConstructInitializationResume {
+                    continuation: next,
+                    this_function_object: capture.this_function_object.clone(),
+                    new_target: capture.new_target.clone(),
+                    this: capture.this.clone(),
+                    argument_count: capture.argument_count,
+                },
+            ),
+        )),
+    }
+}
+
 /// Abstract operation `SetFunctionName`
 ///
 /// More information:
@@ -1174,19 +1325,12 @@ fn function_construct(
     let function = this_function_object
         .downcast_ref::<OrdinaryFunction>()
         .js_expect("not a function")?;
-    let realm = function.realm().clone();
-
     debug_assert!(
         function.is_ordinary(),
         "only ordinary functions can be constructed"
     );
-
     let code = function.code.clone();
-    let environments = function.environments.clone();
-    let script_or_module = function.script_or_module.clone();
     drop(function);
-
-    let env_fp = environments.len() as u32;
 
     let new_target = context.vm.stack.pop();
 
@@ -1206,79 +1350,32 @@ fn function_construct(
         )?
         .upcast();
 
-        this.initialize_instance_elements(this_function_object, context)?;
+        match this.initialize_instance_elements_interruptible(this_function_object, context.context())? {
+            ExecutionOutcome::Complete(()) => {}
+            ExecutionOutcome::Suspend(continuation) => {
+                return Ok(CallValue::Suspended(
+                    wrap_function_construct_initialization_suspend(
+                        FunctionConstructInitializationResume {
+                            continuation,
+                            this_function_object: this_function_object.clone(),
+                            new_target: new_target.clone(),
+                            this: this.clone(),
+                            argument_count,
+                        },
+                    ),
+                ));
+            }
+        }
 
         Some(this)
     };
-
-    let mut frame = CallFrame::new(code, script_or_module, environments, realm)
-        .with_argument_count(argument_count as u32)
-        .with_env_fp(env_fp)
-        .with_flags(CallFrameFlags::CONSTRUCT);
-
-    // We push the `this` below so we can mark this function as having the this value
-    // cached if it's initialized.
-    frame
-        .flags
-        .set(CallFrameFlags::THIS_VALUE_CACHED, this.is_some());
-
-    #[cfg(feature = "native-backtrace")]
-    {
-        let native_source_info = context.native_source_info();
-        context
-            .vm
-            .shadow_stack
-            .patch_last_native(native_source_info);
-    }
-
-    context.vm.push_frame(frame);
-    context.vm.set_return_value(JsValue::undefined());
-
-    let mut last_env = 0;
-
-    let has_binding_identifier = context.vm.frame().code_block().has_binding_identifier();
-    let has_function_scope = context.vm.frame().code_block().has_function_scope();
-
-    if has_binding_identifier {
-        let frame = context.vm.frame_mut();
-        let global = frame.realm.environment();
-        let index = frame.environments.push_lexical(1, global)?;
-        frame.environments.put_lexical_value(
-            BindingLocatorScope::Stack(index),
-            0,
-            this_function_object.clone().into(),
-            global,
-        );
-        last_env += 1;
-    }
-
-    if has_function_scope {
-        let scope = context.vm.frame().code_block().constant_scope(last_env);
-        let frame = context.vm.frame_mut();
-        let global = frame.realm.environment();
-        frame.environments.push_function(
-            scope,
-            FunctionSlots::new(
-                this.clone().map_or(ThisBindingStatus::Uninitialized, |o| {
-                    ThisBindingStatus::Initialized(o.into())
-                }),
-                this_function_object.clone(),
-                Some(
-                    new_target
-                        .as_object()
-                        .js_expect("new.target should be an object")?
-                        .clone(),
-                ),
-            ),
-            global,
-        )?;
-    }
-
-    let context = context.context();
-    context.vm.stack.set_this(
-        context.vm.frames.last().js_expect("frame must exist")?,
-        this.map(JsValue::new).unwrap_or_default(),
-    );
+    prepare_function_construct_frame(
+        this_function_object,
+        &new_target,
+        this,
+        argument_count,
+        context,
+    )?;
 
     Ok(CallValue::Ready)
 }

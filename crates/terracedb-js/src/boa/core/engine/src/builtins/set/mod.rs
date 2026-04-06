@@ -43,7 +43,7 @@ use boa_gc::{Finalize, Trace};
 pub(crate) use set_iterator::SetIterator;
 
 /// A record containing information about a Set-like object.
-#[derive(Debug)]
+#[derive(Debug, Clone, Trace, Finalize)]
 struct SetRecord {
     /// The size of the Set-like object.
     size: usize,
@@ -268,9 +268,15 @@ impl BuiltInConstructor for Set {
         //     a. Let next be ? IteratorStepValue(iteratorRecord).
         while let Some(next) = iterator_record.step_value(context)? {
             // c. Let status be Completion(Call(adder, set, « next »)).
-            if let Err(status) = adder.call(&set.clone().into(), &[next], context) {
-                // d. IfAbruptCloseIterator(status, iteratorRecord).
-                return iterator_record.close(Err(status), context);
+            match adder.call_interruptible(&set.clone().into(), &[next], context)? {
+                InterruptibleCallOutcome::Complete(_) => {}
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable Set constructor requires interruptible execution",
+                        )
+                        .into())
+                }
             }
         }
 

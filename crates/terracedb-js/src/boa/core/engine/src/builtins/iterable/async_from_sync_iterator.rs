@@ -7,8 +7,8 @@ use crate::{
     },
     context::intrinsics::Intrinsics,
     js_string,
-    native_function::NativeFunction,
-    object::{FunctionObjectBuilder, JsObject},
+    native_function::{NativeFunction, NativeFunctionResult, NativeResume},
+    object::{FunctionObjectBuilder, InterruptibleCallOutcome, JsObject},
     realm::Realm,
 };
 use boa_gc::{Finalize, Trace};
@@ -35,9 +35,21 @@ impl IntrinsicObject for AsyncFromSyncIterator {
                     .iterator_prototypes()
                     .async_iterator(),
             )
-            .static_method(Self::next, js_string!("next"), 1)
-            .static_method(Self::r#return, js_string!("return"), 1)
-            .static_method(Self::throw, js_string!("throw"), 1)
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::next),
+                js_string!("next"),
+                1,
+            )
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::r#return),
+                js_string!("return"),
+                1,
+            )
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::throw),
+                js_string!("throw"),
+                1,
+            )
             .build()?;
 
         Ok(())
@@ -93,12 +105,16 @@ impl AsyncFromSyncIterator {
     ///  - [ECMA reference][spec]
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-%asyncfromsynciteratorprototype%.next
-    fn next(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn next(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. Assert: O is an Object that has a [[SyncIteratorRecord]] internal slot.
         // 4. Let syncIteratorRecord be O.[[SyncIteratorRecord]].
         let object = this.as_object();
-        let mut sync_iterator_record = object
+        let sync_iterator_record = object
             .as_ref()
             .and_then(JsObject::downcast_ref::<Self>)
             .js_expect("async from sync iterator prototype must be object")?
@@ -116,15 +132,32 @@ impl AsyncFromSyncIterator {
         //     a. Let result be Completion(IteratorNext(syncIteratorRecord, value)).
         // 6. Else,
         //     a. Let result be Completion(IteratorNext(syncIteratorRecord)).
-        let result = sync_iterator_record.next(args.first(), context);
+        let iterator = sync_iterator_record.iterator().clone();
+        let next_method = sync_iterator_record
+            .next_method()
+            .as_object()
+            .js_expect("async from sync iterator next method must be callable object")?;
+        let result: JsResult<JsValue> = match next_method.call_interruptible(
+            &iterator.clone().into(),
+            args.first().map_or(&[], std::slice::from_ref),
+            context,
+        )? {
+            InterruptibleCallOutcome::Complete(result) => Ok(result),
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                return Ok(NativeFunctionResult::Suspend(wrap_async_from_sync_suspend(
+                    continuation,
+                    AsyncFromSyncSuspendState {
+                        sync_iterator_record,
+                        promise_capability,
+                        close_on_rejection: true,
+                    },
+                )));
+            }
+        };
 
-        // 7. IfAbruptRejectPromise(result, promiseCapability).
-        let result = if_abrupt_reject_promise!(result, promise_capability, context);
-
-        // 8. Return AsyncFromSyncIteratorContinuation(result, promiseCapability, syncIteratorRecord, true).
-        Self::continuation(
-            &result,
-            &promise_capability,
+        Self::finish(
+            IteratorResult::from_value(result?),
+            promise_capability,
             sync_iterator_record,
             true,
             context,
@@ -137,7 +170,11 @@ impl AsyncFromSyncIterator {
     ///  - [ECMA reference][spec]
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-%asyncfromsynciteratorprototype%.return
-    fn r#return(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn r#return(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. Assert: O is an Object that has a [[SyncIteratorRecord]] internal slot.
         // 4. Let syncIteratorRecord be O.[[SyncIteratorRecord]].
@@ -159,10 +196,12 @@ impl AsyncFromSyncIterator {
         .js_expect("cannot fail with promise constructor")?;
 
         // 6. Let return be Completion(GetMethod(syncIterator, "return")).
-        let r#return = sync_iterator.get_method(js_string!("return"), context);
-
-        // 7. IfAbruptRejectPromise(return, promiseCapability).
-        let r#return = if_abrupt_reject_promise!(r#return, promise_capability, context);
+        let r#return = match sync_iterator.get_method(js_string!("return"), context) {
+            Ok(return_method) => return_method,
+            Err(err) => {
+                return Self::reject_promise(err, promise_capability, context);
+            }
+        };
 
         let result = match (r#return, args.first()) {
             // 8. If return is undefined, then
@@ -178,35 +217,55 @@ impl AsyncFromSyncIterator {
                     .js_expect("cannot fail according to spec")?;
 
                 // c. Return promiseCapability.[[Promise]].
-                return Ok(promise_capability.promise().clone().into());
+                return Ok(NativeFunctionResult::complete(
+                    promise_capability.promise().clone(),
+                ));
             }
             // 9. If value is present, then
             (Some(r#return), Some(value)) => {
                 // a. Let result be Completion(Call(return, syncIterator, « value »)).
-                r#return.call(
+                match r#return.call_interruptible(
                     &sync_iterator.clone().into(),
                     std::slice::from_ref(value),
                     context,
-                )
+                )? {
+                    InterruptibleCallOutcome::Complete(result) => result,
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::Suspend(wrap_async_from_sync_suspend(
+                            continuation,
+                            AsyncFromSyncSuspendState {
+                                sync_iterator_record,
+                                promise_capability,
+                                close_on_rejection: false,
+                            },
+                        )));
+                    }
+                }
             }
             // 10. Else,
             (Some(r#return), None) => {
                 // a. Let result be Completion(Call(return, syncIterator)).
-                r#return.call(&sync_iterator.clone().into(), &[], context)
+                match r#return.call_interruptible(&sync_iterator.clone().into(), &[], context)? {
+                    InterruptibleCallOutcome::Complete(result) => result,
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::Suspend(wrap_async_from_sync_suspend(
+                            continuation,
+                            AsyncFromSyncSuspendState {
+                                sync_iterator_record,
+                                promise_capability,
+                                close_on_rejection: false,
+                            },
+                        )));
+                    }
+                }
             }
         };
 
-        // 12. If Type(result) is not Object, then
+            // 12. If Type(result) is not Object, then
         //     a. Perform ! Call(promiseCapability.[[Reject]], undefined, « a newly created TypeError object »).
-        let result = result.and_then(IteratorResult::from_value);
-
-        // 11. IfAbruptRejectPromise(result, promiseCapability).
-        let result = if_abrupt_reject_promise!(result, promise_capability, context);
-
-        // 13. Return AsyncFromSyncIteratorContinuation(result, promiseCapability, syncIteratorRecord, false).
-        Self::continuation(
-            &result,
-            &promise_capability,
+        Self::finish(
+            IteratorResult::from_value(result),
+            promise_capability,
             sync_iterator_record,
             false,
             context,
@@ -219,7 +278,11 @@ impl AsyncFromSyncIterator {
     ///  - [ECMA reference][spec]
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-%asyncfromsynciteratorprototype%.throw
-    fn throw(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    fn throw(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. Assert: O is an Object that has a [[SyncIteratorRecord]] internal slot.
         // 4. Let syncIteratorRecord be O.[[SyncIteratorRecord]].
@@ -241,10 +304,12 @@ impl AsyncFromSyncIterator {
         .js_expect("cannot fail with promise constructor")?;
 
         // 6. Let throw be Completion(GetMethod(syncIterator, "throw")).
-        let throw = sync_iterator.get_method(js_string!("throw"), context);
-
-        // 7. IfAbruptRejectPromise(throw, promiseCapability).
-        let throw = if_abrupt_reject_promise!(throw, promise_capability, context);
+        let throw = match sync_iterator.get_method(js_string!("throw"), context) {
+            Ok(throw_method) => throw_method,
+            Err(err) => {
+                return Self::reject_promise(err, promise_capability, context);
+            }
+        };
 
         let result = match (throw, args.first()) {
             // 8. If throw is undefined, then
@@ -254,7 +319,9 @@ impl AsyncFromSyncIterator {
                 // c. Let result be Completion(IteratorClose(syncIteratorRecord, closeCompletion)).
                 let result = sync_iterator_record.close(Ok(JsValue::undefined()), context);
                 // d. IfAbruptRejectPromise(result, promiseCapability).
-                if_abrupt_reject_promise!(result, promise_capability, context);
+                if let Err(err) = result {
+                    return Self::reject_promise(err, promise_capability, context);
+                }
 
                 // e. NOTE: The next step throws a TypeError to indicate that there was a protocol violation: syncIterator does not have a throw method.
                 // f. NOTE: If closing syncIterator does not throw then the result of that operation is ignored, even if it yields a rejected promise.
@@ -272,35 +339,55 @@ impl AsyncFromSyncIterator {
                     .js_expect("cannot fail according to spec")?;
 
                 // h. Return promiseCapability.[[Promise]].
-                return Ok(promise_capability.promise().clone().into());
+                return Ok(NativeFunctionResult::complete(
+                    promise_capability.promise().clone(),
+                ));
             }
             // 9. If value is present, then
             (Some(throw), Some(value)) => {
                 // a. Let result be Completion(Call(throw, syncIterator, « value »)).
-                throw.call(
+                match throw.call_interruptible(
                     &sync_iterator.clone().into(),
                     std::slice::from_ref(value),
                     context,
-                )
+                )? {
+                    InterruptibleCallOutcome::Complete(result) => result,
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::Suspend(wrap_async_from_sync_suspend(
+                            continuation,
+                            AsyncFromSyncSuspendState {
+                                sync_iterator_record,
+                                promise_capability,
+                                close_on_rejection: true,
+                            },
+                        )));
+                    }
+                }
             }
             // 10. Else,
             (Some(throw), None) => {
                 // a. Let result be Completion(Call(throw, syncIterator)).
-                throw.call(&sync_iterator.clone().into(), &[], context)
+                match throw.call_interruptible(&sync_iterator.clone().into(), &[], context)? {
+                    InterruptibleCallOutcome::Complete(result) => result,
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::Suspend(wrap_async_from_sync_suspend(
+                            continuation,
+                            AsyncFromSyncSuspendState {
+                                sync_iterator_record,
+                                promise_capability,
+                                close_on_rejection: true,
+                            },
+                        )));
+                    }
+                }
             }
         };
 
-        // 12. If Type(result) is not Object, then
+            // 12. If Type(result) is not Object, then
         // a. Perform ! Call(promiseCapability.[[Reject]], undefined, « a newly created TypeError object »).
-        let result = result.and_then(IteratorResult::from_value);
-
-        // 11. IfAbruptRejectPromise(result, promiseCapability).
-        let result = if_abrupt_reject_promise!(result, promise_capability, context);
-
-        // 13. Return Return AsyncFromSyncIteratorContinuation(result, promiseCapability, syncIteratorRecord, true).
-        Self::continuation(
-            &result,
-            &promise_capability,
+        Self::finish(
+            IteratorResult::from_value(result),
+            promise_capability,
             sync_iterator_record,
             true,
             context,
@@ -419,5 +506,93 @@ impl AsyncFromSyncIterator {
 
         // 15. Return promiseCapability.[[Promise]].
         Ok(promise_capability.promise().clone().into())
+    }
+}
+
+#[derive(Clone, Debug, Finalize, Trace)]
+struct AsyncFromSyncSuspendState {
+    sync_iterator_record: IteratorRecord,
+    promise_capability: PromiseCapability,
+    close_on_rejection: bool,
+}
+
+impl AsyncFromSyncIterator {
+    fn finish(
+        result: JsResult<IteratorResult>,
+        promise_capability: PromiseCapability,
+        sync_iterator_record: IteratorRecord,
+        close_on_rejection: bool,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => return Self::reject_promise(err, promise_capability, context),
+        };
+        Self::continuation(
+            &result,
+            &promise_capability,
+            sync_iterator_record,
+            close_on_rejection,
+            context,
+        )
+        .map(NativeFunctionResult::complete)
+    }
+
+    fn reject_promise(
+        err: JsError,
+        promise_capability: PromiseCapability,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        let err = err.into_opaque(context)?;
+        promise_capability
+            .reject()
+            .call(&JsValue::undefined(), &[err], context)
+            .js_expect("promise rejection must not fail")?;
+
+        Ok(NativeFunctionResult::complete(
+            promise_capability.promise().clone(),
+        ))
+    }
+}
+
+fn wrap_async_from_sync_suspend(
+    continuation: NativeResume,
+    state: AsyncFromSyncSuspendState,
+) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_async_from_sync_suspend,
+        (continuation, state),
+    )
+}
+
+fn resume_async_from_sync_suspend(
+    completion: crate::vm::CompletionRecord,
+    captures: &(NativeResume, AsyncFromSyncSuspendState),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match captures.0.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            let result = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => Ok(value),
+                crate::vm::CompletionRecord::Throw(err) => Err(err),
+                crate::vm::CompletionRecord::Suspend => Err(JsNativeError::error()
+                    .with_message(
+                        "async from sync iterator resumed with unexpected suspended completion",
+                    )
+                    .into()),
+            };
+
+            AsyncFromSyncIterator::finish(
+                IteratorResult::from_value(result?),
+                captures.1.promise_capability.clone(),
+                captures.1.sync_iterator_record.clone(),
+                captures.1.close_on_rejection,
+                context,
+            )
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_async_from_sync_suspend(next, captures.1.clone()),
+        )),
     }
 }

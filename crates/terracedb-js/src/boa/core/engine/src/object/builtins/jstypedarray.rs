@@ -1409,11 +1409,17 @@ fn typed_array_entries() {
             .unwrap()
             .get(next_str.clone(), context)
             .unwrap();
-        let result = next_fn
+        let result = match next_fn
             .as_object()
             .unwrap()
-            .call(&entries, &[], context)
-            .unwrap();
+            .call_interruptible(&entries, &[], context)
+            .unwrap()
+        {
+            crate::object::InterruptibleCallOutcome::Complete(result) => result,
+            crate::object::InterruptibleCallOutcome::Suspend(_) => {
+                panic!("typed array iterator.next() should not suspend in this Rust wrapper test")
+            }
+        };
         if result
             .as_object()
             .unwrap()
@@ -1448,11 +1454,17 @@ fn typed_array_keys() {
             .unwrap()
             .get(next_str.clone(), context)
             .unwrap();
-        let result = next_fn
+        let result = match next_fn
             .as_object()
             .unwrap()
-            .call(&keys, &[], context)
-            .unwrap();
+            .call_interruptible(&keys, &[], context)
+            .unwrap()
+        {
+            crate::object::InterruptibleCallOutcome::Complete(result) => result,
+            crate::object::InterruptibleCallOutcome::Suspend(_) => {
+                panic!("typed array iterator.next() should not suspend in this Rust wrapper test")
+            }
+        };
         if result
             .as_object()
             .unwrap()
@@ -1487,11 +1499,17 @@ fn typed_array_values() {
             .unwrap()
             .get(next_str.clone(), context)
             .unwrap();
-        let result = next_fn
+        let result = match next_fn
             .as_object()
             .unwrap()
-            .call(&values, &[], context)
-            .unwrap();
+            .call_interruptible(&values, &[], context)
+            .unwrap()
+        {
+            crate::object::InterruptibleCallOutcome::Complete(result) => result,
+            crate::object::InterruptibleCallOutcome::Suspend(_) => {
+                panic!("typed array iterator.next() should not suspend in this Rust wrapper test")
+            }
+        };
         if result
             .as_object()
             .unwrap()
@@ -1525,11 +1543,17 @@ fn typed_array_iterator() {
             .unwrap()
             .get(next_str.clone(), context)
             .unwrap();
-        let result = next_fn
+        let result = match next_fn
             .as_object()
             .unwrap()
-            .call(&values, &[], context)
-            .unwrap();
+            .call_interruptible(&values, &[], context)
+            .unwrap()
+        {
+            crate::object::InterruptibleCallOutcome::Complete(result) => result,
+            crate::object::InterruptibleCallOutcome::Suspend(_) => {
+                panic!("typed array iterator.next() should not suspend in this Rust wrapper test")
+            }
+        };
         if result
             .as_object()
             .unwrap()

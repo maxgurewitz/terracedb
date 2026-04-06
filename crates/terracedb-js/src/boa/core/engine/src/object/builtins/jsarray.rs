@@ -3,6 +3,7 @@ use crate::{
     Context, JsExpect, JsResult, JsString, JsValue,
     builtins::Array,
     error::JsNativeError,
+    native_function::NativeFunctionResult,
     object::{JsFunction, JsObject},
     value::{IntoOrUndefined, TryFromJs},
 };
@@ -221,11 +222,16 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        Array::find(
+        match Array::find(
             &self.inner.clone().into(),
             &[predicate.into(), this_arg.into_or_undefined()],
             context,
-        )
+        )? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable Array.prototype.find requires interruptible execution")
+                .into()),
+        }
     }
 
     /// Calls `Array.prototype.filter()`.
@@ -236,13 +242,23 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<Self> {
-        let object = Array::filter(
+        let object = match Array::filter(
             &self.inner.clone().into(),
             &[callback.into(), this_arg.into_or_undefined()],
             context,
-        )?
-        .as_object()
-        .js_expect("Array.prototype.filter should always return object")?;
+        )? {
+            NativeFunctionResult::Complete(record) => record
+                .consume()?
+                .as_object()
+                .js_expect("Array.prototype.filter should always return object")?,
+            NativeFunctionResult::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message(
+                        "suspendable Array.prototype.filter requires interruptible execution",
+                    )
+                    .into())
+            }
+        };
 
         Self::from_object(object)
     }
@@ -255,13 +271,21 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<Self> {
-        let object = Array::map(
+        let object = match Array::map(
             &self.inner.clone().into(),
             &[callback.into(), this_arg.into_or_undefined()],
             context,
-        )?
-        .as_object()
-        .js_expect("Array.prototype.map should always return object")?;
+        )? {
+            NativeFunctionResult::Complete(record) => record
+                .consume()?
+                .as_object()
+                .js_expect("Array.prototype.map should always return object")?,
+            NativeFunctionResult::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("suspendable Array.prototype.map requires interruptible execution")
+                    .into())
+            }
+        };
 
         Self::from_object(object)
     }
@@ -274,13 +298,21 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<bool> {
-        let result = Array::every(
+        let result = match Array::every(
             &self.inner.clone().into(),
             &[callback.into(), this_arg.into_or_undefined()],
             context,
-        )?
-        .as_boolean()
-        .js_expect("Array.prototype.every should always return boolean")?;
+        )? {
+            NativeFunctionResult::Complete(record) => record
+                .consume()?
+                .as_boolean()
+                .js_expect("Array.prototype.every should always return boolean")?,
+            NativeFunctionResult::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("suspendable Array.prototype.every requires interruptible execution")
+                    .into())
+            }
+        };
 
         Ok(result)
     }
@@ -293,13 +325,21 @@ impl JsArray {
         this_arg: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<bool> {
-        let result = Array::some(
+        let result = match Array::some(
             &self.inner.clone().into(),
             &[callback.into(), this_arg.into_or_undefined()],
             context,
-        )?
-        .as_boolean()
-        .js_expect("Array.prototype.some should always return boolean")?;
+        )? {
+            NativeFunctionResult::Complete(record) => record
+                .consume()?
+                .as_boolean()
+                .js_expect("Array.prototype.some should always return boolean")?,
+            NativeFunctionResult::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("suspendable Array.prototype.some requires interruptible execution")
+                    .into())
+            }
+        };
 
         Ok(result)
     }
@@ -395,11 +435,16 @@ impl JsArray {
         initial_value: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        Array::reduce(
+        match Array::reduce(
             &self.inner.clone().into(),
             &[callback.into(), initial_value.into_or_undefined()],
             context,
-        )
+        )? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable Array.prototype.reduce requires interruptible execution")
+                .into()),
+        }
     }
 
     /// Calls `Array.prototype.reduceRight()`.
@@ -410,11 +455,16 @@ impl JsArray {
         initial_value: Option<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
-        Array::reduce_right(
+        match Array::reduce_right(
             &self.inner.clone().into(),
             &[callback.into(), initial_value.into_or_undefined()],
             context,
-        )
+        )? {
+            NativeFunctionResult::Complete(record) => record.consume(),
+            NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+                .with_message("suspendable Array.prototype.reduceRight requires interruptible execution")
+                .into()),
+        }
     }
 
     /// Calls `Array.prototype.toReversed`.

@@ -27,6 +27,7 @@ use crate::{
     vm::CompletionRecord,
 };
 use boa_gc::{Finalize, Trace};
+use crate::builtins::iterable::IteratorRecord;
 
 use super::{
     BuiltInBuilder, BuiltInConstructor, IntrinsicObject, canonicalize_keyed_collection_key,
@@ -60,6 +61,22 @@ struct MapInsertComputedState {
     key: JsValue,
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct AddEntriesFromIterableState {
+    target: JsObject,
+    adder: JsObject,
+    iterator_record: IteratorRecord,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct MapGroupByState {
+    iterator: IteratorRecord,
+    callback: JsObject,
+    groups: Vec<(JsValue, Vec<JsValue>)>,
+    k: u64,
+    pending_value: JsValue,
+}
+
 impl IntrinsicObject for Map {
     fn init(realm: &Realm) -> crate::JsResult<()> {
         let get_species = BuiltInBuilder::callable(realm, Self::get_species)
@@ -75,7 +92,11 @@ impl IntrinsicObject for Map {
             .build()?;
 
         BuiltInBuilder::from_standard_constructor::<Self>(realm)
-            .static_method(Self::group_by, js_string!("groupBy"), 2)
+            .static_method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::group_by),
+                js_string!("groupBy"),
+                2,
+            )
             .static_accessor(
                 JsSymbol::species(),
                 Some(get_species),
@@ -822,13 +843,8 @@ impl Map {
         _: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
-        use std::hash::BuildHasherDefault;
-
-        use indexmap::IndexMap;
-        use rustc_hash::FxHasher;
-
-        use crate::builtins::{Array, Number, iterable::if_abrupt_close_iterator};
+    ) -> JsResult<NativeFunctionResult> {
+        use crate::builtins::{Array, Number};
 
         let items = args.get_or_undefined(0);
         let callback = args.get_or_undefined(1);
@@ -849,77 +865,119 @@ impl Map {
             )
         })?;
 
-        // 3. Let groups be a new empty List.
-        let mut groups: IndexMap<JsValue, Vec<JsValue>, BuildHasherDefault<FxHasher>> =
-            IndexMap::default();
+        let state = MapGroupByState {
+            iterator: items.get_iterator(IteratorHint::Sync, context)?,
+            callback: callback.clone(),
+            groups: Vec::new(),
+            k: 0,
+            pending_value: JsValue::undefined(),
+        };
 
-        // 4. Let iteratorRecord be ? GetIterator(items, sync).
-        let mut iterator = items.get_iterator(IteratorHint::Sync, context)?;
+        Self::map_group_by_step(state, context)
+    }
 
-        // 5. Let k be 0.
-        let mut k = 0u64;
+    fn map_group_by_step(
+        mut state: MapGroupByState,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        use crate::builtins::{Array, Number};
 
-        // 6. Repeat,
         loop {
-            // a. If k ≥ 2^53 - 1, then
-            if k >= Number::MAX_SAFE_INTEGER as u64 {
-                // i. Let error be ThrowCompletion(a newly created TypeError object).
+            if state.k >= Number::MAX_SAFE_INTEGER as u64 {
                 let error = JsNativeError::typ()
                     .with_message("exceeded maximum safe integer")
                     .into();
-
-                // ii. Return ? IteratorClose(iteratorRecord, error).
-                return iterator.close(Err(error), context);
+                return state
+                    .iterator
+                    .close(Err(error), context)
+                    .map(NativeFunctionResult::complete);
             }
 
-            // b. Let next be ? IteratorStepValue(iteratorRecord).
-            let Some(next) = iterator.step_value(context)? else {
-                // c. If next is false, then
-                // i. Return groups.
-                break;
+            let Some(next) = state.iterator.step_value(context)? else {
+                let mut map: OrderedMap<JsValue> = OrderedMap::new();
+                for (key, elements) in std::mem::take(&mut state.groups) {
+                    let elements = Array::create_array_from_list(elements, context)?;
+                    map.insert(key, elements.into());
+                }
+
+                let proto = context.intrinsics().constructors().map().prototype();
+                return Ok(NativeFunctionResult::complete(
+                    JsObject::try_from_proto_and_data_with_shared_shape(
+                        context.root_shape(),
+                        proto,
+                        map,
+                    )?,
+                ));
             };
 
-            // d. Let value be next.
             let value = next;
-
-            // e. Let key be Completion(Call(callbackfn, undefined, « value, 𝔽(k) »)).
-            let key = callback.call(&JsValue::undefined(), &[value.clone(), k.into()], context);
-
-            // f. IfAbruptCloseIterator(key, iteratorRecord).
-            let key = if_abrupt_close_iterator!(key, iterator, context);
-
-            // h. Else,
-            //     i. Assert: keyCoercion is collection.
-            //     ii. Set key to CanonicalizeKeyedCollectionKey(key).
-            let key = canonicalize_keyed_collection_key(key);
-
-            // i. Perform AddValueToKeyedGroup(groups, key, value).
-            groups.entry(key).or_default().push(value);
-
-            // j. Set k to k + 1.
-            k += 1;
+            state.pending_value = value.clone();
+            match state.callback.call_interruptible(
+                &JsValue::undefined(),
+                &[value.clone(), state.k.into()],
+                context,
+            )? {
+                InterruptibleCallOutcome::Complete(key) => {
+                    let key = canonicalize_keyed_collection_key(key);
+                    if let Some((_, elements)) =
+                        state.groups.iter_mut().find(|(existing, _)| *existing == key)
+                    {
+                        elements.push(value);
+                    } else {
+                        state.groups.push((key, vec![value]));
+                    }
+                    state.k += 1;
+                }
+                InterruptibleCallOutcome::Suspend(next) => {
+                    return Ok(NativeFunctionResult::Suspend(
+                        NativeResume::from_copy_closure_with_captures(
+                            Self::resume_map_group_by_after_callback,
+                            (next, state),
+                        ),
+                    ));
+                }
+            }
         }
+    }
 
-        // 2. Let map be ! Construct(%Map%).
-        let mut map: OrderedMap<JsValue> = OrderedMap::new();
-
-        // 3. For each Record { [[Key]], [[Elements]] } g of groups, do
-        for (key, elements) in groups {
-            // a. Let elements be CreateArrayFromList(g.[[Elements]]).
-            let elements = Array::create_array_from_list(elements, context)?;
-
-            // b. Let entry be the Record { [[Key]]: g.[[Key]], [[Value]]: elements }.
-            // c. Append entry to map.[[MapData]].
-            map.insert(key, elements.into());
+    fn resume_map_group_by_after_callback(
+        completion: CompletionRecord,
+        captures: &(NativeResume, MapGroupByState),
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
+        match captures.0.call(completion, context)? {
+            NativeFunctionResult::Complete(record) => match record {
+                CompletionRecord::Normal(key) | CompletionRecord::Return(key) => {
+                    let mut state = captures.1.clone();
+                    let value = state
+                        .pending_value
+                        .clone();
+                    let key = canonicalize_keyed_collection_key(key);
+                    if let Some((_, elements)) =
+                        state.groups.iter_mut().find(|(existing, _)| *existing == key)
+                    {
+                        elements.push(value);
+                    } else {
+                        state.groups.push((key, vec![value]));
+                    }
+                    state.k += 1;
+                    Self::map_group_by_step(state, context)
+                }
+                CompletionRecord::Throw(err) => {
+                    let _ = captures.1.iterator.clone().close(Err(err.clone()), context);
+                    Ok(NativeFunctionResult::from_completion(CompletionRecord::Throw(err)))
+                }
+                CompletionRecord::Suspend => Err(js_error!(
+                    TypeError: "Map.prototype.groupBy resumed with unexpected suspend completion"
+                )),
+            },
+            NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+                NativeResume::from_copy_closure_with_captures(
+                    Self::resume_map_group_by_after_callback,
+                    (next, captures.1.clone()),
+                ),
+            )),
         }
-
-        let proto = context.intrinsics().constructors().map().prototype();
-
-        // 4. Return map.
-        Ok(
-            JsObject::try_from_proto_and_data_with_shared_shape(context.root_shape(), proto, map)?
-                .into(),
-        )
     }
 }
 
@@ -937,38 +995,115 @@ pub(crate) fn add_entries_from_iterable(
     adder: &JsFunction,
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    // 1. Let iteratorRecord be ? GetIterator(iterable, sync).
-    let mut iterator_record = iterable.get_iterator(IteratorHint::Sync, context)?;
+    match add_entries_from_iterable_interruptible(target, iterable, adder, context)? {
+        NativeFunctionResult::Complete(record) => record.consume(),
+        NativeFunctionResult::Suspend(_) => Err(JsNativeError::error()
+            .with_message(
+                "suspendable AddEntriesFromIterable requires interruptible execution",
+            )
+            .into()),
+    }
+}
 
-    // 2. Repeat,
-    //     a. Let next be ? IteratorStepValue(iteratorRecord).
-    //     b. If next is done, return target.
-    while let Some(next) = iterator_record.step_value(context)? {
+pub(crate) fn add_entries_from_iterable_interruptible(
+    target: &JsObject,
+    iterable: &JsValue,
+    adder: &JsFunction,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let state = AddEntriesFromIterableState {
+        target: target.clone(),
+        adder: adder.clone().into(),
+        iterator_record: iterable.get_iterator(IteratorHint::Sync, context)?,
+    };
+
+    add_entries_from_iterable_step(state, context)
+}
+
+fn add_entries_from_iterable_step(
+    mut state: AddEntriesFromIterableState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    loop {
+        let Some(next) = state.iterator_record.step_value(context)? else {
+            return Ok(NativeFunctionResult::complete(state.target.clone()));
+        };
+
         let Some(next) = next.as_object() else {
-            //     c. If next is not an Object, then
-            //         i. Let error be ThrowCompletion(a newly created TypeError object).
-            //         ii. Return ? IteratorClose(iteratorRecord, error).
             let err = Err(JsNativeError::typ()
                 .with_message("cannot get key and value from primitive item of `iterable`")
                 .into());
-
-            // ii. Return ? IteratorClose(iteratorRecord, error).
-            return iterator_record.close(err, context);
+            return state
+                .iterator_record
+                .close(err, context)
+                .map(NativeFunctionResult::complete);
         };
 
-        //     d. Let k be Completion(Get(next, "0")).
-        //     e. IfAbruptCloseIterator(k, iteratorRecord).
-        let key = if_abrupt_close_iterator!(next.get(0, context), iterator_record, context);
+        let key = match next.get(0, context) {
+            Ok(key) => key,
+            Err(err) => {
+                let err = Err(err);
+                return state
+                    .iterator_record
+                    .close(err, context)
+                    .map(NativeFunctionResult::complete);
+            }
+        };
+        let value = match next.get(1, context) {
+            Ok(value) => value,
+            Err(err) => {
+                let err = Err(err);
+                return state
+                    .iterator_record
+                    .close(err, context)
+                    .map(NativeFunctionResult::complete);
+            }
+        };
 
-        //     f. Let v be Completion(Get(next, "1")).
-        //     g. IfAbruptCloseIterator(v, iteratorRecord).
-        let value = if_abrupt_close_iterator!(next.get(1, context), iterator_record, context);
-
-        //     h. Let status be Completion(Call(adder, target, « k, v »)).
-        //     i. IfAbruptCloseIterator(status, iteratorRecord).
-        let status = adder.call(&target.clone().into(), &[key, value], context);
-        if_abrupt_close_iterator!(status, iterator_record, context);
+        match state
+            .adder
+            .call_interruptible(&state.target.clone().into(), &[key, value], context)?
+        {
+            InterruptibleCallOutcome::Complete(_) => {}
+            InterruptibleCallOutcome::Suspend(next) => {
+                return Ok(NativeFunctionResult::Suspend(
+                    NativeResume::from_copy_closure_with_captures(
+                        resume_add_entries_from_iterable_after_adder,
+                        (next, state),
+                    ),
+                ));
+            }
+        }
     }
+}
 
-    Ok(target.clone().into())
+fn resume_add_entries_from_iterable_after_adder(
+    completion: CompletionRecord,
+    captures: &(NativeResume, AddEntriesFromIterableState),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match captures.0.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                add_entries_from_iterable_step(captures.1.clone(), context)
+            }
+            CompletionRecord::Throw(err) => {
+                let _ = captures
+                    .1
+                    .iterator_record
+                    .clone()
+                    .close(Err(err.clone()), context);
+                Ok(NativeFunctionResult::from_completion(CompletionRecord::Throw(err)))
+            }
+            CompletionRecord::Suspend => Err(js_error!(
+                TypeError: "AddEntriesFromIterable resumed with unexpected suspend completion"
+            )),
+        },
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            NativeResume::from_copy_closure_with_captures(
+                resume_add_entries_from_iterable_after_adder,
+                (next, captures.1.clone()),
+            ),
+        )),
+    }
 }

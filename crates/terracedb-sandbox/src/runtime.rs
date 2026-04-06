@@ -19816,6 +19816,13 @@ fn node_resume_builtins_compile_function(
         NodeCompletedHostOperation::String(value) => value,
         other => return Err(node_unexpected_host_operation_result("string", &other)),
     };
+    if let Ok(host) = active_node_host() {
+        let _ = node_debug_event(
+            &host,
+            "builtin",
+            format!("compile_function eval start specifier={}", capture.specifier),
+        );
+    }
     match node_compile_builtin_wrapper_from_source_interruptible(
         context,
         &capture.specifier,
@@ -19830,16 +19837,37 @@ fn node_resume_builtins_compile_function(
         ],
         None,
     ) {
-        Ok(InterruptibleCallOutcome::Complete(value)) => Ok(NativeFunctionResult::complete(value)),
+        Ok(InterruptibleCallOutcome::Complete(value)) => {
+            if let Ok(host) = active_node_host() {
+                let _ = node_debug_event(
+                    &host,
+                    "builtin",
+                    format!("compile_function eval ok specifier={}", capture.specifier),
+                );
+            }
+            Ok(NativeFunctionResult::complete(value))
+        }
         Ok(InterruptibleCallOutcome::Suspend(continuation)) => Ok(
             NativeFunctionResult::suspend_with_copy_closure(
                 node_resume_builtins_compile_function_after_suspend,
                 NodeBuiltinCompileEvalResume { continuation },
             ),
         ),
-        Err(error) => Ok(NativeFunctionResult::from_completion(
-            boa_engine::vm::CompletionRecord::Throw(error),
-        )),
+        Err(error) => {
+            if let Ok(host) = active_node_host() {
+                let _ = node_debug_event(
+                    &host,
+                    "builtin",
+                    format!(
+                        "compile_function eval err specifier={}: {}",
+                        capture.specifier, error
+                    ),
+                );
+            }
+            Ok(NativeFunctionResult::from_completion(
+                boa_engine::vm::CompletionRecord::Throw(error),
+            ))
+        }
     }
 }
 
@@ -19867,6 +19895,8 @@ fn node_builtins_compile_function_suspend(
 ) -> JsResult<NativeFunctionResult> {
     let id = node_arg_string(args, 0, context)?;
     let host = active_node_host().map_err(js_error)?;
+    node_debug_event(&host, "builtin", format!("compile_function start specifier={id}"))
+        .map_err(js_error)?;
     let request_id = node_queue_host_operation(
         &host,
         NodePendingHostOperation::ReadBuiltinSource {

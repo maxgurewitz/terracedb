@@ -20,6 +20,8 @@ use crate::{
     },
     context::intrinsics::{Intrinsics, StandardConstructor, StandardConstructors},
     js_string,
+    context::ExecutionOutcome,
+    object::InterruptibleCallOutcome,
     object::internal_methods::get_prototype_from_constructor,
     property::{Attribute, PropertyNameKind},
     realm::Realm,
@@ -2549,13 +2551,20 @@ impl BuiltinTypedArray {
             // Mirrors the behaviour of `join`, but the compiler
             // could unswitch the loop using `is_fixed_len`.
             if is_fixed_len || !next_element.is_undefined() {
-                let s = next_element
-                    .invoke(
-                        js_string!("toLocaleString"),
-                        &[locales.clone(), options.clone()],
-                        context,
-                    )?
-                    .to_string(context)?;
+                let s = match next_element.invoke_interruptible(
+                    js_string!("toLocaleString"),
+                    &[locales.clone(), options.clone()],
+                    context,
+                )? {
+                    ExecutionOutcome::Complete(value) => value.to_string(context)?,
+                    ExecutionOutcome::Suspend(_) => {
+                        return Err(JsNativeError::error()
+                            .with_message(
+                                "suspendable typed array toLocaleString requires interruptible execution",
+                            )
+                            .into());
+                    }
+                };
 
                 r.extend(s.iter());
             }
@@ -3194,9 +3203,20 @@ fn compare_typed_array_elements(
     // 2. If comparefn is not undefined, then
     if let Some(compare_fn) = compare_fn {
         // a. Let v be ? ToNumber(? Call(comparefn, undefined, « x, y »)).
-        let v = compare_fn
-            .call(&JsValue::undefined(), &[x.clone(), y.clone()], context)?
-            .to_number(context)?;
+        let v = match compare_fn.call_interruptible(
+            &JsValue::undefined(),
+            &[x.clone(), y.clone()],
+            context,
+        )? {
+            InterruptibleCallOutcome::Complete(value) => value.to_number(context)?,
+            InterruptibleCallOutcome::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message(
+                        "suspendable typed array comparefn requires interruptible execution",
+                    )
+                    .into());
+            }
+        };
 
         // b. If v is NaN, return +0𝔽.
         if v.is_nan() {

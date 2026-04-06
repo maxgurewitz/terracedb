@@ -75,6 +75,145 @@ fn wrap_string_replace_suspend(state: StringReplaceResumeState, continuation: Na
     NativeResume::from_copy_closure_with_captures(resume_string_replace_suspend, (state, continuation))
 }
 
+#[derive(Clone, Trace, Finalize)]
+enum StringReplaceAllReplacement {
+    FunctionalReplace(JsObject),
+    ReplaceValue(JsString),
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct StringReplaceAllResumeState {
+    string: JsString,
+    search_string: JsString,
+    replace_value: StringReplaceAllReplacement,
+    match_positions: Vec<usize>,
+    search_length: usize,
+    match_index: usize,
+    end_of_last_match: usize,
+    result: Vec<u16>,
+}
+
+fn wrap_string_replace_all_suspend(
+    state: StringReplaceAllResumeState,
+    continuation: NativeResume,
+) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_string_replace_all_suspend,
+        (state, continuation),
+    )
+}
+
+fn resume_string_replace_all_suspend(
+    completion: crate::vm::CompletionRecord,
+    captures: &(StringReplaceAllResumeState, NativeResume),
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let (state, continuation) = captures;
+    match continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            crate::vm::CompletionRecord::Normal(value)
+            | crate::vm::CompletionRecord::Return(value) => {
+                continue_string_replace_all_after_replacement(
+                    state.clone(),
+                    value.to_string(context)?,
+                    context,
+                )
+            }
+            crate::vm::CompletionRecord::Throw(err) => {
+                Ok(NativeFunctionResult::from_completion(crate::vm::CompletionRecord::Throw(
+                    err,
+                )))
+            }
+            crate::vm::CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message(
+                    "replaceAll continuation resumed with suspended completion",
+                )
+                .into()),
+        },
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_string_replace_all_suspend(state.clone(), next),
+        )),
+    }
+}
+
+fn continue_string_replace_all(
+    mut state: StringReplaceAllResumeState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    while let Some(&p) = state.match_positions.get(state.match_index) {
+        let preserved = state.string.get_expect(state.end_of_last_match..p);
+
+        let replacement = match &state.replace_value {
+            StringReplaceAllReplacement::FunctionalReplace(replace_fn) => {
+                let outcome = replace_fn.call_interruptible(
+                    &JsValue::undefined(),
+                    &[
+                        state.search_string.clone().into(),
+                        p.into(),
+                        state.string.clone().into(),
+                    ],
+                    context,
+                )?;
+
+                match outcome {
+                    crate::object::InterruptibleCallOutcome::Complete(value) => {
+                        value.to_string(context)?
+                    }
+                    crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::Suspend(
+                            wrap_string_replace_all_suspend(state, continuation),
+                        ));
+                    }
+                }
+            }
+            StringReplaceAllReplacement::ReplaceValue(replace_str) => get_substitution(
+                &state.search_string,
+                &state.string,
+                p,
+                &[],
+                &JsValue::undefined(),
+                replace_str,
+                context,
+            )
+            .js_expect("GetSubstitution should never fail here.")?,
+        };
+
+        state.result.extend(preserved.iter());
+        state.result.extend(replacement.iter());
+        state.end_of_last_match = p + state.search_length;
+        state.match_index += 1;
+    }
+
+    if state.end_of_last_match < state.string.len() {
+        state
+            .result
+            .extend(state.string.get_expect(state.end_of_last_match..).iter());
+    }
+
+    Ok(NativeFunctionResult::complete(JsValue::from(js_string!(
+        &state.result[..]
+    ))))
+}
+
+fn continue_string_replace_all_after_replacement(
+    mut state: StringReplaceAllResumeState,
+    replacement: JsString,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let p = *state
+        .match_positions
+        .get(state.match_index)
+        .expect("string replaceAll state should always point to a valid match");
+
+    let preserved = state.string.get_expect(state.end_of_last_match..p);
+    state.result.extend(preserved.iter());
+    state.result.extend(replacement.iter());
+    state.end_of_last_match = p + state.search_length;
+    state.match_index += 1;
+
+    continue_string_replace_all(state, context)
+}
+
 fn resume_string_replace_suspend(
     completion: crate::vm::CompletionRecord,
     captures: &(StringReplaceResumeState, NativeResume),
@@ -216,7 +355,11 @@ impl IntrinsicObject for String {
                 js_string!("replace"),
                 2,
             )
-            .method(Self::replace_all, js_string!("replaceAll"), 2)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::replace_all),
+                js_string!("replaceAll"),
+                2,
+            )
             .method(Self::iterator, JsSymbol::iterator(), 0)
             .method_native(
                 NativeFunction::from_suspend_fn_ptr(Self::search),
@@ -1246,7 +1389,7 @@ impl String {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be ? RequireObjectCoercible(this value).
         let o = this.require_object_coercible()?;
 
@@ -1275,12 +1418,29 @@ impl String {
             }
 
             // c. Let replacer be ? GetMethod(searchValue, @@replace).
-            let replacer = search_value.get_method(JsSymbol::replace(), context)?;
+            let replacer = match search_value.get_method_interruptible(JsSymbol::replace(), context)?
+            {
+                crate::context::ExecutionOutcome::Complete(replacer) => replacer,
+                crate::context::ExecutionOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::Suspend(continuation));
+                }
+            };
 
             // d. If replacer is not undefined, then
             if let Some(replacer) = replacer {
                 // i. Return ? Call(replacer, searchValue, « O, replaceValue »).
-                return replacer.call(search_value, &[o.clone(), replace_value.clone()], context);
+                return match replacer.call_interruptible(
+                    search_value,
+                    &[o.clone(), replace_value.clone()],
+                    context,
+                )? {
+                    crate::object::InterruptibleCallOutcome::Complete(value) => {
+                        Ok(NativeFunctionResult::complete(value))
+                    }
+                    crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                        Ok(NativeFunctionResult::Suspend(continuation))
+                    }
+                };
             }
         }
 
@@ -1322,63 +1482,23 @@ impl String {
 
         // 12. Let endOfLastMatch be 0.
         let mut end_of_last_match = 0;
+        let result_capacity = string.len();
 
-        // 13. Let result be the empty String.
-        let mut result = Vec::with_capacity(string.len());
+        let state = StringReplaceAllResumeState {
+            string,
+            search_string,
+            replace_value: match replace {
+                Ok(replace_fn) => StringReplaceAllReplacement::FunctionalReplace(replace_fn),
+                Err(replace_str) => StringReplaceAllReplacement::ReplaceValue(replace_str),
+            },
+            match_positions,
+            search_length,
+            match_index: 0,
+            end_of_last_match,
+            result: Vec::with_capacity(result_capacity),
+        };
 
-        // 14. For each element p of matchPositions, do
-        for p in match_positions {
-            // a. Let preserved be the substring of string from endOfLastMatch to p.
-            let preserved = string.get_expect(end_of_last_match..p);
-
-            // c. Else,
-            let replacement = match replace {
-                // b. If functionalReplace is true, then
-                Ok(ref replace_fn) => {
-                    // i. Let replacement be ? ToString(? Call(replaceValue, undefined, « searchString, 𝔽(p), string »)).
-                    replace_fn
-                        .call(
-                            &JsValue::undefined(),
-                            &[
-                                search_string.clone().into(),
-                                p.into(),
-                                string.clone().into(),
-                            ],
-                            context,
-                        )?
-                        .to_string(context)?
-                }
-                // i. Assert: Type(replaceValue) is String.
-                // ii. Let captures be a new empty List.
-                // iii. Let replacement be ! GetSubstitution(searchString, string, p, captures, undefined, replaceValue).
-                Err(ref replace_str) => get_substitution(
-                    &search_string,
-                    &string,
-                    p,
-                    &[],
-                    &JsValue::undefined(),
-                    replace_str,
-                    context,
-                )
-                .js_expect("GetSubstitution should never fail here.")?,
-            };
-
-            // d. Set result to the string-concatenation of result, preserved, and replacement.
-            result.extend(preserved.iter());
-            result.extend(replacement.iter());
-
-            // e. Set endOfLastMatch to p + searchLength.
-            end_of_last_match = p + search_length;
-        }
-
-        // 15. If endOfLastMatch < the length of string, then
-        if end_of_last_match < string.len() {
-            // a. Set result to the string-concatenation of result and the substring of string from endOfLastMatch.
-            result.extend(string.get_expect(end_of_last_match..).iter());
-        }
-
-        // 16. Return result.
-        Ok(js_string!(&result[..]).into())
+        continue_string_replace_all(state, context)
     }
 
     /// `String.prototype.indexOf( searchValue[, fromIndex] )`

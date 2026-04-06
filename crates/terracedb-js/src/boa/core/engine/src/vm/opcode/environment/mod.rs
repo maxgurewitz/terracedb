@@ -2,9 +2,13 @@ use super::{IndexOperand, RegisterOperand};
 use crate::{
     Context, JsExpect, JsResult, JsValue,
     error::JsNativeError,
+    native_function::{NativeFunctionResult, NativeResume},
     object::internal_methods::InternalMethodPropertyContext,
-    vm::{CallFrameFlags, opcode::Operation},
+    object::JsObject,
+    vm::{CallFrameFlags, CompletionRecord, opcode::Operation},
 };
+use boa_gc::{Finalize, Trace};
+use std::ops::ControlFlow;
 
 /// `GetFunctionObject` implements the Opcode Operation for `Opcode::GetFunctionObject`
 ///
@@ -286,6 +290,47 @@ impl Operation for SuperCallDerived {
     const COST: u8 = 3;
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct BindThisValueResumeCapture {
+    continuation: NativeResume,
+    result: JsObject,
+    register_index: u32,
+}
+
+fn wrap_bind_this_value_resume(capture: BindThisValueResumeCapture) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_bind_this_value, capture)
+}
+
+fn resume_bind_this_value(
+    completion: CompletionRecord,
+    capture: &BindThisValueResumeCapture,
+    context: &mut Context,
+) -> crate::JsResult<NativeFunctionResult> {
+    match capture.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                context
+                    .vm
+                    .set_register(capture.register_index as usize, capture.result.clone().into());
+                context.continue_interruptible_vm()
+            }
+            CompletionRecord::Throw(err) => context.continue_interruptible_vm_with_throw(err),
+            CompletionRecord::Suspend => Err(JsNativeError::error()
+                .with_message(
+                    "bind this value continuation resumed with unexpected suspend completion",
+                )
+                .into()),
+        },
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_bind_this_value_resume(BindThisValueResumeCapture {
+                continuation: next,
+                result: capture.result.clone(),
+                register_index: capture.register_index,
+            }),
+        )),
+    }
+}
+
 /// `BindThisValue` implements the Opcode Operation for `Opcode::BindThisValue`
 ///
 /// Operation:
@@ -295,7 +340,10 @@ pub(crate) struct BindThisValue;
 
 impl BindThisValue {
     #[inline(always)]
-    pub(super) fn operation(value: RegisterOperand, context: &mut Context) -> JsResult<()> {
+    pub(super) fn operation(
+        value: RegisterOperand,
+        context: &mut Context,
+    ) -> ControlFlow<CompletionRecord> {
         // Taken from `SuperCall : super Arguments` steps 7-12.
         //
         // <https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation>
@@ -318,18 +366,33 @@ impl BindThisValue {
         };
 
         // 8. Perform ? thisER.BindThisValue(result).
-        this_env.bind_this_value(result.clone())?;
+        if let Err(err) = this_env.bind_this_value(result.clone()) {
+            return context.handle_error(err);
+        }
 
         // 9. Let F be thisER.[[FunctionObject]].
         // SKIP: 10. Assert: F is an ECMAScript function object.
         let active_function = this_env.slots().function_object().clone();
 
         // 11. Perform ? InitializeInstanceElements(result, F).
-        result.initialize_instance_elements(&active_function, context)?;
+        match result.initialize_instance_elements_interruptible(&active_function, context) {
+            Ok(crate::context::ExecutionOutcome::Complete(())) => {}
+            Ok(crate::context::ExecutionOutcome::Suspend(continuation)) => {
+                context.install_interruptible_resume(wrap_bind_this_value_resume(
+                    BindThisValueResumeCapture {
+                        continuation,
+                        result: result.clone(),
+                        register_index: value.into(),
+                    },
+                ));
+                return ControlFlow::Break(CompletionRecord::Suspend);
+            }
+            Err(err) => return context.handle_error(err),
+        }
 
         // 12. Return result.
         context.vm.set_register(value.into(), result.into());
-        Ok(())
+        ControlFlow::Continue(())
     }
 }
 
