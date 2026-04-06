@@ -4,6 +4,7 @@ mod node_compat;
 mod tracing_support;
 
 use terracedb_vfs::CreateOptions;
+use terracedb_sandbox::NodeDebugExecutionOptions;
 
 #[tokio::test]
 async fn node_dynamic_import_supports_module_packages_and_package_imports() {
@@ -87,15 +88,32 @@ async fn node_dynamic_import_supports_module_packages_and_package_imports() {
         .await
         .expect("write esm helper module");
 
-    let result = session
-        .exec_node_command(
+    let result = match session
+        .exec_node_command_with_debug(
             entrypoint.to_string(),
             vec!["/usr/bin/node".to_string(), entrypoint.to_string()],
             "/workspace/app".to_string(),
             std::collections::BTreeMap::from([("HOME".to_string(), "/workspace/home".to_string())]),
+            NodeDebugExecutionOptions {
+                capture_exceptions: true,
+                ..Default::default()
+            },
         )
         .await
-        .expect("node command should import ESM package");
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let trace = session.runtime_state_handle().node_runtime_trace_snapshot();
+            panic!(
+                "node command should import ESM package: {error}\nnode trace: {}\nnode last exception: {}",
+                trace.recent_events.join(" | "),
+                trace
+                    .last_exception
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+            );
+        }
+    };
 
     let report = result.result.expect("node command report");
     let stdout = report["stdout"].as_str().expect("stdout");

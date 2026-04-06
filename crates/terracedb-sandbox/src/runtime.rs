@@ -264,6 +264,7 @@ struct NodeExecutionTimeout {
 #[derive(Debug, Default)]
 struct NodeHostOperationState {
     next_request_id: u64,
+    active_request_id: Option<u64>,
     pending: BTreeMap<u64, NodePendingHostOperation>,
     completed: BTreeMap<u64, Result<NodeCompletedHostOperation, SandboxError>>,
 }
@@ -4373,7 +4374,11 @@ fn node_queue_host_operation(
     let mut state = host.host_operations.borrow_mut();
     let request_id = state.next_request_id.max(1);
     state.next_request_id = request_id.saturating_add(1).max(1);
+    state.active_request_id = Some(request_id);
+    let detail = format!("queue id={request_id} op={operation:?}");
     state.pending.insert(request_id, operation);
+    drop(state);
+    let _ = node_debug_event(host, "hostop", detail);
     Ok(request_id)
 }
 
@@ -4381,16 +4386,22 @@ fn node_take_pending_host_operation(
     host: &NodeRuntimeHost,
 ) -> Result<(u64, NodePendingHostOperation), SandboxError> {
     let mut state = host.host_operations.borrow_mut();
-    let Some((&request_id, _)) = state.pending.first_key_value() else {
-        return Err(SandboxError::Service {
+    let request_id = state
+        .active_request_id
+        .and_then(|request_id| state.pending.contains_key(&request_id).then_some(request_id))
+        .or_else(|| state.pending.first_key_value().map(|(&request_id, _)| request_id))
+        .ok_or_else(|| SandboxError::Service {
             service: "node_runtime",
             message: "suspended node runtime has no pending host operation".to_string(),
-        });
-    };
+        })?;
+    state.active_request_id = None;
     let operation = state.pending.remove(&request_id).ok_or_else(|| SandboxError::Service {
         service: "node_runtime",
         message: format!("missing pending host operation {request_id}"),
     })?;
+    let detail = format!("take_pending id={request_id} op={operation:?}");
+    drop(state);
+    let _ = node_debug_event(host, "hostop", detail);
     Ok((request_id, operation))
 }
 
@@ -4399,10 +4410,15 @@ fn node_store_host_operation_completion(
     request_id: u64,
     completion: Result<NodeCompletedHostOperation, SandboxError>,
 ) {
+    let detail = match &completion {
+        Ok(value) => format!("store_completion id={request_id} ok={value:?}"),
+        Err(error) => format!("store_completion id={request_id} err={error}"),
+    };
     host.host_operations
         .borrow_mut()
         .completed
         .insert(request_id, completion);
+    let _ = node_debug_event(host, "hostop", detail);
 }
 
 fn node_take_host_operation_completion(
@@ -4414,6 +4430,12 @@ fn node_take_host_operation_completion(
         service: "node_runtime",
         message: format!("missing completed host operation {request_id}"),
     })?;
+    let detail = match &completion {
+        Ok(value) => format!("take_completion id={request_id} ok={value:?}"),
+        Err(error) => format!("take_completion id={request_id} err={error}"),
+    };
+    drop(state);
+    let _ = node_debug_event(host, "hostop", detail);
     completion
 }
 
