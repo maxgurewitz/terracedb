@@ -5,9 +5,10 @@ use boa_gc::{Finalize, Trace};
 use crate::{
     JsObject,
     builtins::iterable::IteratorRecord,
+    error::JsNativeError,
     js_error,
     native_function::{CoroutineBranch, CoroutineState, NativeCoroutine},
-    object::JsFunction,
+    object::{InterruptibleCallOutcome, JsFunction},
 };
 
 use super::super::get_iterator_direct;
@@ -79,7 +80,23 @@ impl Concat {
                             };
 
                             // i. Let iter be ? Call(iterable.[[OpenMethod]], iterable.[[Iterable]]).
-                            let iter = open_method.call(&iterable.into(), &[], context).branch()?;
+                            let iter = match open_method.call_interruptible(
+                                &iterable.into(),
+                                &[],
+                                context,
+                            ) {
+                                Ok(InterruptibleCallOutcome::Complete(value)) => value,
+                                Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                                    return CoroutineState::Break(Err(
+                                        JsNativeError::error()
+                                            .with_message(
+                                                "suspendable iterator helper callback requires interruptible execution",
+                                            )
+                                            .into(),
+                                    ));
+                                }
+                                Err(err) => return CoroutineState::Break(Err(err)),
+                            };
                             let Some(iter) = iter.as_object() else {
                                 // ii. If iter is not an Object, throw a TypeError exception.
                                 return CoroutineState::Break(Err(

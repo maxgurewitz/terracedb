@@ -6,8 +6,52 @@ use crate::{
     },
     error::JsNativeError,
     js_string,
+    native_function::{NativeFunctionResult, NativeResume},
+    object::InterruptibleCallOutcome,
     value::{JsSymbol, Numeric, PreferredType},
+    context::ExecutionOutcome,
 };
+use boa_gc::{Finalize, Trace};
+
+#[derive(Clone, Trace, Finalize)]
+struct InstanceOfResume {
+    continuation: NativeResume,
+}
+
+fn wrap_instance_of_resume(capture: InstanceOfResume) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_instance_of, capture)
+}
+
+fn resume_instance_of(
+    completion: crate::vm::CompletionRecord,
+    capture: &InstanceOfResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match capture.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => value,
+                crate::vm::CompletionRecord::Throw(err) => {
+                    return Ok(NativeFunctionResult::from_completion(
+                        crate::vm::CompletionRecord::Throw(err),
+                    ));
+                }
+                crate::vm::CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "instanceof continuation resumed with unexpected suspend completion",
+                        )
+                        .into());
+                }
+            };
+            Ok(NativeFunctionResult::complete(value))
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_instance_of_resume(InstanceOfResume { continuation: next }),
+        )),
+    }
+}
 
 impl JsValue {
     /// Perform the binary `+` operator on the value and return the result.
@@ -454,6 +498,25 @@ impl JsValue {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-instanceofoperator
     pub fn instance_of(&self, target: &Self, context: &mut Context) -> JsResult<bool> {
+        match self.instance_of_interruptible(target, context)? {
+            ExecutionOutcome::Complete(value) => Ok(value),
+            ExecutionOutcome::Suspend(_) => Err(JsNativeError::error()
+                .with_message("instanceof check suspended in sync path")
+                .into()),
+        }
+    }
+
+    /// Interruptible abstract operation `InstanceofOperator ( V, target )`
+    ///
+    /// More information:
+    /// - [ECMAScript reference][spec]
+    ///
+    /// [spec]: https://tc39.es/ecma262/#sec-instanceofoperator
+    pub fn instance_of_interruptible(
+        &self,
+        target: &Self,
+        context: &mut Context,
+    ) -> JsResult<ExecutionOutcome<bool>> {
         // 1. If Type(target) is not Object, throw a TypeError exception.
         if !target.is_object() {
             return Err(JsNativeError::typ()
@@ -465,24 +528,38 @@ impl JsValue {
         }
 
         // 2. Let instOfHandler be ? GetMethod(target, @@hasInstance).
-        match target.get_method(JsSymbol::has_instance(), context)? {
+        match target.get_method_interruptible(JsSymbol::has_instance(), context)? {
             // 3. If instOfHandler is not undefined, then
-            Some(instance_of_handler) => {
+            ExecutionOutcome::Complete(Some(instance_of_handler)) => {
                 // a. Return ! ToBoolean(? Call(instOfHandler, target, « V »)).
-                Ok(instance_of_handler
-                    .call(target, std::slice::from_ref(self), context)?
-                    .to_boolean())
+                match instance_of_handler.call_interruptible(
+                    target,
+                    std::slice::from_ref(self),
+                    context,
+                )? {
+                    InterruptibleCallOutcome::Complete(value) => {
+                        Ok(ExecutionOutcome::Complete(value.to_boolean()))
+                    }
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        Ok(ExecutionOutcome::Suspend(wrap_instance_of_resume(
+                            InstanceOfResume { continuation },
+                        )))
+                    }
+                }
             }
-            None if target.is_callable() => {
+            ExecutionOutcome::Complete(None) if target.is_callable() => {
                 // 5. Return ? OrdinaryHasInstance(target, V).
-                Self::ordinary_has_instance(target, self, context)
+                Ok(ExecutionOutcome::Complete(Self::ordinary_has_instance(
+                    target, self, context,
+                )?))
             }
-            None => {
+            ExecutionOutcome::Complete(None) => {
                 // 4. If IsCallable(target) is false, throw a TypeError exception.
                 Err(JsNativeError::typ()
                     .with_message("right-hand side of 'instanceof' is not callable")
                     .into())
             }
+            ExecutionOutcome::Suspend(continuation) => Ok(ExecutionOutcome::Suspend(continuation)),
         }
     }
 

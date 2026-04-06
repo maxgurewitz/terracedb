@@ -6,7 +6,8 @@ use crate::{
     JsValue,
     builtins::iterable::{IteratorRecord, get_iterator_flattenable},
     native_function::{CoroutineBranch, CoroutineState, NativeCoroutine},
-    object::JsFunction,
+    object::{InterruptibleCallOutcome, JsFunction},
+    error::JsNativeError,
     vm::CompletionRecord,
 };
 
@@ -105,15 +106,23 @@ impl FlatMap {
                                 return CoroutineState::Break(Ok(()));
                             };
 
-                            let mapped_value = if_abrupt_close_iterator!(
-                                mapper.call(
-                                    &JsValue::undefined(),
-                                    &[value, counter.into()],
-                                    context
-                                ),
-                                iterated,
-                                context
-                            );
+                            let mapped_value = match mapper.call_interruptible(
+                                &JsValue::undefined(),
+                                &[value, counter.into()],
+                                context,
+                            ) {
+                                Ok(InterruptibleCallOutcome::Complete(value)) => value,
+                                Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                                    return CoroutineState::Break(Err(
+                                        JsNativeError::error()
+                                            .with_message(
+                                                "suspendable iterator helper callback requires interruptible execution",
+                                            )
+                                            .into(),
+                                    ));
+                                }
+                                Err(err) => return iterated.close(Err(err), context).branch(),
+                            };
 
                             let inner_iterator = if_abrupt_close_iterator!(
                                 get_iterator_flattenable(&mapped_value, false, context),

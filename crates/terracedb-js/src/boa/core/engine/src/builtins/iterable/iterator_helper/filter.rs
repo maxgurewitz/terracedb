@@ -6,7 +6,8 @@ use crate::{
     JsValue,
     builtins::iterable::IteratorRecord,
     native_function::{CoroutineBranch, CoroutineState, NativeCoroutine},
-    object::JsFunction,
+    object::{InterruptibleCallOutcome, JsFunction},
+    error::JsNativeError,
 };
 
 /// [`Iterator.prototype.filter(predicate)`][spec]
@@ -67,12 +68,21 @@ impl Filter {
                             };
 
                             // iii. Let selected be Completion(Call(predicate, undefined, « value, 𝔽(counter) »)).
-                            let selected = match predicate.call(
+                            let selected = match predicate.call_interruptible(
                                 &JsValue::undefined(),
                                 &[value.clone(), counter.into()],
                                 context,
                             ) {
-                                Ok(val) => val,
+                                Ok(InterruptibleCallOutcome::Complete(val)) => val,
+                                Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                                    return CoroutineState::Break(Err(
+                                        JsNativeError::error()
+                                            .with_message(
+                                                "suspendable iterator helper callback requires interruptible execution",
+                                            )
+                                            .into(),
+                                    ));
+                                }
                                 Err(err) => {
                                     // iv. IfAbruptCloseIterator(selected, iterated).
                                     return iterated.close(Err(err), context).branch();

@@ -741,6 +741,19 @@ impl JsObject {
         Ok(desc.is_some())
     }
 
+    /// Get this object's own property descriptor.
+    pub fn get_own_property_descriptor<K>(
+        &self,
+        key: K,
+        context: &mut Context,
+    ) -> JsResult<Option<PropertyDescriptor>>
+    where
+        K: Into<PropertyKey>,
+    {
+        let key = key.into();
+        self.__get_own_property__(&key, &mut InternalMethodPropertyContext::new(context))
+    }
+
     /// Get all the keys of the properties of this object.
     ///
     /// More information:

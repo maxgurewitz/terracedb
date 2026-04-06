@@ -36,6 +36,7 @@ use crate::{
     module::ModuleKind,
     object::{FunctionObjectBuilder, JsPromise},
     realm::Realm,
+    native_function::NativeFunctionResult,
     vm::{
         ActiveRunnable, CallFrame, CallFrameFlags, CodeBlock, CompletionRecord,
         create_function_object_fast,
@@ -1452,12 +1453,12 @@ impl SourceTextModule {
         // 5. Let onFulfilled be CreateBuiltinFunction(fulfilledClosure, 0, "", « »).
         let on_fulfilled = FunctionObjectBuilder::new(
             context.realm(),
-            NativeFunction::from_copy_closure_with_captures(
+            NativeFunction::from_suspend_copy_closure_with_captures(
                 |_, _, module, context| {
                     //     a. Perform AsyncModuleExecutionFulfilled(module).
                     async_module_execution_fulfilled(module, context)?;
                     //     b. Return undefined.
-                    Ok(JsValue::undefined())
+                    Ok(NativeFunctionResult::complete(JsValue::undefined()))
                 },
                 module_self.clone(),
             ),
@@ -1468,13 +1469,13 @@ impl SourceTextModule {
         // 7. Let onRejected be CreateBuiltinFunction(rejectedClosure, 0, "", « »).
         let on_rejected = FunctionObjectBuilder::new(
             context.realm(),
-            NativeFunction::from_copy_closure_with_captures(
+            NativeFunction::from_suspend_copy_closure_with_captures(
                 |_, args, module, context| {
                     let error = JsError::from_opaque(args.get_or_undefined(0).clone());
                     // a. Perform AsyncModuleExecutionRejected(module, error).
                     async_module_execution_rejected(module, error, context)?;
                     // b. Return undefined.
-                    Ok(JsValue::undefined())
+                    Ok(NativeFunctionResult::complete(JsValue::undefined()))
                 },
                 module_self.clone(),
             ),
@@ -2015,7 +2016,10 @@ impl SourceTextModule {
 ///
 /// [spec]: https://tc39.es/ecma262/#sec-async-module-execution-fulfilled
 #[allow(clippy::mutable_key_type)]
-fn async_module_execution_fulfilled(module: &Module, context: &mut Context) -> JsResult<()> {
+fn async_module_execution_fulfilled(
+    module: &Module,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
     let ModuleKind::SourceText(module_src) = module.kind() else {
         unreachable!("async executed module must be a source text module");
     };
@@ -2025,7 +2029,7 @@ fn async_module_execution_fulfilled(module: &Module, context: &mut Context) -> J
         //     a. Assert: module.[[EvaluationError]] is not empty.
         assert!(error.is_some());
         //     b. Return unused.
-        return Ok(());
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
     }
 
     // 2. Assert: module.[[Status]] is evaluating-async.
@@ -2147,7 +2151,7 @@ fn async_module_execution_fulfilled(module: &Module, context: &mut Context) -> J
         }
     }
     // 13. Return unused.
-    Ok(())
+    Ok(NativeFunctionResult::complete(JsValue::undefined()))
 }
 
 /// Abstract operation [`AsyncModuleExecutionRejected ( module, error )`][spec].
@@ -2157,7 +2161,7 @@ fn async_module_execution_rejected(
     module: &Module,
     error: JsError,
     context: &mut Context,
-) -> JsResult<()> {
+) -> JsResult<NativeFunctionResult> {
     let ModuleKind::SourceText(module_src) = module.kind() else {
         unreachable!("async executed module must be a source text module");
     };
@@ -2166,7 +2170,7 @@ fn async_module_execution_rejected(
         //     a. Assert: module.[[EvaluationError]] is not empty.
         assert!(error.is_some());
         //     b. Return unused.
-        return Ok(());
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
     }
 
     // 2. Assert: module.[[Status]] is evaluating-async.
@@ -2214,5 +2218,5 @@ fn async_module_execution_rejected(
             .js_expect("default `reject` function cannot fail")?;
     }
     // 9. Return unused.
-    Ok(())
+    Ok(NativeFunctionResult::complete(JsValue::undefined()))
 }

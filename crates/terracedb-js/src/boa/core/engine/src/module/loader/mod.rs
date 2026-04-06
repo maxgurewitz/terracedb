@@ -11,8 +11,8 @@ use boa_parser::Source;
 
 use crate::script::Script;
 use crate::{
-    Context, JsError, JsNativeError, JsResult, JsString, js_error, js_string, object::JsObject,
-    realm::Realm, vm::ActiveRunnable,
+    Context, JsError, JsNativeError, JsResult, JsString, context::ExecutionOutcome, js_error,
+    js_string, object::JsObject, realm::Realm, vm::ActiveRunnable,
 };
 
 use super::Module;
@@ -194,7 +194,8 @@ pub trait ModuleLoader: Any {
         import_meta: &JsObject,
         module: &Module,
         context: &mut Context,
-    ) {
+    ) -> JsResult<ExecutionOutcome<()>> {
+        Ok(ExecutionOutcome::Complete(()))
     }
 }
 

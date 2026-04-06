@@ -16,7 +16,7 @@ use crate::{
     builtins::{OrdinaryObject, function::ConstructorKind},
     context::intrinsics::StandardConstructors,
     object::{
-        FunctionObjectBuilder, JsData, JsFunction, JsPromise,
+        FunctionObjectBuilder, InterruptibleCallOutcome, JsData, JsFunction, JsPromise,
         internal_methods::{
             CallValue, InternalObjectMethods, ORDINARY_INTERNAL_METHODS,
             get_prototype_from_constructor,
@@ -333,10 +333,30 @@ impl NativeFunction {
 
                     let context = &mut context.borrow_mut();
                     match result {
-                        Ok(v) => resolvers.resolve.call(&JsValue::undefined(), &[v], context),
+                        Ok(v) => match resolvers
+                            .resolve
+                            .call_interruptible(&JsValue::undefined(), &[v], context)?
+                        {
+                            InterruptibleCallOutcome::Complete(_) => {
+                                Ok(NativeFunctionResult::complete(JsValue::undefined()))
+                            }
+                            InterruptibleCallOutcome::Suspend(continuation) => {
+                                Ok(NativeFunctionResult::Suspend(continuation))
+                            }
+                        },
                         Err(e) => {
-                            let e = e.into_opaque(context)?;
-                            resolvers.reject.call(&JsValue::undefined(), &[e], context)
+                            let e: JsValue = e.into_opaque(context)?;
+                            match resolvers
+                                .reject
+                                .call_interruptible(&JsValue::undefined(), &[e], context)?
+                            {
+                                InterruptibleCallOutcome::Complete(_) => {
+                                    Ok(NativeFunctionResult::complete(JsValue::undefined()))
+                                }
+                                InterruptibleCallOutcome::Suspend(continuation) => {
+                                    Ok(NativeFunctionResult::Suspend(continuation))
+                                }
+                            }
                         }
                     }
                 })

@@ -6,7 +6,8 @@ use crate::{
     JsValue,
     builtins::iterable::IteratorRecord,
     native_function::{CoroutineBranch, CoroutineState, NativeCoroutine},
-    object::JsFunction,
+    object::{InterruptibleCallOutcome, JsFunction},
+    error::JsNativeError,
 };
 
 /// [`Iterator.prototype.map(mapper)`][spec]
@@ -57,11 +58,25 @@ impl Map {
 
                         // iii. Let mapped be Completion(Call(mapper, undefined, « value, 𝔽(counter) »)).
                         // iv. IfAbruptCloseIterator(mapped, iterated).
-                        let value = if_abrupt_close_iterator!(
-                            mapper.call(&JsValue::undefined(), &[value, counter.into()], context,),
-                            iterated,
-                            context
-                        );
+                        let value = match mapper.call_interruptible(
+                            &JsValue::undefined(),
+                            &[value, counter.into()],
+                            context,
+                        ) {
+                            Ok(InterruptibleCallOutcome::Complete(value)) => value,
+                            Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                                return CoroutineState::Break(Err(
+                                    JsNativeError::error()
+                                        .with_message(
+                                            "suspendable iterator helper callback requires interruptible execution",
+                                        )
+                                        .into(),
+                                ));
+                            }
+                            Err(err) => {
+                                return iterated.close(Err(err), context).branch();
+                            }
+                        };
 
                         // vii. Set counter to counter + 1.
                         state.set(Self::Yielding {

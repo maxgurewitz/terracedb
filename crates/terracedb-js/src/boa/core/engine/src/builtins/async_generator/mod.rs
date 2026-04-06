@@ -18,6 +18,7 @@ use crate::{
     js_string,
     native_function::NativeFunction,
     object::{CONSTRUCTOR, FunctionObjectBuilder, JsObject},
+    object::InterruptibleCallOutcome,
     property::Attribute,
     realm::Realm,
     string::StaticJsStrings,
@@ -154,11 +155,21 @@ impl AsyncGenerator {
             let iterator_result = create_iter_result_object(JsValue::undefined(), true, context)?;
 
             // b. Perform ! Call(promiseCapability.[[Resolve]], undefined, « iteratorResult »).
-            promise_capability.resolve().call(
+            match promise_capability.resolve().call_interruptible(
                 &JsValue::undefined(),
                 &[iterator_result],
                 context,
-            )?;
+            ) {
+                Ok(InterruptibleCallOutcome::Complete(_)) => {}
+                Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable promise capability callback requires interruptible execution",
+                        )
+                        .into());
+                }
+                Err(err) => return Err(err),
+            }
 
             // c. Return promiseCapability.[[Promise]].
             return Ok(promise_capability.promise().clone().into());
@@ -303,11 +314,21 @@ impl AsyncGenerator {
         // 7. If state is completed, then
         if state == AsyncGeneratorState::Completed {
             // a. Perform ! Call(promiseCapability.[[Reject]], undefined, « exception »).
-            promise_capability.reject().call(
+            match promise_capability.reject().call_interruptible(
                 &JsValue::undefined(),
                 &[args.get_or_undefined(0).clone()],
                 context,
-            )?;
+            ) {
+                Ok(InterruptibleCallOutcome::Complete(_)) => {}
+                Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable promise capability callback requires interruptible execution",
+                        )
+                        .into());
+                }
+                Err(err) => return Err(err),
+            }
 
             // b. Return promiseCapability.[[Promise]].
             return Ok(promise_capability.promise().clone().into());
@@ -390,11 +411,21 @@ impl AsyncGenerator {
             // 6. If completion is a throw completion, then
             Err(e) => {
                 // a. Perform ! Call(promiseCapability.[[Reject]], undefined, « value »).
-                promise_capability.reject().call(
+                match promise_capability.reject().call_interruptible(
                     &JsValue::undefined(),
                     &[e.into_opaque(context)?],
                     context,
-                )?;
+                ) {
+                    Ok(InterruptibleCallOutcome::Complete(_)) => {}
+                    Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                        return Err(JsNativeError::error()
+                            .with_message(
+                                "suspendable promise capability callback requires interruptible execution",
+                            )
+                            .into());
+                    }
+                    Err(err) => return Err(err),
+                }
             }
 
             // 7. Else,
@@ -420,11 +451,21 @@ impl AsyncGenerator {
                 };
 
                 // d. Perform ! Call(promiseCapability.[[Resolve]], undefined, « iteratorResult »).
-                promise_capability.resolve().call(
+                match promise_capability.resolve().call_interruptible(
                     &JsValue::undefined(),
                     &[iterator_result],
                     context,
-                )?;
+                ) {
+                    Ok(InterruptibleCallOutcome::Complete(_)) => {}
+                    Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                        return Err(JsNativeError::error()
+                            .with_message(
+                                "suspendable promise capability callback requires interruptible execution",
+                            )
+                            .into());
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
         // 8. Return unused.

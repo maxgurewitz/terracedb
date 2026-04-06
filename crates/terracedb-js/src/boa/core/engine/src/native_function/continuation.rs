@@ -206,7 +206,7 @@ impl std::fmt::Debug for NativeResume {
 }
 
 impl NativeResume {
-    pub(crate) fn from_copy_closure_with_captures<F, T>(closure: F, captures: T) -> Self
+    pub fn from_copy_closure_with_captures<F, T>(closure: F, captures: T) -> Self
     where
         F: Fn(CompletionRecord, &T, &mut Context) -> NativeResumeState + Copy + 'static,
         T: Trace + 'static,

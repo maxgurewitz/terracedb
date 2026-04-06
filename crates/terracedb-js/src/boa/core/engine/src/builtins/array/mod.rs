@@ -563,7 +563,14 @@ impl Array {
 
         if let Some(c) = c.as_constructor() {
             // 8. Return ? Construct(C, « 𝔽(length) »).
-            return c.construct(&[JsValue::new(length)], Some(&c), context);
+            return match c.construct_interruptible(&[JsValue::new(length)], Some(&c), context)? {
+                InterruptibleCallOutcome::Complete(object) => Ok(object.into()),
+                InterruptibleCallOutcome::Suspend(_) => Err(JsNativeError::error()
+                    .with_message(
+                        "suspendable Array species constructor requires interruptible execution",
+                    )
+                    .into()),
+            };
         }
 
         // 7. If IsConstructor(C) is false, throw a TypeError exception.
@@ -624,7 +631,20 @@ impl Array {
             // 10. Else,
             //     a. Let A be ? ArrayCreate(len).
             let a = match this.as_constructor() {
-                Some(constructor) => constructor.construct(&[len.into()], None, context)?,
+                Some(constructor) => match constructor.construct_interruptible(
+                    &[len.into()],
+                    None,
+                    context,
+                )? {
+                    InterruptibleCallOutcome::Complete(object) => object,
+                    InterruptibleCallOutcome::Suspend(_) => {
+                        return Err(JsNativeError::error()
+                            .with_message(
+                                "suspendable Array.from constructor requires interruptible execution",
+                            )
+                            .into())
+                    }
+                },
                 _ => Self::array_create(len, None, context)?,
             };
 
@@ -640,7 +660,16 @@ impl Array {
                 let mapped_value = if let Some(ref mapfn) = mapping {
                     // c. If mapping is true, then
                     //     i. Let mappedValue be ? Call(mapfn, thisArg, « kValue, 𝔽(k) »).
-                    mapfn.call(this_arg, &[k_value, k.into()], context)?
+                    match mapfn.call_interruptible(this_arg, &[k_value, k.into()], context)? {
+                        InterruptibleCallOutcome::Complete(value) => value,
+                        InterruptibleCallOutcome::Suspend(_) => {
+                            return Err(JsNativeError::error()
+                                .with_message(
+                                    "suspendable Array.from mapfn requires interruptible execution",
+                                )
+                                .into())
+                        }
+                    }
                 } else {
                     // d. Else, let mappedValue be kValue.
                     k_value
@@ -664,7 +693,16 @@ impl Array {
         // b. Else,
         //     i. Let A be ? ArrayCreate(0en).
         let a = match this.as_constructor() {
-            Some(constructor) => constructor.construct(&[], None, context)?,
+            Some(constructor) => match constructor.construct_interruptible(&[], None, context)? {
+                InterruptibleCallOutcome::Complete(object) => object,
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable Array.from constructor requires interruptible execution",
+                        )
+                        .into())
+                }
+            },
             _ => Self::array_create(0, None, context)?,
         };
 
@@ -689,7 +727,16 @@ impl Array {
             // v. If mapping is true, then
             let mapped_value = if let Some(ref mapfn) = mapping {
                 // 1. Let mappedValue be Completion(Call(mapper, thisArg, « next, 𝔽(k) »)).
-                let mapped_value = mapfn.call(this_arg, &[next, k.into()], context);
+                let mapped_value = match mapfn.call_interruptible(this_arg, &[next, k.into()], context)
+                {
+                    Ok(InterruptibleCallOutcome::Complete(value)) => Ok(value),
+                    Ok(InterruptibleCallOutcome::Suspend(_)) => Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable Array.from iterator mapfn requires interruptible execution",
+                        )
+                        .into()),
+                    Err(err) => Err(err),
+                };
 
                 // 2. IfAbruptCloseIterator(mappedValue, iteratorRecord).
                 if_abrupt_close_iterator!(mapped_value, iterator_record, context)
@@ -760,7 +807,16 @@ impl Array {
         // 5. Else,
         //     a. Let A be ? ArrayCreate(len).
         let a = match this.as_constructor() {
-            Some(constructor) => constructor.construct(&[len.into()], None, context)?,
+            Some(constructor) => match constructor.construct_interruptible(&[len.into()], None, context)? {
+                InterruptibleCallOutcome::Complete(object) => object,
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable Array.of constructor requires interruptible execution",
+                        )
+                        .into())
+                }
+            },
             _ => Self::array_create(len as u64, None, context)?,
         };
 
@@ -1102,7 +1158,14 @@ impl Array {
         // 3. If IsCallable(func) is false, set func to the intrinsic function %Object.prototype.toString%.
         // 4. Return ? Call(func, array).
         if let Some(func) = func.as_callable() {
-            func.call(&array.into(), &[], context)
+            match func.call_interruptible(&array.into(), &[], context)? {
+                InterruptibleCallOutcome::Complete(value) => Ok(value),
+                InterruptibleCallOutcome::Suspend(_) => Err(JsNativeError::error()
+                    .with_message(
+                        "suspendable Array.prototype.toString join callback requires interruptible execution",
+                    )
+                    .into()),
+            }
         } else {
             crate::builtins::object::OrdinaryObject::to_string(&array.into(), &[], context)
         }
@@ -1914,11 +1977,20 @@ impl Array {
                 // ii. If mapperFunction is present, then
                 if let Some(mapper_function) = mapper_function {
                     // 1. Set element to ? Call(mapperFunction, thisArg, <<element, sourceIndex, source>>)
-                    element = mapper_function.call(
+                    element = match mapper_function.call_interruptible(
                         this_arg,
                         &[element, source_index.into(), source.clone().into()],
                         context,
-                    )?;
+                    )? {
+                        InterruptibleCallOutcome::Complete(value) => value,
+                        InterruptibleCallOutcome::Suspend(_) => {
+                            return Err(JsNativeError::error()
+                                .with_message(
+                                    "suspendable Array.prototype.flatMap mapper requires interruptible execution",
+                                )
+                                .into())
+                        }
+                    };
                 }
 
                 // iii. Let shouldFlatten be false
@@ -4230,9 +4302,16 @@ fn compare_array_elements(
     if let Some(cmp) = comparefn {
         let args = [x.clone(), y.clone()];
         //     a. Let v be ? ToNumber(? Call(comparefn, undefined, « x, y »)).
-        let v = cmp
-            .call(&JsValue::undefined(), &args, context)?
-            .to_number(context)?;
+        let v = match cmp.call_interruptible(&JsValue::undefined(), &args, context)? {
+            InterruptibleCallOutcome::Complete(value) => value.to_number(context)?,
+            InterruptibleCallOutcome::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message(
+                        "suspendable Array.prototype.sort comparefn requires interruptible execution",
+                    )
+                    .into())
+            }
+        };
         //     b. If v is NaN, return +0𝔽.
         //     c. Return v.
         return Ok(v.partial_cmp(&0.0).unwrap_or(Ordering::Equal));
@@ -4293,13 +4372,20 @@ pub(crate) fn find_via_predicate(
         let k_value = o.get(pk, context)?;
 
         // d. Let testResult be ? Call(predicate, thisArg, « kValue, 𝔽(k), O »).
-        let test_result = predicate
-            .call(
-                this_arg,
-                &[k_value.clone(), k.into(), o.clone().into()],
-                context,
-            )?
-            .to_boolean();
+        let test_result = match predicate.call_interruptible(
+            this_arg,
+            &[k_value.clone(), k.into(), o.clone().into()],
+            context,
+        )? {
+            InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+            InterruptibleCallOutcome::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message(
+                        "suspendable Array.prototype.find predicate requires interruptible execution",
+                    )
+                    .into())
+            }
+        };
 
         if test_result {
             // e. If ToBoolean(testResult) is true, return the Record { [[Index]]: 𝔽(k), [[Value]]: kValue }.

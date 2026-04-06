@@ -34,6 +34,7 @@ use crate::context::time::{JsDuration, JsInstant};
 use crate::sys::time;
 use crate::{
     Context, JsResult, JsValue,
+    native_function::NativeFunctionResult,
     object::{JsFunction, NativeObject},
     realm::Realm,
 };
@@ -323,8 +324,24 @@ impl GenericJob {
     }
 }
 
+trait IntoNativeAsyncJobResult {
+    fn into_native_async_job_result(self) -> NativeFunctionResult;
+}
+
+impl IntoNativeAsyncJobResult for JsValue {
+    fn into_native_async_job_result(self) -> NativeFunctionResult {
+        NativeFunctionResult::complete(self)
+    }
+}
+
+impl IntoNativeAsyncJobResult for NativeFunctionResult {
+    fn into_native_async_job_result(self) -> NativeFunctionResult {
+        self
+    }
+}
+
 /// The [`Future`] job returned by a [`NativeAsyncJob`] operation.
-pub type BoxedFuture<'a> = Pin<Box<dyn Future<Output = JsResult<JsValue>> + 'a>>;
+pub type BoxedFuture<'a> = Pin<Box<dyn Future<Output = JsResult<NativeFunctionResult>> + 'a>>;
 
 /// An ECMAScript [Job] that can be run asynchronously.
 ///
@@ -346,23 +363,37 @@ impl Debug for NativeAsyncJob {
 
 impl NativeAsyncJob {
     /// Creates a new `NativeAsyncJob` from an async closure.
-    pub fn new<F>(f: F) -> Self
+    pub fn new<F, R>(f: F) -> Self
     where
-        F: AsyncFnOnce(&RefCell<&mut Context>) -> JsResult<JsValue> + 'static,
+        F: AsyncFnOnce(&RefCell<&mut Context>) -> JsResult<R> + 'static,
+        R: IntoNativeAsyncJobResult,
     {
         Self {
-            f: Box::new(move |ctx| Box::pin(async move { f(ctx).await })),
+            f: Box::new(move |ctx| {
+                Box::pin(async move {
+                    f(ctx)
+                        .await
+                        .map(IntoNativeAsyncJobResult::into_native_async_job_result)
+                })
+            }),
             realm: None,
         }
     }
 
     /// Creates a new `NativeAsyncJob` from an async closure and an execution realm.
-    pub fn with_realm<F>(f: F, realm: Realm) -> Self
+    pub fn with_realm<F, R>(f: F, realm: Realm) -> Self
     where
-        F: AsyncFnOnce(&RefCell<&mut Context>) -> JsResult<JsValue> + 'static,
+        F: AsyncFnOnce(&RefCell<&mut Context>) -> JsResult<R> + 'static,
+        R: IntoNativeAsyncJobResult,
     {
         Self {
-            f: Box::new(move |ctx| Box::pin(async move { f(ctx).await })),
+            f: Box::new(move |ctx| {
+                Box::pin(async move {
+                    f(ctx)
+                        .await
+                        .map(IntoNativeAsyncJobResult::into_native_async_job_result)
+                })
+            }),
             realm: Some(realm),
         }
     }
@@ -379,12 +410,12 @@ impl NativeAsyncJob {
     ///
     /// If the native async job has an execution realm defined, this sets the running execution
     /// context to the realm's before calling the inner closure, and resets it after execution.
-    pub fn call<'a, 'b>(
+    pub fn call_result<'a, 'b>(
         self,
         context: &'a RefCell<&'b mut Context>,
         // We can make our users assume `Unpin` because `self.f` is already boxed, so we shouldn't
         // need pin at all.
-    ) -> impl Future<Output = JsResult<JsValue>> + Unpin + use<'a, 'b> {
+    ) -> impl Future<Output = JsResult<NativeFunctionResult>> + Unpin + use<'a, 'b> {
         // If realm is not null, each time job is invoked the implementation must perform
         // implementation-defined steps such that execution is prepared to evaluate ECMAScript
         // code at the time of job's invocation.
@@ -419,6 +450,28 @@ impl NativeAsyncJob {
                 future.as_mut().poll(cx)
             }
         })
+    }
+
+    /// Calls the native async job with the specified [`Context`].
+    ///
+    /// # Note
+    ///
+    /// If the native async job has an execution realm defined, this sets the running execution
+    /// context to the realm's before calling the inner closure, and resets it after execution.
+    pub fn call<'a, 'b>(
+        self,
+        context: &'a RefCell<&'b mut Context>,
+        // We can make our users assume `Unpin` because `self.f` is already boxed, so we shouldn't
+        // need pin at all.
+    ) -> impl Future<Output = JsResult<JsValue>> + use<'a, 'b> {
+        async move {
+            match self.call_result(context).await? {
+                NativeFunctionResult::Complete(record) => record.consume(),
+                NativeFunctionResult::Suspend(_) => Err(crate::JsNativeError::error()
+                    .with_message("suspendable native async job requires interruptible execution")
+                    .into()),
+            }
+        }
     }
 }
 
@@ -784,11 +837,11 @@ impl JobExecutor for SimpleJobExecutor {
                 }
 
                 for job in mem::take(&mut *self.async_jobs.borrow_mut()) {
-                    group.insert(job.call(context));
+                    group.insert(job.call_result(context));
                 }
 
                 for job in mem::take(&mut *self.finalization_registry_jobs.borrow_mut()) {
-                    fr_group.insert(job.call(context));
+                    fr_group.insert(job.call_result(context));
                 }
 
                 {
@@ -817,18 +870,40 @@ impl JobExecutor for SimpleJobExecutor {
 
                 if self.is_empty() && group.is_empty() {
                     match future::poll_once(fr_group.next()).await.flatten() {
+                        Some(Ok(NativeFunctionResult::Complete(record))) => {
+                            if let Err(err) = record.consume() {
+                                self.clear();
+                                return Err(err);
+                            }
+                        }
+                        Some(Ok(NativeFunctionResult::Suspend(continuation))) => {
+                            context.borrow_mut().install_interruptible_resume(continuation);
+                        }
                         Some(Err(err)) => {
                             self.clear();
                             return Err(err);
                         }
-                        _ if !self.is_empty() => {}
-                        _ => break,
+                        None if !self.is_empty() => {}
+                        None => break,
                     }
                 }
 
-                if let Some(Err(err)) = future::poll_once(group.next()).await.flatten() {
-                    self.clear();
-                    return Err(err);
+                if let Some(result) = future::poll_once(group.next()).await.flatten() {
+                    match result {
+                        Ok(NativeFunctionResult::Complete(record)) => {
+                            if let Err(err) = record.consume() {
+                                self.clear();
+                                return Err(err);
+                            }
+                        }
+                        Ok(NativeFunctionResult::Suspend(continuation)) => {
+                            context.borrow_mut().install_interruptible_resume(continuation);
+                        }
+                        Err(err) => {
+                            self.clear();
+                            return Err(err);
+                        }
+                    }
                 }
 
                 let jobs = mem::take(&mut *self.promise_jobs.borrow_mut());

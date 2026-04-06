@@ -247,6 +247,55 @@ fn finalize_proxy_get_result(
     Ok(trap_result)
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct ProxyConstructResume {
+    continuation: NativeResume,
+}
+
+fn wrap_proxy_construct_resume(continuation: NativeResume) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_proxy_construct_after_trap_call,
+        ProxyConstructResume { continuation },
+    )
+}
+
+fn resume_proxy_construct_after_trap_call(
+    completion: crate::vm::CompletionRecord,
+    capture: &ProxyConstructResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match capture.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            let value = match record {
+                crate::vm::CompletionRecord::Normal(value)
+                | crate::vm::CompletionRecord::Return(value) => value,
+                crate::vm::CompletionRecord::Throw(err) => {
+                    return Ok(NativeFunctionResult::from_completion(
+                        crate::vm::CompletionRecord::Throw(err),
+                    ));
+                }
+                crate::vm::CompletionRecord::Suspend => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "proxy construct continuation resumed with unexpected suspend completion",
+                        )
+                        .into());
+                }
+            };
+            let new_obj = value.as_object().ok_or_else(|| {
+                JsNativeError::typ()
+                    .with_message("Proxy trap constructor returned non-object value")
+            })?;
+            Ok(NativeFunctionResult::from_completion(
+                crate::vm::CompletionRecord::Normal(new_obj.clone().into()),
+            ))
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_proxy_construct_resume(next),
+        )),
+    }
+}
+
 fn wrap_proxy_get_get_method_resume(
     continuation: NativeResume,
     target: JsObject,
@@ -807,14 +856,35 @@ pub(crate) fn proxy_exotic_get_prototype_of(
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "getPrototypeOf").
-    let Some(trap) = handler.get_method(js_string!("getPrototypeOf"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? target.[[GetPrototypeOf]]().
-        return target.__get_prototype_of__(context);
+    let trap = match handler.get_method_interruptible(js_string!("getPrototypeOf"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? target.[[GetPrototypeOf]]().
+                return target.__get_prototype_of__(context);
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy getPrototypeOf trap lookup",
+            ));
+        }
     };
 
     // 7. Let handlerProto be ? Call(trap, handler, « target »).
-    let handler_proto = trap.call(&handler.into(), &[target.clone().into()], context)?;
+    let handler_proto = match trap.call_interruptible(
+        &handler.into(),
+        &[target.clone().into()],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value,
+        InterruptibleCallOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy getPrototypeOf trap",
+            ));
+        }
+    };
 
     // 8. If Type(handlerProto) is neither Object nor Null, throw a TypeError exception.
     let handler_proto = match handler_proto.variant() {
@@ -868,25 +938,39 @@ pub(crate) fn proxy_exotic_set_prototype_of(
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "setPrototypeOf").
-    let Some(trap) = handler.get_method(js_string!("setPrototypeOf"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? target.[[SetPrototypeOf]](V).
-        return target.__set_prototype_of__(val, context);
+    let trap = match handler.get_method_interruptible(js_string!("setPrototypeOf"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? target.[[SetPrototypeOf]](V).
+                return target.__set_prototype_of__(val, context);
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy setPrototypeOf trap lookup",
+            ));
+        }
     };
 
     // 7. Let booleanTrapResult be ! ToBoolean(? Call(trap, handler, « target, V »)).
     // 8. If booleanTrapResult is false, return false.
-    if !trap
-        .call(
-            &handler.into(),
-            &[
-                target.clone().into(),
-                val.clone().map_or(JsValue::null(), Into::into),
-            ],
-            context,
-        )?
-        .to_boolean()
-    {
+    if !match trap.call_interruptible(
+        &handler.into(),
+        &[
+            target.clone().into(),
+            val.clone().map_or(JsValue::null(), Into::into),
+        ],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+        InterruptibleCallOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy setPrototypeOf trap",
+            ));
+        }
+    } {
         return Ok(false);
     }
 
@@ -927,16 +1011,35 @@ pub(crate) fn proxy_exotic_is_extensible(obj: &JsObject, context: &mut Context) 
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "isExtensible").
-    let Some(trap) = handler.get_method(js_string!("isExtensible"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? IsExtensible(target).
-        return target.is_extensible(context);
+    let trap = match handler.get_method_interruptible(js_string!("isExtensible"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? IsExtensible(target).
+                return target.is_extensible(context);
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy isExtensible trap lookup",
+            ));
+        }
     };
 
     // 7. Let booleanTrapResult be ! ToBoolean(? Call(trap, handler, « target »)).
-    let boolean_trap_result = trap
-        .call(&handler.into(), &[target.clone().into()], context)?
-        .to_boolean();
+    let boolean_trap_result = match trap.call_interruptible(
+        &handler.into(),
+        &[target.clone().into()],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+        InterruptibleCallOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy isExtensible trap",
+            ));
+        }
+    };
 
     // 8. Let targetResult be ? IsExtensible(target).
     let target_result = target.is_extensible(context)?;
@@ -972,16 +1075,35 @@ pub(crate) fn proxy_exotic_prevent_extensions(
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "preventExtensions").
-    let Some(trap) = handler.get_method(js_string!("preventExtensions"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? target.[[PreventExtensions]]().
-        return target.__prevent_extensions__(context);
+    let trap = match handler.get_method_interruptible(js_string!("preventExtensions"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? target.[[PreventExtensions]]().
+                return target.__prevent_extensions__(context);
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy preventExtensions trap lookup",
+            ));
+        }
     };
 
     // 7. Let booleanTrapResult be ! ToBoolean(? Call(trap, handler, « target »)).
-    let boolean_trap_result = trap
-        .call(&handler.into(), &[target.clone().into()], context)?
-        .to_boolean();
+    let boolean_trap_result = match trap.call_interruptible(
+        &handler.into(),
+        &[target.clone().into()],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+        InterruptibleCallOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy preventExtensions trap",
+            ));
+        }
+    };
 
     // 8. If booleanTrapResult is true, then
     if boolean_trap_result && target.is_extensible(context)? {
@@ -1019,18 +1141,38 @@ pub(crate) fn proxy_exotic_get_own_property(
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "getOwnPropertyDescriptor").
-    let Some(trap) = handler.get_method(js_string!("getOwnPropertyDescriptor"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? target.[[GetOwnProperty]](P).
-        return target.__get_own_property__(key, context);
+    let trap = match handler.get_method_interruptible(
+        js_string!("getOwnPropertyDescriptor"),
+        context,
+    )? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? target.[[GetOwnProperty]](P).
+                return target.__get_own_property__(key, context);
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy getOwnPropertyDescriptor trap lookup",
+            ));
+        }
     };
 
     // 7. Let trapResultObj be ? Call(trap, handler, « target, P »).
-    let trap_result_obj = trap.call(
+    let trap_result_obj = match trap.call_interruptible(
         &handler.into(),
         &[target.clone().into(), key.clone().into()],
         context,
-    )?;
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value,
+        InterruptibleCallOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy getOwnPropertyDescriptor trap",
+            ));
+        }
+    };
 
     // 8. If Type(trapResultObj) is neither Object nor Undefined, throw a TypeError exception.
     if !trap_result_obj.is_object() && !trap_result_obj.is_undefined() {
@@ -1144,10 +1286,20 @@ pub(crate) fn proxy_exotic_define_own_property(
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "defineProperty").
-    let Some(trap) = handler.get_method(js_string!("defineProperty"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? target.[[DefineOwnProperty]](P, Desc).
-        return target.__define_own_property__(key, desc, context);
+    let trap = match handler.get_method_interruptible(js_string!("defineProperty"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? target.[[DefineOwnProperty]](P, Desc).
+                return target.__define_own_property__(key, desc, context);
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy defineProperty trap lookup",
+            ));
+        }
     };
 
     // 7. Let descObj be FromPropertyDescriptor(Desc).
@@ -1155,14 +1307,18 @@ pub(crate) fn proxy_exotic_define_own_property(
 
     // 8. Let booleanTrapResult be ! ToBoolean(? Call(trap, handler, « target, P, descObj »)).
     // 9. If booleanTrapResult is false, return false.
-    if !trap
-        .call(
-            &handler.into(),
-            &[target.clone().into(), key.clone().into(), desc_obj],
-            context,
-        )?
-        .to_boolean()
-    {
+    if !match trap.call_interruptible(
+        &handler.into(),
+        &[target.clone().into(), key.clone().into(), desc_obj],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+        InterruptibleCallOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy defineProperty trap",
+            ));
+        }
+    } {
         return Ok(false);
     }
 
@@ -1521,22 +1677,36 @@ pub(crate) fn proxy_exotic_delete(
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "deleteProperty").
-    let Some(trap) = handler.get_method(js_string!("deleteProperty"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? target.[[Delete]](P).
-        return target.__delete__(key, context);
+    let trap = match handler.get_method_interruptible(js_string!("deleteProperty"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? target.[[Delete]](P).
+                return target.__delete__(key, context);
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy deleteProperty trap lookup",
+            ));
+        }
     };
 
     // 7. Let booleanTrapResult be ! ToBoolean(? Call(trap, handler, « target, P »)).
     // 8. If booleanTrapResult is false, return false.
-    if !trap
-        .call(
-            &handler.into(),
-            &[target.clone().into(), key.clone().into()],
-            context,
-        )?
-        .to_boolean()
-    {
+    if !match trap.call_interruptible(
+        &handler.into(),
+        &[target.clone().into(), key.clone().into()],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+        InterruptibleCallOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy deleteProperty trap",
+            ));
+        }
+    } {
         return Ok(false);
     }
 
@@ -1586,14 +1756,35 @@ pub(crate) fn proxy_exotic_own_property_keys(
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "ownKeys").
-    let Some(trap) = handler.get_method(js_string!("ownKeys"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? target.[[OwnPropertyKeys]]().
-        return target.__own_property_keys__(context);
+    let trap = match handler.get_method_interruptible(js_string!("ownKeys"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? target.[[OwnPropertyKeys]]().
+                return target.__own_property_keys__(context);
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy ownKeys trap lookup",
+            ));
+        }
     };
 
     // 7. Let trapResultArray be ? Call(trap, handler, « target »).
-    let trap_result_array = trap.call(&handler.into(), &[target.clone().into()], context)?;
+    let trap_result_array = match trap.call_interruptible(
+        &handler.into(),
+        &[target.clone().into()],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value,
+        InterruptibleCallOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy ownKeys trap",
+            ));
+        }
+    };
 
     // 8. Let trapResult be ? CreateListFromArrayLike(trapResultArray, « String, Symbol »).
     let trap_result_raw =
@@ -1720,10 +1911,20 @@ fn proxy_exotic_call(
         .try_data()?;
 
     // 5. Let trap be ? GetMethod(handler, "apply").
-    let Some(trap) = handler.get_method(js_string!("apply"), context)? else {
-        // 6. If trap is undefined, then
-        // a. Return ? Call(target, thisArgument, argumentsList).
-        return Ok(target.__call__(argument_count));
+    let trap = match handler.get_method_interruptible(js_string!("apply"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 6. If trap is undefined, then
+                // a. Return ? Call(target, thisArgument, argumentsList).
+                return Ok(target.__call__(argument_count));
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy apply trap lookup",
+            ));
+        }
     };
 
     let args = context
@@ -1738,13 +1939,19 @@ fn proxy_exotic_call(
     let _func = context.vm.stack.pop();
     let this = context.vm.stack.pop();
 
-    context.vm.stack.push(handler); // This
-    context.vm.stack.push(trap.clone()); // Function
-
-    context.vm.stack.push(target);
-    context.vm.stack.push(this);
-    context.vm.stack.push(arg_array);
-    Ok(trap.__call__(3))
+    match trap.call_interruptible(
+        &handler.into(),
+        &[target.into(), this, arg_array.into()],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(value) => {
+            context.vm.stack.push(value);
+            Ok(CallValue::Complete)
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => {
+            Ok(CallValue::Suspended(continuation))
+        }
+    }
 }
 
 /// `[[Construct]] ( argumentsList, newTarget )`
@@ -1771,10 +1978,20 @@ fn proxy_exotic_construct(
     assert!(target.is_constructor());
 
     // 6. Let trap be ? GetMethod(handler, "construct").
-    let Some(trap) = handler.get_method(js_string!("construct"), context)? else {
-        // 7. If trap is undefined, then
-        // a. Return ? Construct(target, argumentsList, newTarget).
-        return Ok(target.__construct__(argument_count));
+    let trap = match handler.get_method_interruptible(js_string!("construct"), context)? {
+        ExecutionOutcome::Complete(trap) => match trap {
+            Some(trap) => trap,
+            None => {
+                // 7. If trap is undefined, then
+                // a. Return ? Construct(target, argumentsList, newTarget).
+                return Ok(target.__construct__(argument_count));
+            }
+        },
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "proxy construct trap lookup",
+            ));
+        }
     };
 
     let new_target = context.vm.stack.pop();
@@ -1789,11 +2006,16 @@ fn proxy_exotic_construct(
     let arg_array = array::Array::create_array_from_list(args, context)?;
 
     // 9. Let newObj be ? Call(trap, handler, « target, argArray, newTarget »).
-    let new_obj = trap.call(
+    let new_obj = match trap.call_interruptible(
         &handler.into(),
         &[target.into(), arg_array.into(), new_target],
         context,
-    )?;
+    )? {
+        InterruptibleCallOutcome::Complete(value) => value,
+        InterruptibleCallOutcome::Suspend(continuation) => {
+            return Ok(CallValue::Suspended(wrap_proxy_construct_resume(continuation)));
+        }
+    };
 
     // 10. If Type(newObj) is not Object, throw a TypeError exception.
     let new_obj = new_obj.as_object().ok_or_else(|| {

@@ -3,6 +3,7 @@
 use crate::{
     Context, JsResult, JsValue,
     builtins::{BuiltInBuilder, IntrinsicObject},
+    context::ExecutionOutcome,
     context::intrinsics::Intrinsics,
     error::JsNativeError,
     js_string,
@@ -254,13 +255,24 @@ impl JsValue {
         context: &mut Context,
     ) -> JsResult<IteratorRecord> {
         // 1. Let iterator be ? Call(method, obj).
-        let iterator = method.call(self, &[], context)?;
+        let iterator = match method.call_interruptible(self, &[], context)? {
+            crate::object::InterruptibleCallOutcome::Complete(iterator) => iterator,
+            crate::object::InterruptibleCallOutcome::Suspend(_) => {
+                return Err(JsObject::suspended_internal_method_error("iterator acquisition"))
+            }
+        };
         // 2. If iterator is not an Object, throw a TypeError exception.
         let iterator_obj = iterator.as_object().ok_or_else(|| {
             JsNativeError::typ().with_message("returned iterator is not an object")
         })?;
         // 3. Let nextMethod be ? Get(iterator, "next").
-        let next_method = iterator_obj.get(js_string!("next"), context)?;
+        let next_method = iterator_obj.get_interruptible(js_string!("next"), context)?;
+        let next_method = match next_method {
+            crate::context::ExecutionOutcome::Complete(next_method) => next_method,
+            crate::context::ExecutionOutcome::Suspend(_) => {
+                return Err(JsObject::suspended_internal_method_error("iterator acquisition"))
+            }
+        };
         // 4. Let iteratorRecord be the Iterator Record { [[Iterator]]: iterator, [[NextMethod]]: nextMethod, [[Done]]: false }.
         // 5. Return iteratorRecord.
         Ok(IteratorRecord::new(iterator_obj.clone(), next_method))
@@ -281,31 +293,54 @@ impl JsValue {
             // 1. If kind is async, then
             IteratorHint::Async => {
                 // a. Let method be ? GetMethod(obj, %Symbol.asyncIterator%).
-                let Some(method) = self.get_method(JsSymbol::async_iterator(), context)? else {
-                    // b. If method is undefined, then
-                    //     i. Let syncMethod be ? GetMethod(obj, %Symbol.iterator%).
-                    let sync_method =
-                        self.get_method(JsSymbol::iterator(), context)?
-                            .ok_or_else(|| {
-                                // ii. If syncMethod is undefined, throw a TypeError exception.
-                                JsNativeError::typ().with_message(format!(
-                                    "value with type `{}` is not iterable",
-                                    self.type_of()
-                                ))
-                            })?;
-                    // iii. Let syncIteratorRecord be ? GetIteratorFromMethod(obj, syncMethod).
-                    let sync_iterator_record =
-                        self.get_iterator_from_method(&sync_method, context)?;
-                    // iv. Return CreateAsyncFromSyncIterator(syncIteratorRecord).
-                    return Ok(AsyncFromSyncIterator::create(sync_iterator_record, context));
+                let method = match self.get_method_interruptible(JsSymbol::async_iterator(), context)? {
+                    ExecutionOutcome::Complete(method) => method,
+                    ExecutionOutcome::Suspend(_) => {
+                        return Err(JsObject::suspended_internal_method_error(
+                            "iterator acquisition",
+                        ))
+                    }
                 };
 
-                Some(method)
+                match method {
+                    // b. If method is undefined, then
+                    None => {
+                        //     i. Let syncMethod be ? GetMethod(obj, %Symbol.iterator%).
+                        let sync_method = match self.get_method_interruptible(JsSymbol::iterator(), context)? {
+                            ExecutionOutcome::Complete(sync_method) => sync_method,
+                            ExecutionOutcome::Suspend(_) => {
+                                return Err(JsObject::suspended_internal_method_error(
+                                    "iterator acquisition",
+                                ))
+                            }
+                        }
+                        .ok_or_else(|| {
+                                    // ii. If syncMethod is undefined, throw a TypeError exception.
+                                    JsNativeError::typ().with_message(format!(
+                                        "value with type `{}` is not iterable",
+                                        self.type_of()
+                                    ))
+                                })?;
+                        // iii. Let syncIteratorRecord be ? GetIteratorFromMethod(obj, syncMethod).
+                        let sync_iterator_record =
+                            self.get_iterator_from_method(&sync_method, context)?;
+                        // iv. Return CreateAsyncFromSyncIterator(syncIteratorRecord).
+                        return Ok(AsyncFromSyncIterator::create(sync_iterator_record, context));
+                    }
+                    Some(method) => Some(method),
+                }
             }
             // 2. Else,
             IteratorHint::Sync => {
                 // a. Let method be ? GetMethod(obj, %Symbol.iterator%).
-                self.get_method(JsSymbol::iterator(), context)?
+                match self.get_method_interruptible(JsSymbol::iterator(), context)? {
+                    ExecutionOutcome::Complete(method) => method,
+                    ExecutionOutcome::Suspend(_) => {
+                        return Err(JsObject::suspended_internal_method_error(
+                            "iterator acquisition",
+                        ))
+                    }
+                }
             }
         };
 
@@ -513,13 +548,18 @@ impl IteratorRecord {
         // NOTE: In this case, `set_done_on_err` does all the heavylifting for us, which
         // simplifies the instructions below.
         self.set_done_on_err(|iter| {
-            iter.next_method
-                .call(
+            match iter.next_method.call_interruptible(
                     &iter.iterator.clone().into(),
                     value.map_or(&[], std::slice::from_ref),
                     context,
-                )
-                .and_then(IteratorResult::from_value)
+                )? {
+                crate::object::InterruptibleCallOutcome::Complete(result) => {
+                    IteratorResult::from_value(result)
+                }
+                crate::object::InterruptibleCallOutcome::Suspend(_) => Err(
+                    JsObject::suspended_internal_method_error("iterator next"),
+                ),
+            }
         })
     }
 
@@ -623,34 +663,50 @@ impl IteratorRecord {
         completion: JsResult<JsValue>,
         context: &mut Context,
     ) -> JsResult<JsValue> {
+        match self.close_interruptible(completion, context)? {
+            ExecutionOutcome::Complete(value) => Ok(value),
+            ExecutionOutcome::Suspend(_) => Err(JsObject::suspended_internal_method_error(
+                "iterator close",
+            )),
+        }
+    }
+
+    pub(crate) fn close_interruptible(
+        &self,
+        completion: JsResult<JsValue>,
+        context: &mut Context,
+    ) -> JsResult<ExecutionOutcome<JsValue>> {
         // 1. Assert: Type(iteratorRecord.[[Iterator]]) is Object.
 
         // 2. Let iterator be iteratorRecord.[[Iterator]].
         let iterator = &self.iterator;
 
         // 3. Let innerResult be Completion(GetMethod(iterator, "return")).
-        let inner_result = iterator.get_method(js_string!("return"), context);
+        let inner_result = iterator.get_method_interruptible(js_string!("return"), context)?;
 
         // 4. If innerResult.[[Type]] is normal, then
         let inner_result = match inner_result {
-            Ok(inner_result) => {
+            ExecutionOutcome::Complete(inner_result) => {
                 // a. Let return be innerResult.[[Value]].
                 let r#return = inner_result;
 
                 if let Some(r#return) = r#return {
                     // c. Set innerResult to Completion(Call(return, iterator)).
-                    r#return.call(&iterator.clone().into(), &[], context)
+                    match r#return.call_interruptible(&iterator.clone().into(), &[], context)? {
+                        crate::object::InterruptibleCallOutcome::Complete(result) => {
+                            ExecutionOutcome::Complete(result)
+                        }
+                        crate::object::InterruptibleCallOutcome::Suspend(continuation) => {
+                            return Ok(ExecutionOutcome::Suspend(continuation))
+                        }
+                    }
                 } else {
                     // b. If return is undefined, return ? completion.
-                    return completion;
+                    return completion.map(ExecutionOutcome::Complete);
                 }
             }
-            Err(inner_result) => {
-                // 5. If completion.[[Type]] is throw, return ? completion.
-                completion?;
-
-                // 6. If innerResult.[[Type]] is throw, return ? innerResult.
-                return Err(inner_result);
+            ExecutionOutcome::Suspend(continuation) => {
+                return Ok(ExecutionOutcome::Suspend(continuation));
             }
         };
 
@@ -658,11 +714,16 @@ impl IteratorRecord {
         let completion = completion?;
 
         // 6. If innerResult.[[Type]] is throw, return ? innerResult.
-        let inner_result = inner_result?;
+        let inner_result = match inner_result {
+            ExecutionOutcome::Complete(inner_result) => inner_result,
+            ExecutionOutcome::Suspend(continuation) => {
+                return Ok(ExecutionOutcome::Suspend(continuation));
+            }
+        };
 
         if inner_result.is_object() {
             // 8. Return ? completion.
-            Ok(completion)
+            Ok(ExecutionOutcome::Complete(completion))
         } else {
             // 7. If Type(innerResult.[[Value]]) is not Object, throw a TypeError exception.
             Err(JsNativeError::typ()
@@ -741,7 +802,14 @@ pub(crate) fn get_iterator_flattenable(
     }
 
     // 2. Let method be ? GetMethod(obj, @@iterator).
-    let method = obj.get_method(JsSymbol::iterator(), context)?;
+    let method = match obj.get_method_interruptible(JsSymbol::iterator(), context)? {
+        ExecutionOutcome::Complete(method) => method,
+        ExecutionOutcome::Suspend(_) => {
+            return Err(JsObject::suspended_internal_method_error(
+                "iterator flattenable acquisition",
+            ))
+        }
+    };
 
     match method {
         // 3. If method is undefined, then
@@ -758,7 +826,14 @@ pub(crate) fn get_iterator_flattenable(
         // 4. Else,
         Some(method) => {
             // a. Let iterator be ? Call(method, obj).
-            let iterator = method.call(obj, &[], context)?;
+            let iterator = match method.call_interruptible(obj, &[], context)? {
+                crate::object::InterruptibleCallOutcome::Complete(iterator) => iterator,
+                crate::object::InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsObject::suspended_internal_method_error(
+                        "iterator flattenable acquisition",
+                    ))
+                }
+            };
 
             // b. If iterator is not an Object, throw a TypeError exception.
             let iterator_obj = iterator.as_object().ok_or_else(|| {

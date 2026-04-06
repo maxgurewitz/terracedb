@@ -211,10 +211,17 @@ impl AsyncFromSyncIterator {
                     create_iter_result_object(args.get_or_undefined(0).clone(), true, context)?;
 
                 // b. Perform ! Call(promiseCapability.[[Resolve]], undefined, « iterResult »).
-                promise_capability
+                match promise_capability
                     .resolve()
-                    .call(&JsValue::undefined(), &[iter_result], context)
-                    .js_expect("cannot fail according to spec")?;
+                    .call_interruptible(&JsValue::undefined(), &[iter_result], context)?
+                {
+                    InterruptibleCallOutcome::Complete(_) => {}
+                    InterruptibleCallOutcome::Suspend(_) => {
+                        return Err(JsNativeError::error()
+                            .with_message("promise resolution requires interruptible execution")
+                            .into())
+                    }
+                }
 
                 // c. Return promiseCapability.[[Promise]].
                 return Ok(NativeFunctionResult::complete(
@@ -317,26 +324,36 @@ impl AsyncFromSyncIterator {
                 // a. NOTE: If syncIterator does not have a throw method, close it to give it a chance to clean up before we reject the capability.
                 // b. Let closeCompletion be NormalCompletion(empty).
                 // c. Let result be Completion(IteratorClose(syncIteratorRecord, closeCompletion)).
-                let result = sync_iterator_record.close(Ok(JsValue::undefined()), context);
-                // d. IfAbruptRejectPromise(result, promiseCapability).
-                if let Err(err) = result {
-                    return Self::reject_promise(err, promise_capability, context);
+                match sync_iterator_record.close_interruptible(Ok(JsValue::undefined()), context) {
+                    Ok(crate::context::ExecutionOutcome::Complete(_)) => {}
+                    Ok(crate::context::ExecutionOutcome::Suspend(_)) => {
+                        return Err(JsNativeError::error()
+                            .with_message("iterator close requires interruptible execution")
+                            .into())
+                    }
+                    Err(err) => {
+                        return Self::reject_promise(err, promise_capability, context);
+                    }
                 }
 
                 // e. NOTE: The next step throws a TypeError to indicate that there was a protocol violation: syncIterator does not have a throw method.
                 // f. NOTE: If closing syncIterator does not throw then the result of that operation is ignored, even if it yields a rejected promise.
                 // g. Perform ! Call(promiseCapability.[[Reject]], undefined, « a newly created TypeError object »).
-                promise_capability
-                    .reject()
-                    .call(
-                        &JsValue::undefined(),
-                        &[JsNativeError::typ()
-                            .with_message("sync iterator does not have a throw method")
-                            .into_opaque(context)?
-                            .into()],
-                        context,
-                    )
-                    .js_expect("cannot fail according to spec")?;
+                match promise_capability.reject().call_interruptible(
+                    &JsValue::undefined(),
+                    &[JsNativeError::typ()
+                        .with_message("sync iterator does not have a throw method")
+                        .into_opaque(context)?
+                        .into()],
+                    context,
+                )? {
+                    InterruptibleCallOutcome::Complete(_) => {}
+                    InterruptibleCallOutcome::Suspend(_) => {
+                        return Err(JsNativeError::error()
+                            .with_message("promise rejection requires interruptible execution")
+                            .into())
+                    }
+                }
 
                 // h. Return promiseCapability.[[Promise]].
                 return Ok(NativeFunctionResult::complete(
@@ -433,9 +450,15 @@ impl AsyncFromSyncIterator {
             //    true, then
             Err(e) if !done && close_on_rejection => {
                 // a. Set valueWrapper to Completion(IteratorClose(syncIteratorRecord, valueWrapper)).
-                Err(sync_iterator_record.close(Err(e), context).expect_err(
-                    "closing an iterator with an error must always return an error back",
-                ))
+                match sync_iterator_record.close_interruptible(Err(e), context) {
+                    Ok(crate::context::ExecutionOutcome::Complete(_)) => Err(JsNativeError::error()
+                        .with_message("iterator close unexpectedly completed during rejection cleanup")
+                        .into()),
+                    Ok(crate::context::ExecutionOutcome::Suspend(_)) => Err(JsNativeError::error()
+                        .with_message("iterator close requires interruptible execution")
+                        .into()),
+                    Err(err) => Err(err),
+                }
             }
             other => other.map(|o| {
                 o.downcast::<Promise>()
@@ -544,10 +567,17 @@ impl AsyncFromSyncIterator {
         context: &mut Context,
     ) -> JsResult<NativeFunctionResult> {
         let err = err.into_opaque(context)?;
-        promise_capability
+        match promise_capability
             .reject()
-            .call(&JsValue::undefined(), &[err], context)
-            .js_expect("promise rejection must not fail")?;
+            .call_interruptible(&JsValue::undefined(), &[err], context)?
+        {
+            InterruptibleCallOutcome::Complete(_) => {}
+            InterruptibleCallOutcome::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message("promise rejection requires interruptible execution")
+                    .into())
+            }
+        }
 
         Ok(NativeFunctionResult::complete(
             promise_capability.promise().clone(),

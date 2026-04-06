@@ -19,6 +19,7 @@ pub mod ordered_set;
 
 use self::ordered_set::OrderedSet;
 use super::iterable::IteratorHint;
+use std::cell::Cell;
 use crate::{
     Context, JsArgs, JsResult, JsString, JsValue,
     builtins::{
@@ -133,6 +134,407 @@ struct SetForEachState {
     locked: bool,
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct SetDisjointFromState {
+    this_set: JsObject<OrderedSet>,
+    other: JsValue,
+    other_rec: SetRecord,
+    this_size: Cell<usize>,
+    index: Cell<usize>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct SetSubsetOfState {
+    this_set: JsObject<OrderedSet>,
+    other: JsValue,
+    other_rec: SetRecord,
+    this_size: Cell<usize>,
+    index: Cell<usize>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct SetIntersectionState {
+    this_set: JsObject<OrderedSet>,
+    other: JsValue,
+    other_rec: SetRecord,
+    result_set: JsObject<OrderedSet>,
+    pending_value: Option<JsValue>,
+    this_size: Cell<usize>,
+    index: Cell<usize>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct SetDifferenceState {
+    this_set: JsObject<OrderedSet>,
+    other: JsValue,
+    other_rec: SetRecord,
+    result_set: JsObject<OrderedSet>,
+    pending_value: Option<JsValue>,
+    this_size: Cell<usize>,
+    index: Cell<usize>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct SetDisjointFromSuspendState {
+    state: SetDisjointFromState,
+    continuation: NativeResume,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct SetSubsetOfSuspendState {
+    state: SetSubsetOfState,
+    continuation: NativeResume,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct SetIntersectionSuspendState {
+    state: SetIntersectionState,
+    pending_value: JsValue,
+    continuation: NativeResume,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct SetDifferenceSuspendState {
+    state: SetDifferenceState,
+    pending_value: JsValue,
+    continuation: NativeResume,
+}
+
+fn clone_set_disjoint_from_state(state: &SetDisjointFromState) -> SetDisjointFromState {
+    SetDisjointFromState {
+        this_set: state.this_set.clone(),
+        other: state.other.clone(),
+        other_rec: state.other_rec.clone(),
+        this_size: Cell::new(state.this_size.get()),
+        index: Cell::new(state.index.get()),
+    }
+}
+
+fn wrap_set_disjoint_from_suspend(
+    state: SetDisjointFromSuspendState,
+) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_set_disjoint_from_suspend, state)
+}
+
+fn resume_set_disjoint_from_suspend(
+    completion: CompletionRecord,
+    state: &SetDisjointFromSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            if record.consume()?.to_boolean() {
+                return Ok(NativeFunctionResult::complete(JsValue::from(false)));
+            }
+            continue_is_disjoint_from(&state.state, context)
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_set_disjoint_from_suspend(SetDisjointFromSuspendState {
+                state: clone_set_disjoint_from_state(&state.state),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_is_disjoint_from(
+    state: &SetDisjointFromState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let mut index = state.index.get();
+    let mut this_size = state.this_size.get();
+
+    while index < this_size {
+        let e = state.this_set.borrow().data().get_index(index).cloned();
+        index += 1;
+
+        if let Some(e) = e {
+            match state
+                .other_rec
+                .has
+                .call_interruptible(&state.other, &[e], context)?
+            {
+                InterruptibleCallOutcome::Complete(value) => {
+                    if value.to_boolean() {
+                        return Ok(NativeFunctionResult::complete(JsValue::from(false)));
+                    }
+                    this_size = state.this_set.borrow().data().full_len();
+                    state.this_size.set(this_size);
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    state.index.set(index);
+                    state.this_size.set(this_size);
+                    return Ok(NativeFunctionResult::Suspend(wrap_set_disjoint_from_suspend(
+                        SetDisjointFromSuspendState {
+                            state: clone_set_disjoint_from_state(state),
+                            continuation,
+                        },
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(NativeFunctionResult::complete(JsValue::from(true)))
+}
+
+fn clone_set_subset_of_state(state: &SetSubsetOfState) -> SetSubsetOfState {
+    SetSubsetOfState {
+        this_set: state.this_set.clone(),
+        other: state.other.clone(),
+        other_rec: state.other_rec.clone(),
+        this_size: Cell::new(state.this_size.get()),
+        index: Cell::new(state.index.get()),
+    }
+}
+
+fn wrap_set_subset_of_suspend(state: SetSubsetOfSuspendState) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_set_subset_of_suspend, state)
+}
+
+fn resume_set_subset_of_suspend(
+    completion: CompletionRecord,
+    state: &SetSubsetOfSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            if !record.consume()?.to_boolean() {
+                return Ok(NativeFunctionResult::complete(JsValue::from(false)));
+            }
+            continue_is_subset_of(&state.state, context)
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_set_subset_of_suspend(SetSubsetOfSuspendState {
+                state: clone_set_subset_of_state(&state.state),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_is_subset_of(
+    state: &SetSubsetOfState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let mut index = state.index.get();
+    let mut this_size = state.this_size.get();
+
+    while index < this_size {
+        let e = state.this_set.borrow().data().get_index(index).cloned();
+        index += 1;
+
+        if let Some(e) = e {
+        match state
+            .other_rec
+            .has
+            .call_interruptible(&state.other, &[e], context)?
+            {
+                InterruptibleCallOutcome::Complete(value) => {
+                    if !value.to_boolean() {
+                        return Ok(NativeFunctionResult::complete(JsValue::from(false)));
+                    }
+                    this_size = state.this_set.borrow().data().full_len();
+                    state.this_size.set(this_size);
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    state.index.set(index);
+                    state.this_size.set(this_size);
+                    return Ok(NativeFunctionResult::Suspend(wrap_set_subset_of_suspend(
+                        SetSubsetOfSuspendState {
+                            state: clone_set_subset_of_state(state),
+                            continuation,
+                        },
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(NativeFunctionResult::complete(JsValue::from(true)))
+}
+
+fn clone_set_intersection_state(state: &SetIntersectionState) -> SetIntersectionState {
+    SetIntersectionState {
+        this_set: state.this_set.clone(),
+        other: state.other.clone(),
+        other_rec: state.other_rec.clone(),
+        result_set: state.result_set.clone(),
+        pending_value: state.pending_value.clone(),
+        this_size: Cell::new(state.this_size.get()),
+        index: Cell::new(state.index.get()),
+    }
+}
+
+fn wrap_set_intersection_suspend(
+    state: SetIntersectionSuspendState,
+) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_set_intersection_suspend, state)
+}
+
+fn resume_set_intersection_suspend(
+    completion: CompletionRecord,
+    state: &SetIntersectionSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            if record.consume()?.to_boolean() {
+                state
+                    .state
+                    .result_set
+                    .borrow_mut()
+                    .data_mut()
+                    .add(state.pending_value.clone());
+                state.state.this_size.set(state.state.this_set.borrow().data().full_len());
+            }
+            continue_intersection_with_set(&state.state, context)
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_set_intersection_suspend(SetIntersectionSuspendState {
+                state: clone_set_intersection_state(&state.state),
+                pending_value: state.pending_value.clone(),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_intersection_with_set(
+    state: &SetIntersectionState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let mut this_size = state.this_size.get();
+    let mut index = state.index.get();
+
+    while index < this_size {
+        let e = state.this_set.borrow().data().get_index(index).cloned();
+        index += 1;
+
+        let Some(e) = e else {
+            continue;
+        };
+        let other = JsValue::from(state.other.clone());
+
+        match state
+            .other_rec
+            .has
+            .call_interruptible(&other, std::slice::from_ref(&e), context)?
+        {
+            InterruptibleCallOutcome::Complete(in_other) => {
+                if in_other.to_boolean() {
+                    state.result_set.borrow_mut().data_mut().add(e);
+                    this_size = state.this_set.borrow().data().full_len();
+                    state.this_size.set(this_size);
+                }
+            }
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                state.index.set(index);
+                state.this_size.set(this_size);
+                return Ok(NativeFunctionResult::Suspend(wrap_set_intersection_suspend(
+                    SetIntersectionSuspendState {
+                        state: clone_set_intersection_state(state),
+                        pending_value: e,
+                        continuation,
+                    },
+                )));
+            }
+        }
+    }
+
+    Ok(NativeFunctionResult::complete(state.result_set.clone()))
+}
+
+fn clone_set_difference_state(state: &SetDifferenceState) -> SetDifferenceState {
+    SetDifferenceState {
+        this_set: state.this_set.clone(),
+        other: state.other.clone(),
+        other_rec: state.other_rec.clone(),
+        result_set: state.result_set.clone(),
+        pending_value: state.pending_value.clone(),
+        this_size: Cell::new(state.this_size.get()),
+        index: Cell::new(state.index.get()),
+    }
+}
+
+fn wrap_set_difference_suspend(state: SetDifferenceSuspendState) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(resume_set_difference_suspend, state)
+}
+
+fn resume_set_difference_suspend(
+    completion: CompletionRecord,
+    state: &SetDifferenceSuspendState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    match state.continuation.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => {
+            if record.consume()?.to_boolean() {
+                state
+                    .state
+                    .result_set
+                    .borrow_mut()
+                    .data_mut()
+                    .delete(&state.pending_value);
+            }
+            continue_difference_with_set(&state.state, context)
+        }
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_set_difference_suspend(SetDifferenceSuspendState {
+                state: clone_set_difference_state(&state.state),
+                pending_value: state.pending_value.clone(),
+                continuation: next,
+            }),
+        )),
+    }
+}
+
+fn continue_difference_with_set(
+    state: &SetDifferenceState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let mut this_size = state.this_size.get();
+    let mut index = state.index.get();
+
+    while index < this_size {
+        let e = state.result_set.borrow().data().get_index(index).cloned();
+
+        if let Some(e) = e {
+            let pending_value = e.clone();
+            let other = JsValue::from(state.other.clone());
+            match state
+                .other_rec
+                .has
+                .call_interruptible(&other, std::slice::from_ref(&e), context)?
+            {
+                InterruptibleCallOutcome::Complete(in_other) => {
+                    if in_other.to_boolean() {
+                        state.result_set.borrow_mut().data_mut().delete(&e);
+                        continue;
+                    }
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    state.index.set(index + 1);
+                    state.this_size.set(this_size);
+                    return Ok(NativeFunctionResult::Suspend(wrap_set_difference_suspend(
+                        SetDifferenceSuspendState {
+                            state: clone_set_difference_state(state),
+                            pending_value,
+                            continuation,
+                        },
+                    )));
+                }
+            }
+        }
+
+        index += 1;
+        state.index.set(index);
+        this_size = state.this_set.borrow().data().full_len();
+        state.this_size.set(this_size);
+    }
+
+    Ok(NativeFunctionResult::complete(state.result_set.clone()))
+}
+
 impl IntrinsicObject for Set {
     fn get(intrinsics: &Intrinsics) -> JsObject {
         Self::STANDARD_CONSTRUCTOR(intrinsics.constructors()).constructor()
@@ -167,10 +569,26 @@ impl IntrinsicObject for Set {
                 1,
             )
             .method(Self::has, js_string!("has"), 1)
-            .method(Self::difference, js_string!("difference"), 1)
-            .method(Self::intersection, js_string!("intersection"), 1)
-            .method(Self::is_disjoint_from, js_string!("isDisjointFrom"), 1)
-            .method(Self::is_subset_of, js_string!("isSubsetOf"), 1)
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::difference),
+                js_string!("difference"),
+                1,
+            )
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::intersection),
+                js_string!("intersection"),
+                1,
+            )
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::is_disjoint_from),
+                js_string!("isDisjointFrom"),
+                1,
+            )
+            .method_native(
+                NativeFunction::from_suspend_fn_ptr(Self::is_subset_of),
+                js_string!("isSubsetOf"),
+                1,
+            )
             .method(Self::is_superset_of, js_string!("isSupersetOf"), 1)
             .method(
                 Self::symmetric_difference,
@@ -669,7 +1087,7 @@ impl Set {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. Perform ? RequireInternalSlot(O, [[SetData]]).
 
@@ -684,33 +1102,16 @@ impl Set {
 
         // 4. If SetDataSize(O.[[SetData]]) ≤ otherRec.[[Size]], then
         if this.borrow().data().len() <= other_rec.size {
-            // a. Let thisSize be the number of elements in O.[[SetData]].
-            let mut this_size = this.borrow().data().full_len();
-            // b. Let index be 0.
-            let mut index = 0;
-            // c. Repeat, while index < thisSize,
-            while index < this_size {
-                // i. Let e be O.[[SetData]][index].
-                let e = this.borrow().data().get_index(index).cloned();
-
-                // ii. Set index to index + 1.
-                index += 1;
-
-                // iii. If e is not empty, then
-                if let Some(e) = e {
-                    // 1. Let inOther be ToBoolean(? Call(otherRec.[[Has]], otherRec.[[SetObject]], « e »)).
-                    let in_other = other_rec.has.call(other, &[e], context)?.to_boolean();
-
-                    // 2. If inOther is true, return false.
-                    if in_other {
-                        return Ok(JsValue::from(false));
-                    }
-
-                    // 3. NOTE: The number of elements in O.[[SetData]] may have increased during execution of otherRec.[[Has]].
-                    // 4. Set thisSize to the number of elements in O.[[SetData]].
-                    this_size = this.borrow().data().full_len();
-                }
-            }
+            return continue_is_disjoint_from(
+                &SetDisjointFromState {
+                    this_set: this.clone(),
+                    other: other.clone(),
+                    other_rec,
+                    this_size: Cell::new(this.borrow().data().full_len()),
+                    index: Cell::new(0),
+                },
+                context,
+            );
         } else {
             // 5. Else,
             //    a. Let keysIter be ? GetIteratorFromMethod(otherRec.[[SetObject]], otherRec.[[Keys]]).
@@ -729,12 +1130,12 @@ impl Set {
                     keys_iter.close(Ok(JsValue::undefined()), context)?;
 
                     //      b. Return false.
-                    return Ok(JsValue::from(false));
+                    return Ok(NativeFunctionResult::complete(JsValue::from(false)));
                 }
             }
         }
         // 6. Return true.
-        Ok(JsValue::from(true))
+        Ok(NativeFunctionResult::complete(JsValue::from(true)))
     }
 
     /// `Set.prototype.isSubsetOf ( other )`
@@ -753,7 +1154,7 @@ impl Set {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. Perform ? RequireInternalSlot(O, [[SetData]]).
 
@@ -767,40 +1168,19 @@ impl Set {
         let other_rec = get_set_record(other, context)?;
         // 4. If SetDataSize(O.[[SetData]]) > otherRec.[[Size]], return false.
         if this.borrow().data().len() > other_rec.size {
-            return Ok(JsValue::from(false));
+            return Ok(NativeFunctionResult::complete(JsValue::from(false)));
         }
 
-        // 5. Let thisSize be the number of elements in O.[[SetData]].
-        let mut this_size = this.borrow().data().full_len();
-        // 6. Let index be 0.
-        let mut index = 0;
-
-        // 7. Repeat, while index < thisSize,
-        while index < this_size {
-            // a. Let e be O.[[SetData]][index].
-            let e = this.borrow().data().get_index(index).cloned();
-
-            // b. Set index to index + 1.
-            index += 1;
-
-            // c. If e is not empty, then
-            if let Some(e) = e {
-                // i. Let inOther be ToBoolean(? Call(otherRec.[[Has]], otherRec.[[SetObject]], « e »)).
-                let in_other = other_rec.has.call(other, &[e], context)?.to_boolean();
-
-                // ii. If inOther is false, return false.
-                if !in_other {
-                    return Ok(JsValue::from(false));
-                }
-
-                // iii. NOTE: The number of elements in O.[[SetData]] may have increased during execution of otherRec.[[Has]].
-                // iv. Set thisSize to the number of elements in O.[[SetData]].
-                this_size = this.borrow().data().full_len();
-            }
-        }
-
-        // 8. Return true.
-        Ok(JsValue::from(true))
+        return continue_is_subset_of(
+            &SetSubsetOfState {
+                this_set: this.clone(),
+                other: other.clone(),
+                other_rec,
+                this_size: Cell::new(this.borrow().data().full_len()),
+                index: Cell::new(0),
+            },
+            context,
+        );
     }
 
     /// `Set.prototype.isSupersetOf ( other )`
@@ -999,7 +1379,7 @@ impl Set {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let S be the this value.
         // 2. Perform ? RequireInternalSlot(O, [[SetData]]).
         let this = this
@@ -1012,43 +1392,26 @@ impl Set {
         let other_rec = get_set_record(other, context)?;
 
         // 4. Let resultSetData be a new empty List.
-        let mut result_set = OrderedSet::new();
+        let result_set = JsObject::try_from_proto_and_data_with_shared_shape(
+            context.root_shape(),
+            context.intrinsics().constructors().set().prototype(),
+            OrderedSet::new(),
+        )?;
 
         // 5. If SetDataSize(O.[[SetData]]) ≤ otherRec.[[Size]], then
         if this.borrow().data().len() <= other_rec.size {
-            // a. Let thisSize be the number of elements in O.[[SetData]].
-            let mut this_size = this.borrow().data().full_len();
-            // b. Let index be 0.
-            let mut index = 0;
-            // c. Repeat, while index < thisSize,
-            while index < this_size {
-                // i. Let e be O.[[SetData]][index].
-                let e = this.borrow().data().get_index(index).cloned();
-                // ii. Set index to index + 1.
-                index += 1;
-
-                // iii. If e is not empty, then
-                let Some(e) = e else {
-                    continue;
-                };
-
-                //      1. Let inOther be ToBoolean(? Call(otherRec.[[Has]], otherRec.[[SetObject]], « e »)).
-                let in_other = other_rec
-                    .has
-                    .call(other, std::slice::from_ref(&e), context)?;
-                //      2. If inOther is true, then
-                //         a. NOTE: It is possible for earlier calls to otherRec.[[Has]] to remove and re-add an element of O.[[SetData]], which can cause the same element to be visited twice during this iteration.
-                if in_other.to_boolean() {
-                    //     b. If SetDataHas(resultSetData, e) is false, then
-                    //        i. Append e to resultSetData.
-                    result_set.add(e);
-                    //  3. NOTE: The number of elements in O.[[SetData]] may have increased during execution of otherRec.[[Has]].
-                    //  4. Set thisSize to the number of elements in O.[[SetData]].
-                    this_size = this.borrow().data().full_len();
-                }
-            }
-
-        // 6. Else,
+            return continue_intersection_with_set(
+                &SetIntersectionState {
+                    this_set: this.clone(),
+                    other: other.clone(),
+                    other_rec,
+                    result_set,
+                    pending_value: None,
+                    this_size: Cell::new(this.borrow().data().full_len()),
+                    index: Cell::new(0),
+                },
+                context,
+            );
         } else {
             // a. Let keysIter be ? GetIteratorFromMethod(otherRec.[[SetObject]], otherRec.[[Keys]]).
             let mut keys_iter = other.get_iterator_from_method(&other_rec.keys, context)?;
@@ -1065,7 +1428,7 @@ impl Set {
                     //        a. NOTE: Because other is an arbitrary object, it is possible for its "keys" iterator to produce the same value more than once.
                     //        b. If SetDataHas(resultSetData, next) is false, then
                     //           i. Append next to resultSetData.
-                    result_set.add(next);
+                    result_set.borrow_mut().data_mut().add(next);
                 }
             }
         }
@@ -1073,12 +1436,7 @@ impl Set {
         // 7. Let result be OrdinaryObjectCreate(%Set.prototype%, « [[SetData]] »).
         // 8. Set result.[[SetData]] to resultSetData.
         // 9. Return result.
-        Ok(JsObject::try_from_proto_and_data_with_shared_shape(
-            context.root_shape(),
-            context.intrinsics().constructors().set().prototype(),
-            result_set,
-        )?
-        .into())
+        Ok(NativeFunctionResult::complete(result_set))
     }
 
     /// ` Set.prototype.difference ( other ) `
@@ -1096,7 +1454,7 @@ impl Set {
         this: &JsValue,
         args: &[JsValue],
         context: &mut Context,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<NativeFunctionResult> {
         // 1. Let O be the this value.
         // 2. Perform ? RequireInternalSlot(O, [[SetData]]).
         let this = this
@@ -1113,44 +1471,27 @@ impl Set {
         let other_rec = get_set_record(other, context)?;
 
         // 4. Let resultSetData be a copy of O.[[SetData]].
-        let mut result_set = this.borrow().data().clone();
+        let result_set = JsObject::try_from_proto_and_data_with_shared_shape(
+            context.root_shape(),
+            context.intrinsics().constructors().set().prototype(),
+            this.borrow().data().clone(),
+        )?;
 
         // 5. If SetDataSize(O.[[SetData]]) ≤ otherRec.[[Size]], then
-        if result_set.len() <= other_rec.size {
-            // a. Let thisSize be the number of elements in O.[[SetData]].
-            let this_size = this.borrow().data().full_len();
-            // b. Let index be 0.
-            let mut index = 0;
-
-            //  c. Repeat, while index < thisSize,
-            while index < this_size {
-                // i. Let e be resultSetData[index].
-                let e = result_set.get_index(index).cloned();
-
-                // ii. If e is not empty, then
-                if let Some(e) = e {
-                    // 1. Let inOther be ToBoolean(? Call(otherRec.[[Has]], otherRec.[[SetObject]], « e »)).
-                    let in_other = other_rec
-                        .has
-                        .call(other, std::slice::from_ref(&e), context)?
-                        .to_boolean();
-                    // 2. If inOther is true, then
-                    if in_other {
-                        // a. Set resultSetData[index] to empty.
-                        result_set.delete(&e);
-
-                        // No need to increment the index, after deletion we're
-                        // in the correct next position.
-                        continue;
-                    }
-                }
-
-                // iii. Set index to index + 1.
-                index += 1;
-            }
-        }
-        // 6. Else,
-        else {
+        if result_set.borrow().data().len() <= other_rec.size {
+            return continue_difference_with_set(
+                &SetDifferenceState {
+                    this_set: this.clone(),
+                    other: other.clone(),
+                    other_rec,
+                    result_set,
+                    pending_value: None,
+                    this_size: Cell::new(this.borrow().data().full_len()),
+                    index: Cell::new(0),
+                },
+                context,
+            );
+        } else {
             // a. Let keysIter be ? GetIteratorFromMethod(otherRec.[[SetObject]], otherRec.[[Keys]]).
             let mut keys_iter = other.get_iterator_from_method(&other_rec.keys, context)?;
             // b. Let next be not-started.
@@ -1163,19 +1504,14 @@ impl Set {
                 //     2. Let valueIndex be SetDataIndex(resultSetData, next).
                 //     3. If valueIndex is not not-found, then
                 //        a. Set resultSetData[valueIndex] to empty.
-                result_set.delete(&next);
+                result_set.borrow_mut().data_mut().delete(&next);
             }
         }
 
         // 7. Let result be OrdinaryObjectCreate(%Set.prototype%, « [[SetData]] »).
         // 8. Set result.[[SetData]] to resultSetData.
         // 9. Return result.
-        Ok(JsObject::try_from_proto_and_data_with_shared_shape(
-            context.root_shape(),
-            context.intrinsics().constructors().set().prototype(),
-            result_set,
-        )?
-        .into())
+        Ok(NativeFunctionResult::complete(result_set))
     }
 
     fn size_getter(this: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {

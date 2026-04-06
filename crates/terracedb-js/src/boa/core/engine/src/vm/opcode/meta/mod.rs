@@ -1,10 +1,43 @@
 use super::RegisterOperand;
 use crate::{
     Context, JsObject, JsValue,
+    context::ExecutionOutcome,
     module::ModuleKind,
-    vm::{ActiveRunnable, opcode::Operation},
+    native_function::{NativeFunctionResult, NativeResume},
+    vm::{ActiveRunnable, CompletionRecord, opcode::Operation},
 };
-use std::unreachable;
+use std::{ops::ControlFlow, unreachable};
+
+fn wrap_import_meta_resume(continuation: NativeResume, dst: usize, import_meta: JsObject) -> NativeResume {
+    NativeResume::from_copy_closure_with_captures(
+        resume_import_meta_operation,
+        (continuation, dst, import_meta),
+    )
+}
+
+fn resume_import_meta_operation(
+    completion: CompletionRecord,
+    captures: &(NativeResume, usize, JsObject),
+    context: &mut Context,
+) -> crate::JsResult<NativeFunctionResult> {
+    match captures.0.call(completion, context)? {
+        NativeFunctionResult::Complete(record) => match record {
+            CompletionRecord::Normal(_) | CompletionRecord::Return(_) => {
+                context
+                    .vm
+                    .set_register(captures.1, JsValue::from(captures.2.clone()));
+                context.continue_interruptible_vm()
+            }
+            CompletionRecord::Throw(error) => context.continue_interruptible_vm_with_throw(error),
+            CompletionRecord::Suspend => Err(crate::JsNativeError::error()
+                .with_message("import.meta continuation resumed with unexpected suspend completion")
+                .into()),
+        },
+        NativeFunctionResult::Suspend(next) => Ok(NativeFunctionResult::Suspend(
+            wrap_import_meta_resume(next, captures.1, captures.2.clone()),
+        )),
+    }
+}
 
 /// `NewTarget` implements the Opcode Operation for `Opcode::NewTarget`
 ///
@@ -47,7 +80,10 @@ pub(crate) struct ImportMeta;
 
 impl ImportMeta {
     #[inline(always)]
-    pub(super) fn operation(dst: RegisterOperand, context: &mut Context) {
+    pub(super) fn operation(
+        dst: RegisterOperand,
+        context: &mut Context,
+    ) -> ControlFlow<CompletionRecord> {
         // Meta Properties
         //
         // ImportMeta : import . meta
@@ -68,29 +104,37 @@ impl ImportMeta {
         // 4. If importMeta is empty, then
         // 5. Else,
         //     a. Assert: importMeta is an Object.
-        let import_meta = src
-            .import_meta()
-            .borrow_mut()
-            .get_or_insert_with(|| {
-                // a. Set importMeta to OrdinaryObjectCreate(null).
-                let import_meta = JsObject::with_null_proto();
-
-                // b. Let importMetaValues be HostGetImportMetaProperties(module).
-                // c. For each Record { [[Key]], [[Value]] } p of importMetaValues, do
-                //     i. Perform ! CreateDataPropertyOrThrow(importMeta, p.[[Key]], p.[[Value]]).
-                // d. Perform HostFinalizeImportMeta(importMeta, module).
-                context
-                    .module_loader()
-                    .init_import_meta(&import_meta, &module, context);
-
-                // e. Set module.[[ImportMeta]] to importMeta.
-                import_meta
-            })
-            .clone();
+        let import_meta = if let Some(import_meta) = src.import_meta().borrow().as_ref().cloned() {
+            import_meta
+        } else {
+            let import_meta = JsObject::with_null_proto();
+            let outcome = match context
+                .module_loader()
+                .init_import_meta(&import_meta, &module, context)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => return context.handle_error(error),
+            };
+            match outcome {
+                ExecutionOutcome::Complete(()) => {
+                    *src.import_meta().borrow_mut() = Some(import_meta.clone());
+                    import_meta
+                }
+                ExecutionOutcome::Suspend(continuation) => {
+                    context.install_interruptible_resume(wrap_import_meta_resume(
+                        continuation,
+                        usize::from(dst),
+                        import_meta,
+                    ));
+                    return ControlFlow::Break(CompletionRecord::Suspend);
+                }
+            }
+        };
 
         //     b. Return importMeta.
         //     f. Return importMeta.
         context.vm.set_register(dst.into(), import_meta.into());
+        ControlFlow::Continue(())
     }
 }
 

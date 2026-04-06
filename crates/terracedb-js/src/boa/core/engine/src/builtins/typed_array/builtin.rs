@@ -247,7 +247,16 @@ impl BuiltinTypedArray {
                 // iii. If mapping is true, then
                 let mapped_value = if let Some(map_fn) = &mapping {
                     // 1. Let mappedValue be ? Call(mapfn, thisArg, « kValue, 𝔽(k) »).
-                    map_fn.call(this_arg, &[k_value.clone(), k.into()], context)?
+                    match map_fn.call_interruptible(this_arg, &[k_value.clone(), k.into()], context)? {
+                        InterruptibleCallOutcome::Complete(value) => value,
+                        InterruptibleCallOutcome::Suspend(_) => {
+                            return Err(JsNativeError::error()
+                                .with_message(
+                                    "suspendable TypedArray.from mapfn requires interruptible execution",
+                                )
+                                .into())
+                        }
+                    }
                 }
                 // iv. Else, let mappedValue be kValue.
                 else {
@@ -285,7 +294,16 @@ impl BuiltinTypedArray {
             // c. If mapping is true, then
             let mapped_value = if let Some(map_fn) = &mapping {
                 // i. Let mappedValue be ? Call(mapfn, thisArg, « kValue, 𝔽(k) »).
-                map_fn.call(this_arg, &[k_value, k.into()], context)?
+                match map_fn.call_interruptible(this_arg, &[k_value, k.into()], context)? {
+                    InterruptibleCallOutcome::Complete(value) => value,
+                    InterruptibleCallOutcome::Suspend(_) => {
+                        return Err(JsNativeError::error()
+                            .with_message(
+                                "suspendable TypedArray.from mapfn requires interruptible execution",
+                            )
+                            .into())
+                    }
+                }
             }
             // d. Else, let mappedValue be kValue.
             else {
@@ -685,13 +703,20 @@ impl BuiltinTypedArray {
             let k_value = ta.get(k, context)?;
 
             // c. Let testResult be ! ToBoolean(? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »)).
-            let test_result = callback_fn
-                .call(
-                    args.get_or_undefined(1),
-                    &[k_value, k.into(), this.clone()],
-                    context,
-                )?
-                .to_boolean();
+            let test_result = match callback_fn.call_interruptible(
+                args.get_or_undefined(1),
+                &[k_value, k.into(), this.clone()],
+                context,
+            )? {
+                InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable TypedArray.prototype.every callback requires interruptible execution",
+                        )
+                        .into())
+                }
+            };
 
             // d. If testResult is false, return false.
             if !test_result {
@@ -828,13 +853,20 @@ impl BuiltinTypedArray {
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
 
             // c. Let selected be ! ToBoolean(? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »)).#
-            let selected = callback_fn
-                .call(
-                    args.get_or_undefined(1),
-                    &[k_value.clone(), k.into(), this.clone()],
-                    context,
-                )?
-                .to_boolean();
+            let selected = match callback_fn.call_interruptible(
+                args.get_or_undefined(1),
+                &[k_value.clone(), k.into(), this.clone()],
+                context,
+            )? {
+                InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable TypedArray.prototype.filter callback requires interruptible execution",
+                        )
+                        .into())
+                }
+            };
 
             // d. If selected is true, then
             if selected {
@@ -1044,11 +1076,20 @@ impl BuiltinTypedArray {
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
 
             // c. Perform ? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »).
-            callback_fn.call(
+            match callback_fn.call_interruptible(
                 args.get_or_undefined(1),
                 &[k_value, k.into(), this.clone()],
                 context,
-            )?;
+            )? {
+                InterruptibleCallOutcome::Complete(_) => {}
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable TypedArray.prototype.forEach callback requires interruptible execution",
+                        )
+                        .into())
+                }
+            };
         }
 
         // 7. Return undefined.
@@ -1399,11 +1440,20 @@ impl BuiltinTypedArray {
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
 
             // c. Let mappedValue be ? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »).
-            let mapped_value = callback_fn.call(
+            let mapped_value = match callback_fn.call_interruptible(
                 args.get_or_undefined(1),
                 &[k_value, k.into(), this.clone()],
                 context,
-            )?;
+            )? {
+                InterruptibleCallOutcome::Complete(value) => value,
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable TypedArray.prototype.map callback requires interruptible execution",
+                        )
+                        .into())
+                }
+            };
 
             // d. Perform ? Set(A, Pk, mappedValue, true).
             a.set(k, mapped_value, true, context)?;
@@ -1475,11 +1525,20 @@ impl BuiltinTypedArray {
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
 
             // c. Set accumulator to ? Call(callbackfn, undefined, « accumulator, kValue, 𝔽(k), O »).
-            accumulator = callback_fn.call(
+            accumulator = match callback_fn.call_interruptible(
                 &JsValue::undefined(),
                 &[accumulator, k_value, k.into(), this.clone()],
                 context,
-            )?;
+            )? {
+                InterruptibleCallOutcome::Complete(value) => value,
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable TypedArray.prototype.reduce callback requires interruptible execution",
+                        )
+                        .into())
+                }
+            };
 
             // d. Set k to k + 1.
         }
@@ -1548,11 +1607,20 @@ impl BuiltinTypedArray {
             let k_value = ta.get(k, context).js_expect("Get cannot fail here")?;
 
             // c. Set accumulator to ? Call(callbackfn, undefined, « accumulator, kValue, 𝔽(k), O »).
-            accumulator = callback_fn.call(
+            accumulator = match callback_fn.call_interruptible(
                 &JsValue::undefined(),
                 &[accumulator, k_value, k.into(), this.clone()],
                 context,
-            )?;
+            )? {
+                InterruptibleCallOutcome::Complete(value) => value,
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable TypedArray.prototype.reduceRight callback requires interruptible execution",
+                        )
+                        .into())
+                }
+            };
 
             // d. Set k to k - 1.
         }
@@ -2242,14 +2310,20 @@ impl BuiltinTypedArray {
 
             // c. Let testResult be ! ToBoolean(? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »)).
             // d. If testResult is true, return true.
-            if callback_fn
-                .call(
-                    args.get_or_undefined(1),
-                    &[k_value, k.into(), this.clone()],
-                    context,
-                )?
-                .to_boolean()
-            {
+            if match callback_fn.call_interruptible(
+                args.get_or_undefined(1),
+                &[k_value, k.into(), this.clone()],
+                context,
+            )? {
+                InterruptibleCallOutcome::Complete(value) => value.to_boolean(),
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable TypedArray.prototype.some callback requires interruptible execution",
+                        )
+                        .into())
+                }
+            } {
                 return Ok(true.into());
             }
         }
@@ -2742,7 +2816,16 @@ impl BuiltinTypedArray {
         context: &mut Context,
     ) -> JsResult<JsObject<TypedArray>> {
         // 1. Let newTypedArray be ? Construct(constructor, argumentList).
-        let new_typed_array = constructor.construct(args, Some(constructor), context)?;
+        let new_typed_array = match constructor.construct_interruptible(args, Some(constructor), context)? {
+            InterruptibleCallOutcome::Complete(object) => object,
+            InterruptibleCallOutcome::Suspend(_) => {
+                return Err(JsNativeError::error()
+                    .with_message(
+                        "suspendable TypedArray constructor requires interruptible execution",
+                    )
+                    .into())
+            }
+        };
 
         // 2. Let taRecord be ? ValidateTypedArray(newTypedArray, seq-cst).
         let (new_ta, buf_len) =

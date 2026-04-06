@@ -10,12 +10,13 @@ use crate::{
     class::{Class, ClassBuilder},
     environments::{DeclarativeEnvironment, EnvironmentStack},
     js_string,
+    native_function::NativeFunctionResult,
     object::JsPromise,
-    vm::{ActiveRunnable, CallFrame, CodeBlock, source_info::SourcePath},
+    vm::{ActiveRunnable, CallFrame, CodeBlock, CompletionRecord, source_info::SourcePath},
 };
 
 trait TraceableCallback: Trace {
-    fn call(&self, module: &SyntheticModule, context: &mut Context) -> JsResult<()>;
+    fn call(&self, module: &SyntheticModule, context: &mut Context) -> JsResult<NativeFunctionResult>;
 }
 
 #[derive(Trace, Finalize)]
@@ -37,8 +38,13 @@ where
     F: Fn(&SyntheticModule, &T, &mut Context) -> JsResult<()>,
     T: Trace,
 {
-    fn call(&self, module: &SyntheticModule, context: &mut Context) -> JsResult<()> {
+    fn call(
+        &self,
+        module: &SyntheticModule,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         (self.f)(module, &self.captures, context)
+            .map(|_| NativeFunctionResult::complete(JsValue::undefined()))
     }
 }
 
@@ -178,7 +184,11 @@ impl SyntheticModuleInitializer {
 
     /// Calls this `SyntheticModuleInitializer`, forwarding the arguments to the corresponding function.
     #[inline]
-    pub(crate) fn call(&self, module: &SyntheticModule, context: &mut Context) -> JsResult<()> {
+    pub(crate) fn call(
+        &self,
+        module: &SyntheticModule,
+        context: &mut Context,
+    ) -> JsResult<NativeFunctionResult> {
         self.inner.call(module, context)
     }
 }
@@ -476,8 +486,24 @@ impl SyntheticModule {
 
         match result {
             // 15. Perform ! pc.[[Resolve]](result).
-            Ok(()) => resolve.call(&JsValue::undefined(), &[], context),
+            Ok(NativeFunctionResult::Complete(CompletionRecord::Normal(_)))
+            | Ok(NativeFunctionResult::Complete(CompletionRecord::Return(_))) => {
+                resolve.call(&JsValue::undefined(), &[], context)
+            }
             // 14. IfAbruptRejectPromise(result, pc).
+            Ok(NativeFunctionResult::Complete(CompletionRecord::Throw(err))) => {
+                reject.call(&JsValue::undefined(), &[err.into_opaque(context)?], context)
+            }
+            Ok(NativeFunctionResult::Complete(CompletionRecord::Suspend)) => {
+                return Err(JsNativeError::error()
+                    .with_message("synthetic module evaluation resumed with unexpected suspension")
+                    .into());
+            }
+            Ok(NativeFunctionResult::Suspend(_)) => {
+                return Err(JsNativeError::error()
+                    .with_message("synthetic module evaluation suspended during synchronous execution")
+                    .into());
+            }
             Err(err) => reject.call(&JsValue::undefined(), &[err.into_opaque(context)?], context),
         }
         .js_expect("default resolving functions cannot throw")?;

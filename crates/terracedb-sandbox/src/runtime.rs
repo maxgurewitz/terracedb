@@ -76,8 +76,8 @@ use terracedb_js::boa::{
         },
         native_function::NativeFunctionResult,
         object::builtins::{
-            JsArray, JsArrayBuffer, JsFunction, JsPromise, JsProxy, JsSharedArrayBuffer,
-            JsUint8Array,
+            JsArray, JsArrayBuffer, JsFunction, JsMap, JsPromise, JsProxy,
+            JsSet, JsSharedArrayBuffer, JsUint8Array,
         },
         object::{FunctionObjectBuilder, InterruptibleCallOutcome, JsObject, ObjectInitializer},
         property::{Attribute, PropertyDescriptor, PropertyKey},
@@ -4164,7 +4164,7 @@ async fn drain_node_jobs_until_quiescent_async(
     for _ in 0..NODE_RUNTIME_JOB_DRAIN_BUDGET {
         node_check_execution_timeout(&host)?;
         let drained_before = drain_node_next_ticks_async(context, host.clone(), entrypoint).await?;
-        let drained_timers = drain_node_timers(context, &host, entrypoint)?;
+        let drained_timers = drain_node_timers_async(context, host.clone(), entrypoint).await?;
         let drained_after = drain_node_next_ticks_async(context, host.clone(), entrypoint).await?;
         if drained_before == 0 && drained_after == 0 && drained_timers == 0 {
             let now_ms = node_monotonic_now_ms(&host);
@@ -5543,19 +5543,20 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
         import_meta: &boa_engine::object::JsObject,
         module: &Module,
         context: &mut Context,
-    ) {
+    ) -> JsResult<boa_engine::context::ExecutionOutcome<()>> {
         let Some(path) = module.path() else {
-            return;
+            return Ok(boa_engine::context::ExecutionOutcome::Complete(()));
         };
         let path = path.to_string_lossy().into_owned();
         if let Ok(url) = node_file_url_from_path(&path) {
-            let _ = import_meta.set(
+            import_meta.set(
                 js_string!("url"),
                 JsValue::from(JsString::from(url)),
                 true,
                 context,
-            );
+            )?;
         }
+        let module_path_symbol = node_host_private_symbol(&self.host, "import_meta.module_path").ok();
         if let Some(callback) = self
             .host
             .bootstrap
@@ -5572,7 +5573,7 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
                 .cloned()
         {
             if let Some(callable) = JsValue::from(callback).as_callable() {
-                let _ = callable.call(
+                match callable.call_interruptible(
                     &JsValue::undefined(),
                     &[
                         state
@@ -5583,26 +5584,90 @@ impl BoaModuleLoader for NodeCommandModuleLoader {
                         JsValue::from(state.wrapper),
                     ],
                     context,
-                );
+                )? {
+                    InterruptibleCallOutcome::Complete(_) => {}
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(boa_engine::context::ExecutionOutcome::Suspend(
+                            boa_engine::native_function::NativeResume::from_copy_closure_with_captures(
+                                node_resume_import_meta_initialization,
+                                NodeImportMetaResume {
+                                    continuation,
+                                    import_meta: import_meta.clone(),
+                                    path,
+                                    module_path_symbol,
+                                },
+                            ),
+                        ));
+                    }
+                }
             }
         }
-        if let Ok(symbol) = node_host_private_symbol(&self.host, "import_meta.module_path") {
-            let _ = import_meta.set(
-                symbol,
-                JsValue::from(JsString::from(path.clone())),
-                true,
+        node_finalize_import_meta(import_meta, &path, module_path_symbol.as_ref(), context)?;
+        Ok(boa_engine::context::ExecutionOutcome::Complete(()))
+    }
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeImportMetaResume {
+    continuation: boa_engine::native_function::NativeResume,
+    import_meta: JsObject,
+    path: String,
+    module_path_symbol: Option<JsSymbol>,
+}
+
+fn node_finalize_import_meta(
+    import_meta: &JsObject,
+    path: &str,
+    module_path_symbol: Option<&JsSymbol>,
+    context: &mut Context,
+) -> JsResult<()> {
+    if let Some(symbol) = module_path_symbol {
+        import_meta.set(
+            symbol.clone(),
+            JsValue::from(JsString::from(path.to_string())),
+            true,
+            context,
+        )?;
+    }
+    let resolver = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_suspend_fn_ptr(node_import_meta_resolve_for_module_suspend),
+    )
+    .name(js_string!("resolve"))
+    .length(1)
+    .constructor(false)
+    .build();
+    import_meta.set(js_string!("resolve"), resolver, true, context)?;
+    Ok(())
+}
+
+fn node_resume_import_meta_initialization(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeImportMetaResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            node_finalize_import_meta(
+                &capture.import_meta,
+                &capture.path,
+                capture.module_path_symbol.as_ref(),
                 context,
-            );
+            )?;
+            Ok(NativeFunctionResult::complete(JsValue::undefined()))
         }
-        let resolver = FunctionObjectBuilder::new(
-            context.realm(),
-            NativeFunction::from_suspend_fn_ptr(node_import_meta_resolve_for_module_suspend),
-        )
-        .name(js_string!("resolve"))
-        .length(1)
-        .constructor(false)
-        .build();
-        let _ = import_meta.set(js_string!("resolve"), resolver, true, context);
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_import_meta_initialization,
+                NodeImportMetaResume {
+                    continuation,
+                    import_meta: capture.import_meta.clone(),
+                    path: capture.path.clone(),
+                    module_path_symbol: capture.module_path_symbol.clone(),
+                },
+            ),
+        ),
     }
 }
 
@@ -7077,9 +7142,17 @@ fn node_run_microtask_checkpoint(
                 entrypoint: "<node-runtime>".to_string(),
                 message: "queued microtask is not callable".to_string(),
             })?;
-        callable
-            .call(&JsValue::undefined(), &[], context)
-            .map_err(sandbox_execution_error)?;
+        match callable
+            .call_interruptible(&JsValue::undefined(), &[], context)
+            .map_err(sandbox_execution_error)?
+        {
+            InterruptibleCallOutcome::Complete(_) => {}
+            InterruptibleCallOutcome::Suspend(_) => {
+                return Err(sandbox_execution_error(
+                    "queued microtask suspended during synchronous checkpoint",
+                ));
+            }
+        }
     }
     Ok(count)
 }
@@ -7111,16 +7184,16 @@ fn node_bootstrap_array_entry(
         .map_err(sandbox_execution_error)
 }
 
-fn drain_node_timers(
+async fn drain_node_timers_async(
     context: &mut Context,
-    host: &NodeRuntimeHost,
+    host: Rc<NodeRuntimeHost>,
     entrypoint: &str,
 ) -> Result<usize, SandboxError> {
     let mut drained = 0usize;
     let bootstrap = host.bootstrap.borrow().clone();
-    let now_ms = node_monotonic_now_ms(host);
-    let immediate_count = node_bootstrap_array_entry(context, host, "immediateInfo", 0)?;
-    let timeout_count = node_bootstrap_array_entry(context, host, "timeoutInfo", 0)?;
+    let now_ms = node_monotonic_now_ms(&host);
+    let immediate_count = node_bootstrap_array_entry(context, &host, "immediateInfo", 0)?;
+    let timeout_count = node_bootstrap_array_entry(context, &host, "timeoutInfo", 0)?;
     let timer_is_due = bootstrap.next_timer_due_ms.is_some_and(|due| due <= now_ms);
     let should_run_immediates =
         immediate_count > 0 && (bootstrap.immediate_is_refed || timeout_count > 0 || timer_is_due);
@@ -7131,11 +7204,20 @@ fn drain_node_timers(
                 .ok_or_else(|| SandboxError::Execution {
                     entrypoint: entrypoint.to_string(),
                     message: "processImmediate callback is not callable".to_string(),
-                })?;
-            callable
-                .call(&JsValue::undefined(), &[], context)
-                .map_err(|error| node_execution_error(entrypoint, host, error))?;
-            node_performance_note_event(host, immediate_count as u64);
+                })?
+                .clone();
+            let _ = node_drive_interruptible_value(context, host.clone(), |context| {
+                callable.call_interruptible(&JsValue::undefined(), &[], context)
+            })
+            .await
+            .map_err(|error| match error {
+                SandboxError::Execution { .. } => error,
+                other => SandboxError::Execution {
+                    entrypoint: entrypoint.to_string(),
+                    message: other.to_string(),
+                },
+            })?;
+            node_performance_note_event(&host, immediate_count as u64);
             drained = drained.saturating_add(1);
         }
     }
@@ -7146,11 +7228,20 @@ fn drain_node_timers(
                 .ok_or_else(|| SandboxError::Execution {
                     entrypoint: entrypoint.to_string(),
                     message: "processTimers callback is not callable".to_string(),
-                })?;
+                })?
+                .clone();
             let now = JsValue::from(now_ms);
-            let next_expiry = callable
-                .call(&JsValue::undefined(), &[now], context)
-                .map_err(|error| node_execution_error(entrypoint, host, error))?;
+            let next_expiry = node_drive_interruptible_value(context, host.clone(), |context| {
+                callable.call_interruptible(&JsValue::undefined(), std::slice::from_ref(&now), context)
+            })
+            .await
+            .map_err(|error| match error {
+                SandboxError::Execution { .. } => error,
+                other => SandboxError::Execution {
+                    entrypoint: entrypoint.to_string(),
+                    message: other.to_string(),
+                },
+            })?;
             let next_expiry = next_expiry
                 .to_number(context)
                 .map_err(sandbox_execution_error)?;
@@ -7161,7 +7252,7 @@ fn drain_node_timers(
                 state.timer_is_refed = next_expiry > 0.0;
                 state.next_timer_due_ms = Some(next_expiry.abs());
             }
-            node_performance_note_event(host, timeout_count as u64);
+            node_performance_note_event(&host, timeout_count as u64);
             drained = drained.saturating_add(1);
         }
     }
@@ -11559,6 +11650,13 @@ struct NodeIgnoredCallbackResume {
     return_value: JsValue,
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct NodeMicrotaskDrainResume {
+    continuation: boa_engine::native_function::NativeResume,
+    queue: Vec<JsObject>,
+    next_index: usize,
+}
+
 fn node_resume_ignored_callback(
     completion: boa_engine::vm::CompletionRecord,
     capture: &NodeIgnoredCallbackResume,
@@ -11596,6 +11694,55 @@ fn node_call_ignored_callback_interruptible(
                 NodeIgnoredCallbackResume {
                     continuation,
                     return_value,
+                },
+            ),
+        ),
+    }
+}
+
+fn node_continue_microtask_queue_interruptible(
+    queue: &[JsObject],
+    start_index: usize,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let mut index = start_index;
+    while let Some(callback) = queue.get(index) {
+        match callback.call_interruptible(&JsValue::undefined(), &[], context)? {
+            InterruptibleCallOutcome::Complete(_) => {
+                index = index.saturating_add(1);
+            }
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                    node_resume_microtask_queue_interruptible,
+                    NodeMicrotaskDrainResume {
+                        continuation,
+                        queue: queue.to_vec(),
+                        next_index: index.saturating_add(1),
+                    },
+                ));
+            }
+        }
+    }
+    Ok(NativeFunctionResult::complete(JsValue::undefined()))
+}
+
+fn node_resume_microtask_queue_interruptible(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeMicrotaskDrainResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            node_continue_microtask_queue_interruptible(&capture.queue, capture.next_index, context)
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_microtask_queue_interruptible,
+                NodeMicrotaskDrainResume {
+                    continuation,
+                    queue: capture.queue.clone(),
+                    next_index: capture.next_index,
                 },
             ),
         ),
@@ -12920,8 +13067,6 @@ fn node_internal_binding_module_wrap(context: &mut Context) -> Result<JsObject, 
             node_module_wrap_instantiate
                 as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("evaluateSync", node_module_wrap_evaluate_sync),
-        ("evaluate", node_module_wrap_evaluate),
         ("setExport", node_module_wrap_set_export),
         (
             "setModuleSourceObject",
@@ -12946,6 +13091,40 @@ fn node_internal_binding_module_wrap(context: &mut Context) -> Result<JsObject, 
             .set(JsString::from(name), JsValue::from(method), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    prototype
+        .set(
+            js_string!("evaluateSync"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_fn_ptr(node_module_wrap_evaluate_sync),
+                )
+                .name(js_string!("evaluateSync"))
+                .length(1)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    prototype
+        .set(
+            js_string!("evaluate"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_module_wrap_evaluate),
+                )
+                .name(js_string!("evaluate"))
+                .length(1)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     let has_async_graph_getter = FunctionObjectBuilder::new(
         context.realm(),
         NativeFunction::from_fn_ptr(node_module_wrap_has_async_graph),
@@ -13223,7 +13402,6 @@ fn node_internal_binding_util(context: &mut Context) -> Result<JsObject, Sandbox
             1usize,
             node_util_array_buffer_view_has_buffer,
         ),
-        ("previewEntries", 2usize, node_util_preview_entries),
         ("getCallSites", 1usize, node_util_get_call_sites),
         ("getCallerLocation", 0usize, node_util_get_caller_location),
         ("getPromiseDetails", 1usize, node_util_get_promise_details),
@@ -13242,6 +13420,23 @@ fn node_internal_binding_util(context: &mut Context) -> Result<JsObject, Sandbox
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    object
+        .set(
+            js_string!("previewEntries"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_util_preview_entries),
+                )
+                .name(js_string!("previewEntries"))
+                .length(2)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -13829,17 +14024,38 @@ fn node_internal_binding_task_queue(
             context,
         )
         .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("runMicrotasks"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_task_queue_run_microtasks),
+                )
+                .name(js_string!("runMicrotasks"))
+                .length(1)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     for (name, function) in [
         (
-            "runMicrotasks",
-            node_task_queue_run_microtasks
+            "setTickCallback",
+            node_task_queue_set_tick_callback
                 as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("setTickCallback", node_task_queue_set_tick_callback),
-        ("enqueueMicrotask", node_task_queue_enqueue_microtask),
+        (
+            "enqueueMicrotask",
+            node_task_queue_enqueue_microtask
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
         (
             "setPromiseRejectCallback",
-            node_task_queue_set_promise_reject_callback,
+            node_task_queue_set_promise_reject_callback
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
     ] {
         let value =
@@ -13949,32 +14165,46 @@ fn node_internal_binding_locks(context: &mut Context) -> Result<JsObject, Sandbo
             .set(JsString::from(name), value, true, context)
             .map_err(sandbox_execution_error)?;
     }
-    for (name, length, function) in [
-        (
-            "request",
-            6usize,
-            node_locks_request as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
-        ),
-        ("query", 0usize, node_locks_query),
-    ] {
-        object
-            .set(
-                JsString::from(name),
-                JsValue::from(
-                    FunctionObjectBuilder::new(
-                        context.realm(),
-                        NativeFunction::from_fn_ptr(function),
-                    )
-                    .name(JsString::from(name))
-                    .length(length)
-                    .constructor(false)
-                    .build(),
-                ),
-                true,
-                context,
-            )
-            .map_err(sandbox_execution_error)?;
-    }
+    object
+        .set(
+            js_string!("request"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(
+                        node_locks_request as fn(
+                            &JsValue,
+                            &[JsValue],
+                            &mut Context,
+                        ) -> JsResult<NativeFunctionResult>,
+                    ),
+                )
+                .name(js_string!("request"))
+                .length(6)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
+    object
+        .set(
+            js_string!("query"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_fn_ptr(node_locks_query),
+                )
+                .name(js_string!("query"))
+                .length(0)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     object
         .set(
             js_string!("execve"),
@@ -14017,11 +14247,359 @@ fn node_locks_is_compatible(existing: &[NodeHeldLockState], mode: &str) -> bool 
     existing.iter().all(|lock| lock.mode == "shared")
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct NodeLocksGrantRequestResume {
+    continuation: boa_engine::native_function::NativeResume,
+    request_id: u64,
+    resolve: JsObject,
+    reject: JsObject,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeLocksRequestGrantResume {
+    continuation: boa_engine::native_function::NativeResume,
+    promise: JsObject,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeLocksRequestIfAvailableResume {
+    continuation: boa_engine::native_function::NativeResume,
+    promise: JsObject,
+    resolve: JsObject,
+    reject: JsObject,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeLocksProcessPendingResume {
+    continuation: boa_engine::native_function::NativeResume,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeLocksStealRejectResume {
+    continuation: boa_engine::native_function::NativeResume,
+    rejects: Vec<JsObject>,
+    next_index: usize,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeLocksReleaseFulfilledResume {
+    continuation: boa_engine::native_function::NativeResume,
+    value: JsValue,
+    resolve: JsObject,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeLocksReleaseRejectedResume {
+    continuation: boa_engine::native_function::NativeResume,
+    reason: JsValue,
+    reject: JsObject,
+}
+
+fn node_resume_locks_grant_request(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeLocksGrantRequestResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(result) => {
+            let host = active_node_host().map_err(js_error)?;
+            node_locks_attach_release_handlers(
+                &host,
+                capture.request_id,
+                result,
+                capture.resolve.clone(),
+                capture.reject.clone(),
+                context,
+            )
+            .map_err(js_error)?;
+            Ok(NativeFunctionResult::complete(JsValue::undefined()))
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_grant_request,
+                NodeLocksGrantRequestResume {
+                    continuation,
+                    request_id: capture.request_id,
+                    resolve: capture.resolve.clone(),
+                    reject: capture.reject.clone(),
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_locks_request_after_grant(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeLocksRequestGrantResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            Ok(NativeFunctionResult::complete(JsValue::from(capture.promise.clone())))
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_request_after_grant,
+                NodeLocksRequestGrantResume {
+                    continuation,
+                    promise: capture.promise.clone(),
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_locks_request_if_available(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeLocksRequestIfAvailableResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(result) => {
+            let resolved = JsPromise::resolve(result, context)?;
+            let on_fulfilled = FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_suspend_copy_closure_with_captures(
+                    |_this, args, resolve, context| {
+                        match resolve.call_interruptible(
+                            &JsValue::undefined(),
+                            &[args.first().cloned().unwrap_or_else(JsValue::undefined)],
+                            context,
+                        )? {
+                            InterruptibleCallOutcome::Complete(_) => {
+                                Ok(NativeFunctionResult::complete(JsValue::undefined()))
+                            }
+                            InterruptibleCallOutcome::Suspend(continuation) => {
+                                Ok(NativeFunctionResult::Suspend(continuation))
+                            }
+                        }
+                    },
+                    capture.resolve.clone(),
+                ),
+            )
+            .name(js_string!("lockIfAvailableFulfilled"))
+            .length(1)
+            .constructor(false)
+            .build();
+            let on_rejected = FunctionObjectBuilder::new(
+                context.realm(),
+                NativeFunction::from_suspend_copy_closure_with_captures(
+                    |_this, args, reject, context| {
+                        let reason = args.first().cloned().unwrap_or_else(JsValue::undefined);
+                        match reject
+                            .call_interruptible(&JsValue::undefined(), &[reason.clone()], context)?
+                        {
+                            InterruptibleCallOutcome::Complete(_) => {
+                                Err(boa_engine::JsError::from_opaque(reason))
+                            }
+                            InterruptibleCallOutcome::Suspend(continuation) => Ok(
+                                NativeFunctionResult::suspend_with_copy_closure(
+                                    node_resume_locks_rejected_after_suspend,
+                                    NodeLocksReleaseRejectedResume {
+                                        continuation,
+                                        reason,
+                                        reject: reject.clone(),
+                                    },
+                                ),
+                            ),
+                        }
+                    },
+                    capture.reject.clone(),
+                ),
+            )
+            .name(js_string!("lockIfAvailableRejected"))
+            .length(1)
+            .constructor(false)
+            .build();
+            let _ = resolved
+                .then(Some(on_fulfilled), Some(on_rejected), context)?;
+            Ok(NativeFunctionResult::complete(JsValue::from(
+                capture.promise.clone(),
+            )))
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_request_if_available,
+                NodeLocksRequestIfAvailableResume {
+                    continuation,
+                    promise: capture.promise.clone(),
+                    resolve: capture.resolve.clone(),
+                    reject: capture.reject.clone(),
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_locks_process_pending(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeLocksProcessPendingResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => node_with_host_native_result(context, |host, context| {
+            node_locks_process_pending(host, context).map_err(sandbox_execution_error)
+        }),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_process_pending,
+                NodeLocksProcessPendingResume { continuation },
+            ),
+        ),
+    }
+}
+
+fn node_resume_locks_reject_stolen(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeLocksStealRejectResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            let stolen_reason = JsValue::from(js_string!("LOCK_STOLEN"));
+            let mut index = capture.next_index;
+            while let Some(reject) = capture.rejects.get(index) {
+                match reject.call_interruptible(
+                    &JsValue::undefined(),
+                    &[stolen_reason.clone()],
+                    context,
+                )? {
+                    InterruptibleCallOutcome::Complete(_) => {
+                        index = index.saturating_add(1);
+                    }
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                            node_resume_locks_reject_stolen,
+                            NodeLocksStealRejectResume {
+                                continuation,
+                                rejects: capture.rejects.clone(),
+                                next_index: index,
+                            },
+                        ));
+                    }
+                }
+            }
+            Ok(NativeFunctionResult::complete(JsValue::undefined()))
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_reject_stolen,
+                NodeLocksStealRejectResume {
+                    continuation,
+                    rejects: capture.rejects.clone(),
+                    next_index: capture.next_index,
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_locks_fulfilled_after_release(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeLocksReleaseFulfilledResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            match capture
+                .resolve
+                .call_interruptible(&JsValue::undefined(), &[capture.value.clone()], context)?
+            {
+                InterruptibleCallOutcome::Complete(_) => {
+                    Ok(NativeFunctionResult::complete(JsValue::undefined()))
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    Ok(NativeFunctionResult::Suspend(continuation))
+                }
+            }
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_fulfilled_after_release,
+                NodeLocksReleaseFulfilledResume {
+                    continuation,
+                    value: capture.value.clone(),
+                    resolve: capture.resolve.clone(),
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_locks_rejected_after_release(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeLocksReleaseRejectedResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            match capture
+                .reject
+                .call_interruptible(&JsValue::undefined(), &[capture.reason.clone()], context)?
+            {
+                InterruptibleCallOutcome::Complete(_) => {
+                    Err(boa_engine::JsError::from_opaque(capture.reason.clone()))
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => Ok(
+                    NativeFunctionResult::suspend_with_copy_closure(
+                        node_resume_locks_rejected_after_suspend,
+                        NodeLocksReleaseRejectedResume {
+                            continuation,
+                            reason: capture.reason.clone(),
+                            reject: capture.reject.clone(),
+                        },
+                    ),
+                ),
+            }
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_rejected_after_release,
+                NodeLocksReleaseRejectedResume {
+                    continuation,
+                    reason: capture.reason.clone(),
+                    reject: capture.reject.clone(),
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_locks_rejected_after_suspend(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeLocksReleaseRejectedResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            Err(boa_engine::JsError::from_opaque(capture.reason.clone()))
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_rejected_after_suspend,
+                NodeLocksReleaseRejectedResume {
+                    continuation,
+                    reason: capture.reason.clone(),
+                    reject: capture.reject.clone(),
+                },
+            ),
+        ),
+    }
+}
+
 fn node_locks_release_request(
     host: &NodeRuntimeHost,
     request_id: u64,
     context: &mut Context,
-) -> Result<(), SandboxError> {
+) -> JsResult<NativeFunctionResult> {
     let resource_names = host
         .bootstrap
         .borrow()
@@ -14061,20 +14639,37 @@ fn node_locks_attach_release_handlers(
     let promise = JsPromise::resolve(result, context).map_err(sandbox_execution_error)?;
     let on_fulfilled = FunctionObjectBuilder::new(
         context.realm(),
-        NativeFunction::from_copy_closure_with_captures(
+        NativeFunction::from_suspend_copy_closure_with_captures(
             |_this, args, captures, context| {
                 let (request_id, resolve, reject) = captures;
-                node_with_host_js(context, |host, context| {
-                    node_locks_release_request(host, *request_id, context)?;
-                    resolve
-                        .call(
-                            &JsValue::undefined(),
-                            &[args.first().cloned().unwrap_or_else(JsValue::undefined)],
-                            context,
-                        )
-                        .map_err(sandbox_execution_error)?;
-                    let _ = reject;
-                    Ok(JsValue::undefined())
+                node_with_host_native_result(context, |host, context| {
+                    let value = args.first().cloned().unwrap_or_else(JsValue::undefined);
+                    match node_locks_release_request(host, *request_id, context)
+                        .map_err(sandbox_execution_error)?
+                    {
+                        NativeFunctionResult::Complete(_) => {}
+                        NativeFunctionResult::Suspend(continuation) => {
+                            return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                                node_resume_locks_fulfilled_after_release,
+                                NodeLocksReleaseFulfilledResume {
+                                    continuation,
+                                    value,
+                                    resolve: resolve.clone(),
+                                },
+                            ));
+                        }
+                    }
+                    match resolve
+                        .call_interruptible(&JsValue::undefined(), &[value], context)
+                        .map_err(sandbox_execution_error)?
+                    {
+                        InterruptibleCallOutcome::Complete(_) => {
+                            Ok(NativeFunctionResult::complete(JsValue::undefined()))
+                        }
+                        InterruptibleCallOutcome::Suspend(continuation) => {
+                            Ok(NativeFunctionResult::Suspend(continuation))
+                        }
+                    }
                 })
             },
             (request_id, resolve.clone(), reject.clone()),
@@ -14086,18 +14681,49 @@ fn node_locks_attach_release_handlers(
     .build();
     let on_rejected = FunctionObjectBuilder::new(
         context.realm(),
-        NativeFunction::from_copy_closure_with_captures(
+        NativeFunction::from_suspend_copy_closure_with_captures(
             |_this, args, captures, context| {
                 let (request_id, _resolve, reject) = captures;
                 let reason = args.first().cloned().unwrap_or_else(JsValue::undefined);
-                node_with_host_js(context, |host, context| {
-                    node_locks_release_request(host, *request_id, context)?;
-                    reject
-                        .call(&JsValue::undefined(), &[reason.clone()], context)
-                        .map_err(sandbox_execution_error)?;
-                    Ok(JsValue::undefined())
-                })?;
-                Err(boa_engine::JsError::from_opaque(reason))
+                node_with_host_native_result(context, |host, context| {
+                    match node_locks_release_request(host, *request_id, context)
+                        .map_err(sandbox_execution_error)?
+                    {
+                        NativeFunctionResult::Complete(_) => {}
+                        NativeFunctionResult::Suspend(continuation) => {
+                            return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                                node_resume_locks_rejected_after_release,
+                                NodeLocksReleaseRejectedResume {
+                                    continuation,
+                                    reason: reason.clone(),
+                                    reject: reject.clone(),
+                                },
+                            ));
+                        }
+                    }
+                    match reject
+                        .call_interruptible(&JsValue::undefined(), &[reason.clone()], context)
+                        .map_err(sandbox_execution_error)?
+                    {
+                        InterruptibleCallOutcome::Complete(_) => {
+                            Ok(NativeFunctionResult::from_completion(
+                                boa_engine::vm::CompletionRecord::Throw(
+                                    boa_engine::JsError::from_opaque(reason),
+                                ),
+                            ))
+                        }
+                        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+                            NativeFunctionResult::suspend_with_copy_closure(
+                                node_resume_locks_rejected_after_suspend,
+                                NodeLocksReleaseRejectedResume {
+                                    continuation,
+                                    reason,
+                                    reject: reject.clone(),
+                                },
+                            ),
+                        ),
+                    }
+                })
             },
             (request_id, resolve, reject),
         ),
@@ -14122,7 +14748,7 @@ fn node_locks_grant_request(
     resolve: JsObject,
     reject: JsObject,
     context: &mut Context,
-) -> Result<(), SandboxError> {
+) -> JsResult<NativeFunctionResult> {
     {
         let mut bootstrap = host.bootstrap.borrow_mut();
         bootstrap
@@ -14140,21 +14766,37 @@ fn node_locks_grant_request(
     }
     let callback = JsValue::from(callback)
         .as_callable()
-        .ok_or_else(|| sandbox_execution_error("locks.request callback must be callable"))?;
-    let result = callback
-        .call(
-            &JsValue::undefined(),
-            &[node_locks_make_internal_lock(&name, &mode, context)?],
-            context,
-        )
-        .map_err(sandbox_execution_error)?;
-    node_locks_attach_release_handlers(host, request_id, result, resolve, reject, context)
+        .ok_or_else(|| {
+            js_error(sandbox_execution_error("locks.request callback must be callable"))
+        })?;
+    match callback.call_interruptible(
+        &JsValue::undefined(),
+        &[node_locks_make_internal_lock(&name, &mode, context).map_err(js_error)?],
+        context,
+    )? {
+        InterruptibleCallOutcome::Complete(result) => {
+            node_locks_attach_release_handlers(host, request_id, result, resolve, reject, context)
+                .map_err(js_error)?;
+            Ok(NativeFunctionResult::complete(JsValue::undefined()))
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_locks_grant_request,
+                NodeLocksGrantRequestResume {
+                    continuation,
+                    request_id,
+                    resolve,
+                    reject,
+                },
+            ),
+        ),
+    }
 }
 
 fn node_locks_process_pending(
     host: &NodeRuntimeHost,
     context: &mut Context,
-) -> Result<(), SandboxError> {
+) -> JsResult<NativeFunctionResult> {
     loop {
         let grantable_index = {
             let bootstrap = host.bootstrap.borrow();
@@ -14169,12 +14811,12 @@ fn node_locks_process_pending(
         };
 
         let Some(index) = grantable_index else {
-            return Ok(());
+            return Ok(NativeFunctionResult::complete(JsValue::undefined()));
         };
 
         let pending = host.bootstrap.borrow_mut().pending_locks.remove(index);
-        node_sync_live_task_queue_budget(host)?;
-        node_locks_grant_request(
+        node_sync_live_task_queue_budget(host).map_err(js_error)?;
+        match node_locks_grant_request(
             host,
             pending.request_id,
             pending.name,
@@ -14184,7 +14826,15 @@ fn node_locks_process_pending(
             pending.resolve,
             pending.reject,
             context,
-        )?;
+        )? {
+            NativeFunctionResult::Complete(_) => continue,
+            NativeFunctionResult::Suspend(continuation) => {
+                return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                    node_resume_locks_process_pending,
+                    NodeLocksProcessPendingResume { continuation },
+                ));
+            }
+        }
     }
 }
 
@@ -14192,7 +14842,7 @@ fn node_locks_request(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let name = node_arg_string(args, 0, context)?;
     let client_id = node_arg_string(args, 1, context)?;
     let mode = node_arg_string(args, 2, context)?;
@@ -14215,7 +14865,7 @@ fn node_locks_request(
             JsNativeError::typ().with_message("locks.request callback must be callable")
         })?;
 
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         let (promise, resolvers) = JsPromise::new_pending(context);
         let request_id = {
             let mut bootstrap = host.bootstrap.borrow_mut();
@@ -14229,14 +14879,28 @@ fn node_locks_request(
                 let mut bootstrap = host.bootstrap.borrow_mut();
                 bootstrap.held_locks.remove(&name).unwrap_or_default()
             };
-            for held in stolen {
-                held.reject
-                    .call(
-                        &JsValue::undefined(),
-                        &[JsValue::from(js_string!("LOCK_STOLEN"))],
-                        context,
-                    )
-                    .map_err(sandbox_execution_error)?;
+            let stolen_reason = JsValue::from(js_string!("LOCK_STOLEN"));
+            let mut index = 0usize;
+            while let Some(held) = stolen.get(index) {
+                match held
+                    .reject
+                    .call_interruptible(&JsValue::undefined(), &[stolen_reason.clone()], context)
+                    .map_err(sandbox_execution_error)?
+                {
+                    InterruptibleCallOutcome::Complete(_) => {
+                        index = index.saturating_add(1);
+                    }
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                            node_resume_locks_reject_stolen,
+                            NodeLocksStealRejectResume {
+                                continuation,
+                                rejects: stolen.iter().map(|held| held.reject.clone()).collect(),
+                                next_index: index,
+                            },
+                        ));
+                    }
+                }
             }
         }
 
@@ -14251,7 +14915,7 @@ fn node_locks_request(
         };
 
         if compatible {
-            node_locks_grant_request(
+            match node_locks_grant_request(
                 host,
                 request_id,
                 name,
@@ -14261,48 +14925,99 @@ fn node_locks_request(
                 resolvers.resolve.clone().into(),
                 resolvers.reject.clone().into(),
                 context,
-            )?;
+            )
+            .map_err(sandbox_execution_error)? {
+                NativeFunctionResult::Complete(_) => {
+                    return Ok(NativeFunctionResult::complete(JsValue::from(promise)));
+                }
+                NativeFunctionResult::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                        node_resume_locks_request_after_grant,
+                        NodeLocksRequestGrantResume {
+                            continuation,
+                            promise: promise.clone().into(),
+                        },
+                    ));
+                }
+            }
         } else if if_available {
-            let result = callback
-                .call(&JsValue::undefined(), &[JsValue::null()], context)
-                .map_err(sandbox_execution_error)?;
-            let resolved = JsPromise::resolve(result, context).map_err(sandbox_execution_error)?;
-            let on_fulfilled = FunctionObjectBuilder::new(
-                context.realm(),
-                NativeFunction::from_copy_closure_with_captures(
-                    |_this, args, resolve, context| {
-                        resolve.call(
-                            &JsValue::undefined(),
-                            &[args.first().cloned().unwrap_or_else(JsValue::undefined)],
-                            context,
-                        )?;
-                        Ok(JsValue::undefined())
-                    },
-                    resolvers.resolve.clone(),
-                ),
-            )
-            .name(js_string!("lockIfAvailableFulfilled"))
-            .length(1)
-            .constructor(false)
-            .build();
-            let on_rejected = FunctionObjectBuilder::new(
-                context.realm(),
-                NativeFunction::from_copy_closure_with_captures(
-                    |_this, args, reject, context| {
-                        let reason = args.first().cloned().unwrap_or_else(JsValue::undefined);
-                        reject.call(&JsValue::undefined(), &[reason.clone()], context)?;
-                        Err(boa_engine::JsError::from_opaque(reason))
-                    },
-                    resolvers.reject.clone(),
-                ),
-            )
-            .name(js_string!("lockIfAvailableRejected"))
-            .length(1)
-            .constructor(false)
-            .build();
-            let _ = resolved
-                .then(Some(on_fulfilled), Some(on_rejected), context)
-                .map_err(sandbox_execution_error)?;
+            match callback
+                .call_interruptible(&JsValue::undefined(), &[JsValue::null()], context)
+                .map_err(sandbox_execution_error)?
+            {
+                InterruptibleCallOutcome::Complete(result) => {
+                    let resolved = JsPromise::resolve(result, context).map_err(sandbox_execution_error)?;
+                    let on_fulfilled = FunctionObjectBuilder::new(
+                        context.realm(),
+                        NativeFunction::from_suspend_copy_closure_with_captures(
+                            |_this, args, resolve, context| {
+                                match resolve.call_interruptible(
+                                    &JsValue::undefined(),
+                                    &[args.first().cloned().unwrap_or_else(JsValue::undefined)],
+                                    context,
+                                )? {
+                                    InterruptibleCallOutcome::Complete(_) => {
+                                        Ok(NativeFunctionResult::complete(JsValue::undefined()))
+                                    }
+                                    InterruptibleCallOutcome::Suspend(continuation) => {
+                                        Ok(NativeFunctionResult::Suspend(continuation))
+                                    }
+                                }
+                            },
+                            JsObject::from(resolvers.resolve.clone()),
+                        ),
+                    )
+                    .name(js_string!("lockIfAvailableFulfilled"))
+                    .length(1)
+                    .constructor(false)
+                    .build();
+                    let on_rejected = FunctionObjectBuilder::new(
+                        context.realm(),
+                        NativeFunction::from_suspend_copy_closure_with_captures(
+                            |_this, args, reject, context| {
+                                let reason = args.first().cloned().unwrap_or_else(JsValue::undefined);
+                                match reject
+                                    .call_interruptible(&JsValue::undefined(), &[reason.clone()], context)?
+                                {
+                                    InterruptibleCallOutcome::Complete(_) => {
+                                        Err(boa_engine::JsError::from_opaque(reason))
+                                    }
+                                    InterruptibleCallOutcome::Suspend(continuation) => Ok(
+                                        NativeFunctionResult::suspend_with_copy_closure(
+                                            node_resume_locks_rejected_after_suspend,
+                                            NodeLocksReleaseRejectedResume {
+                                                continuation,
+                                                reason,
+                                                reject: reject.clone().into(),
+                                            },
+                                        ),
+                                    ),
+                                }
+                            },
+                            JsObject::from(resolvers.reject.clone()),
+                        ),
+                    )
+                    .name(js_string!("lockIfAvailableRejected"))
+                    .length(1)
+                    .constructor(false)
+                    .build();
+                    let _ = resolved
+                        .then(Some(on_fulfilled), Some(on_rejected), context)
+                        .map_err(sandbox_execution_error)?;
+                    return Ok(NativeFunctionResult::complete(JsValue::from(promise)));
+                }
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                        node_resume_locks_request_if_available,
+                        NodeLocksRequestIfAvailableResume {
+                            continuation,
+                            promise: promise.clone().into(),
+                            resolve: resolvers.resolve.clone().into(),
+                            reject: resolvers.reject.clone().into(),
+                        },
+                    ));
+                }
+            }
         } else {
             host.bootstrap
                 .borrow_mut()
@@ -14319,7 +15034,7 @@ fn node_locks_request(
             node_sync_live_task_queue_budget(host)?;
         }
 
-        Ok(JsValue::from(promise))
+        Ok(NativeFunctionResult::complete(JsValue::from(promise)))
     })
 }
 
@@ -14503,11 +15218,6 @@ fn node_internal_binding_async_wrap(
             2usize,
             node_async_wrap_register_destroy_hook,
         ),
-        (
-            "queueDestroyAsyncId",
-            1usize,
-            node_async_wrap_queue_destroy_async_id,
-        ),
         ("setPromiseHooks", 4usize, node_async_wrap_set_promise_hooks),
         ("getPromiseHooks", 0usize, node_async_wrap_get_promise_hooks),
         ("setupHooks", 1usize, node_async_wrap_setup_hooks),
@@ -14538,6 +15248,23 @@ fn node_internal_binding_async_wrap(
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    object
+        .set(
+            js_string!("queueDestroyAsyncId"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_async_wrap_queue_destroy_async_id),
+                )
+                .name(js_string!("queueDestroyAsyncId"))
+                .length(1)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -14686,7 +15413,6 @@ fn node_internal_binding_contextify(context: &mut Context) -> Result<JsObject, S
             4usize,
             node_contextify_compile_function_for_cjs_loader,
         ),
-        ("compileFunction", 10usize, node_contextify_compile_function),
         (
             "startSigintWatchdog",
             0usize,
@@ -14714,6 +15440,23 @@ fn node_internal_binding_contextify(context: &mut Context) -> Result<JsObject, S
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    object
+        .set(
+            js_string!("compileFunction"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_contextify_compile_function),
+                )
+                .name(js_string!("compileFunction"))
+                .length(10)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -14778,16 +15521,10 @@ fn node_internal_binding_messaging(context: &mut Context) -> Result<JsObject, Sa
             node_messaging_set_deserializer_create_object_function
                 as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("structuredClone", 2usize, node_messaging_structured_clone),
         (
             "receiveMessageOnPort",
             1usize,
             node_messaging_receive_message_on_port,
-        ),
-        (
-            "drainMessagePort",
-            1usize,
-            node_messaging_drain_message_port,
         ),
         (
             "moveMessagePortToContext",
@@ -14807,6 +15544,23 @@ fn node_internal_binding_messaging(context: &mut Context) -> Result<JsObject, Sa
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    object
+        .set(
+            js_string!("structuredClone"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_messaging_structured_clone),
+                )
+                .name(js_string!("structuredClone"))
+                .length(2)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -14918,7 +15672,7 @@ fn node_messaging_message_port_constructor(
 ) -> Result<JsFunction, SandboxError> {
     let constructor = FunctionObjectBuilder::new(
         context.realm(),
-        NativeFunction::from_fn_ptr(node_messaging_message_port_construct),
+        NativeFunction::from_suspend_fn_ptr(node_messaging_message_port_construct),
     )
     .name(js_string!("MessagePort"))
     .length(0)
@@ -14943,16 +15697,23 @@ fn node_messaging_message_port_constructor(
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
         (
-            "postMessage",
-            1usize,
-            node_messaging_message_port_post_message
+            "ref",
+            0usize,
+            node_messaging_message_port_ref
                 as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
-        ("start", 0usize, node_messaging_message_port_start),
-        ("close", 0usize, node_messaging_message_port_close),
-        ("ref", 0usize, node_messaging_message_port_ref),
-        ("unref", 0usize, node_messaging_message_port_unref),
-        ("hasRef", 0usize, node_messaging_message_port_has_ref),
+        (
+            "unref",
+            0usize,
+            node_messaging_message_port_unref
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
+        (
+            "hasRef",
+            0usize,
+            node_messaging_message_port_has_ref
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+        ),
     ] {
         prototype
             .set(
@@ -14972,6 +15733,34 @@ fn node_messaging_message_port_constructor(
             )
             .map_err(sandbox_execution_error)?;
     }
+    for (name, length, function) in [
+        (
+            "postMessage",
+            1usize,
+            node_messaging_message_port_post_message
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
+        ),
+        ("start", 0usize, node_messaging_message_port_start),
+        ("close", 0usize, node_messaging_message_port_close),
+    ] {
+        prototype
+            .set(
+                JsString::from(name),
+                JsValue::from(
+                    FunctionObjectBuilder::new(
+                        context.realm(),
+                        NativeFunction::from_suspend_fn_ptr(function),
+                    )
+                    .name(JsString::from(name))
+                    .length(length)
+                    .constructor(false)
+                    .build(),
+                ),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)?;
+    }
     Ok(constructor)
 }
 
@@ -14979,13 +15768,13 @@ fn node_messaging_message_port_construct(
     this: &JsValue,
     _args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(this) = this.as_object() else {
         return Err(JsNativeError::typ()
             .with_message("MessagePort constructor requires receiver")
             .into());
     };
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         let id = node_next_host_handle_id(host);
         let symbol = node_host_private_symbol(host, "message_port.id")?;
         this.set(symbol, JsValue::from(id as f64), true, context)
@@ -15014,11 +15803,16 @@ fn node_messaging_message_port_construct(
             .map_err(sandbox_execution_error)?
             .as_callable()
         {
-            let _ = callback
-                .call(&JsValue::from(this.clone()), &[], context)
-                .map_err(sandbox_execution_error)?;
+            return node_call_ignored_callback_interruptible(
+                &callback,
+                &JsValue::from(this.clone()),
+                &[],
+                JsValue::from(this.clone()),
+                context,
+            )
+            .map_err(sandbox_execution_error);
         }
-        Ok(JsValue::from(this.clone()))
+        Ok(NativeFunctionResult::complete(JsValue::from(this.clone())))
     })
 }
 
@@ -15069,48 +15863,93 @@ fn node_messaging_no_message_symbol(context: &mut Context) -> Result<JsValue, Sa
     Ok(symbol)
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct NodeMessagingEmitPendingMessagesResume {
+    continuation: boa_engine::native_function::NativeResume,
+    port_id: u64,
+    force: bool,
+}
+
+fn node_resume_messaging_emit_pending_messages(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeMessagingEmitPendingMessagesResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let host = active_node_host().map_err(js_error)?;
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(_) => {
+            node_messaging_emit_pending_messages(&host, capture.port_id, capture.force, context)
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_messaging_emit_pending_messages,
+                NodeMessagingEmitPendingMessagesResume {
+                    continuation,
+                    port_id: capture.port_id,
+                    force: capture.force,
+                },
+            ),
+        ),
+    }
+}
+
 fn node_messaging_emit_pending_messages(
     host: &NodeRuntimeHost,
     port_id: u64,
     force: bool,
     context: &mut Context,
-) -> Result<(), SandboxError> {
+) -> JsResult<NativeFunctionResult> {
     loop {
         let (port, message) = {
             let mut bootstrap = host.bootstrap.borrow_mut();
             let Some(state) = bootstrap.message_ports.get_mut(&port_id) else {
-                return Ok(());
+                return Ok(NativeFunctionResult::complete(JsValue::undefined()));
             };
             if state.closed || (!force && !state.started) {
-                return Ok(());
+                return Ok(NativeFunctionResult::complete(JsValue::undefined()));
             }
             let Some(port) = state.object.clone() else {
-                return Ok(());
+                return Ok(NativeFunctionResult::complete(JsValue::undefined()));
             };
             let Some(message) = state.queue.first().cloned() else {
-                return Ok(());
+                return Ok(NativeFunctionResult::complete(JsValue::undefined()));
             };
             state.queue.remove(0);
-            node_sync_live_task_queue_budget(host)?;
+            node_sync_live_task_queue_budget(host).map_err(js_error)?;
             (port, message)
         };
 
-        let emit_message = node_internal_binding_messaging(context)?
+        let emit_message = node_internal_binding_messaging(context)
+            .map_err(js_error)?
             .get(js_string!("emitMessage"), context)
-            .map_err(sandbox_execution_error)?
+            ?
             .as_callable()
-            .ok_or_else(|| sandbox_execution_error("messaging.emitMessage must be callable"))?;
-        emit_message
-            .call(
+            .ok_or_else(|| {
+                js_error(sandbox_execution_error("messaging.emitMessage must be callable"))
+            })?;
+        match emit_message.call_interruptible(
                 &JsValue::from(port),
                 &[
                     message,
-                    JsValue::from(JsArray::new(context).map_err(sandbox_execution_error)?),
+                    JsValue::from(JsArray::new(context)?),
                     JsValue::from(js_string!("message")),
                 ],
                 context,
-            )
-            .map_err(sandbox_execution_error)?;
+            )?
+        {
+            InterruptibleCallOutcome::Complete(_) => {}
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                    node_resume_messaging_emit_pending_messages,
+                    NodeMessagingEmitPendingMessagesResume {
+                        continuation,
+                        port_id,
+                        force,
+                    },
+                ));
+            }
+        }
     }
 }
 
@@ -15145,14 +15984,14 @@ fn node_messaging_drain_message_port(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(port) = args.first().and_then(JsValue::as_object) else {
-        return Ok(JsValue::undefined());
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
     };
     node_with_host(|host| {
         let id = node_messaging_port_id(host, &port, context)?;
-        node_messaging_emit_pending_messages(host, id, true, context)?;
-        Ok(JsValue::undefined())
+        node_messaging_emit_pending_messages(host, id, true, context)
+            .map_err(sandbox_execution_error)
     })
     .map_err(js_error)
 }
@@ -15279,7 +16118,7 @@ fn node_messaging_message_port_post_message(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(port) = this.as_object() else {
         return Err(JsNativeError::typ()
             .with_message("MessagePort receiver must be an object")
@@ -15290,10 +16129,10 @@ fn node_messaging_message_port_post_message(
         let port_id = node_messaging_port_id(host, &port, context)?;
         let mut bootstrap = host.bootstrap.borrow_mut();
         let Some(port_state) = bootstrap.message_ports.get(&port_id).cloned() else {
-            return Ok(JsValue::undefined());
+            return Ok(NativeFunctionResult::complete(JsValue::undefined()));
         };
         if port_state.closed {
-            return Ok(JsValue::undefined());
+            return Ok(NativeFunctionResult::complete(JsValue::undefined()));
         }
         if let Some(name) = port_state.broadcast_name {
             if let Some(targets) = bootstrap.broadcast_channels.get(&name).cloned() {
@@ -15319,11 +16158,17 @@ fn node_messaging_message_port_post_message(
             {
                 for target_id in targets {
                     if target_id != port_id {
-                        node_messaging_emit_pending_messages(host, target_id, false, context)?;
+                        return node_messaging_emit_pending_messages(
+                            host,
+                            target_id,
+                            false,
+                            context,
+                        )
+                        .map_err(sandbox_execution_error);
                     }
                 }
             }
-            return Ok(JsValue::undefined());
+            return Ok(NativeFunctionResult::complete(JsValue::undefined()));
         }
         if let Some(target_id) = port_state.entangled {
             if let Some(target) = bootstrap.message_ports.get_mut(&target_id) {
@@ -15333,10 +16178,10 @@ fn node_messaging_message_port_post_message(
             }
             node_sync_live_task_queue_budget(host)?;
             drop(bootstrap);
-            node_messaging_emit_pending_messages(host, target_id, false, context)?;
-            return Ok(JsValue::undefined());
+            return node_messaging_emit_pending_messages(host, target_id, false, context)
+                .map_err(sandbox_execution_error);
         }
-        Ok(JsValue::undefined())
+        Ok(NativeFunctionResult::complete(JsValue::undefined()))
     })
     .map_err(js_error)
 }
@@ -15345,7 +16190,7 @@ fn node_messaging_message_port_start(
     this: &JsValue,
     _args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(port) = this.as_object() else {
         return Err(JsNativeError::typ()
             .with_message("MessagePort receiver must be an object")
@@ -15356,8 +16201,8 @@ fn node_messaging_message_port_start(
         if let Some(state) = host.bootstrap.borrow_mut().message_ports.get_mut(&id) {
             state.started = true;
         }
-        node_messaging_emit_pending_messages(host, id, false, context)?;
-        Ok(JsValue::undefined())
+        node_messaging_emit_pending_messages(host, id, false, context)
+            .map_err(sandbox_execution_error)
     })
     .map_err(js_error)
 }
@@ -15366,7 +16211,7 @@ fn node_messaging_message_port_close(
     this: &JsValue,
     _args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(port) = this.as_object() else {
         return Err(JsNativeError::typ()
             .with_message("MessagePort receiver must be an object")
@@ -15416,9 +16261,15 @@ fn node_messaging_message_port_close(
             JsNativeError::typ().with_message("handle_onclose_symbol must be a symbol")
         })?;
     if let Some(callback) = port.get(onclose, context)?.as_callable() {
-        let _ = callback.call(&JsValue::from(port.clone()), &[], context)?;
+        return node_call_ignored_callback_interruptible(
+            &callback,
+            &JsValue::from(port.clone()),
+            &[],
+            JsValue::undefined(),
+            context,
+        );
     }
-    Ok(JsValue::undefined())
+    Ok(NativeFunctionResult::complete(JsValue::undefined()))
 }
 
 fn node_messaging_message_port_ref(
@@ -15509,7 +16360,7 @@ fn node_messaging_structured_clone(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let value = args.first().cloned().unwrap_or_else(JsValue::undefined);
     let options = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
     let global = context.global_object();
@@ -15517,7 +16368,7 @@ fn node_messaging_structured_clone(
     let callable = structured_clone.as_callable().ok_or_else(|| {
         JsNativeError::typ().with_message("global structuredClone is not callable")
     })?;
-    callable.call(&JsValue::undefined(), &[value, options], context)
+    node_call_interruptible_native(&callable, &JsValue::undefined(), &[value, options], context)
 }
 
 fn node_internal_binding_profiler(context: &mut Context) -> Result<JsObject, SandboxError> {
@@ -15543,6 +16394,23 @@ fn node_internal_binding_profiler(context: &mut Context) -> Result<JsObject, San
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    object
+        .set(
+            js_string!("drainMessagePort"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_messaging_drain_message_port),
+                )
+                .name(js_string!("drainMessagePort"))
+                .length(1)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -15593,18 +16461,6 @@ fn node_internal_binding_inspector(context: &mut Context) -> Result<JsObject, Sa
                 as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
-            "asyncTaskStarted",
-            1usize,
-            node_inspector_async_task_started
-                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
-        ),
-        (
-            "asyncTaskFinished",
-            1usize,
-            node_inspector_async_task_finished
-                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
-        ),
-        (
             "registerAsyncHook",
             2usize,
             node_inspector_register_async_hook
@@ -15645,6 +16501,24 @@ fn node_internal_binding_inspector(context: &mut Context) -> Result<JsObject, Sa
             FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
                 .name(JsString::from(name))
                 .length(length)
+                .constructor(false)
+                .build();
+        object
+            .set(JsString::from(name), JsValue::from(value), true, context)
+            .map_err(sandbox_execution_error)?;
+    }
+    for (name, function) in [
+        (
+            "asyncTaskStarted",
+            node_inspector_async_task_started
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
+        ),
+        ("asyncTaskFinished", node_inspector_async_task_finished),
+    ] {
+        let value =
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_suspend_fn_ptr(function))
+                .name(JsString::from(name))
+                .length(1)
                 .constructor(false)
                 .build();
         object
@@ -15746,30 +16620,28 @@ fn node_internal_binding_mksnapshot(context: &mut Context) -> Result<JsObject, S
         .map_err(sandbox_execution_error)?;
     for (name, length, function) in [
         (
-            "runEmbedderPreload",
-            2usize,
-            node_mksnapshot_run_embedder_preload
-                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
-        ),
-        (
             "setSerializeCallback",
             1usize,
-            node_mksnapshot_set_serialize_callback,
+            node_mksnapshot_set_serialize_callback
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "setDeserializeCallback",
             1usize,
-            node_mksnapshot_set_deserialize_callback,
+            node_mksnapshot_set_deserialize_callback
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "setDeserializeMainFunction",
             1usize,
-            node_mksnapshot_set_deserialize_main_function,
+            node_mksnapshot_set_deserialize_main_function
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
         (
             "compileSerializeMain",
             2usize,
-            node_mksnapshot_compile_serialize_main,
+            node_mksnapshot_compile_serialize_main
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
         ),
     ] {
         let value =
@@ -15782,6 +16654,23 @@ fn node_internal_binding_mksnapshot(context: &mut Context) -> Result<JsObject, S
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    object
+        .set(
+            js_string!("runEmbedderPreload"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_mksnapshot_run_embedder_preload),
+                )
+                .name(js_string!("runEmbedderPreload"))
+                .length(2)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     object
         .set(
             js_string!("anonymousMainPath"),
@@ -15875,7 +16764,6 @@ fn node_internal_binding_performance(context: &mut Context) -> Result<JsObject, 
             0usize,
             node_performance_remove_garbage_collection_tracking,
         ),
-        ("notify", 2usize, node_performance_notify),
         ("setupObservers", 2usize, node_performance_setup_observers),
     ] {
         let value =
@@ -15888,6 +16776,23 @@ fn node_internal_binding_performance(context: &mut Context) -> Result<JsObject, 
             .set(JsString::from(name), JsValue::from(value), true, context)
             .map_err(sandbox_execution_error)?;
     }
+    object
+        .set(
+            js_string!("notify"),
+            JsValue::from(
+                FunctionObjectBuilder::new(
+                    context.realm(),
+                    NativeFunction::from_suspend_fn_ptr(node_performance_notify),
+                )
+                .name(js_string!("notify"))
+                .length(2)
+                .constructor(false)
+                .build(),
+            ),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)?;
     Ok(object)
 }
 
@@ -16329,21 +17234,15 @@ fn node_inspector_async_task_started(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let task_id = args
         .first()
         .cloned()
         .unwrap_or_else(JsValue::undefined)
         .to_number(context)? as u64;
-    node_with_host(|host| {
-        if let Some(enable) = host.bootstrap.borrow().inspector.async_hook_enable.clone() {
-            let _ = enable.call(
-                &JsValue::undefined(),
-                &[JsValue::from(task_id as f64)],
-                context,
-            );
-        }
-        Ok(JsValue::from(
+    let (enable, exists) = node_with_host(|host| {
+        Ok((
+            host.bootstrap.borrow().inspector.async_hook_enable.clone(),
             host.bootstrap
                 .borrow()
                 .inspector
@@ -16351,27 +17250,35 @@ fn node_inspector_async_task_started(
                 .contains_key(&task_id),
         ))
     })
-    .map_err(js_error)
+    .map_err(js_error)?;
+    let return_value = JsValue::from(exists);
+    let Some(enable) = enable else {
+        return Ok(NativeFunctionResult::complete(return_value));
+    };
+    node_call_ignored_callback_interruptible(
+        &enable,
+        &JsValue::undefined(),
+        &[JsValue::from(task_id as f64)],
+        return_value,
+        context,
+    )
 }
 
 fn node_inspector_async_task_finished(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let task_id = args
         .first()
         .cloned()
         .unwrap_or_else(JsValue::undefined)
         .to_number(context)? as u64;
+    let disable = node_with_host(|host| {
+        Ok(host.bootstrap.borrow().inspector.async_hook_disable.clone())
+    })
+    .map_err(js_error)?;
     node_with_host(|host| {
-        if let Some(disable) = host.bootstrap.borrow().inspector.async_hook_disable.clone() {
-            let _ = disable.call(
-                &JsValue::undefined(),
-                &[JsValue::from(task_id as f64)],
-                context,
-            );
-        }
         if let Some((_, recurring)) = host.bootstrap.borrow().inspector.async_tasks.get(&task_id) {
             if !*recurring {
                 host.bootstrap
@@ -16381,9 +17288,19 @@ fn node_inspector_async_task_finished(
                     .remove(&task_id);
             }
         }
-        Ok(JsValue::undefined())
+        Ok(())
     })
-    .map_err(js_error)
+    .map_err(js_error)?;
+    let Some(disable) = disable else {
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
+    };
+    node_call_ignored_callback_interruptible(
+        &disable,
+        &JsValue::undefined(),
+        &[JsValue::from(task_id as f64)],
+        JsValue::undefined(),
+        context,
+    )
 }
 
 fn node_inspector_register_async_hook(
@@ -16520,20 +17437,7 @@ fn node_cjs_lexer_parse(
     } else {
         String::new()
     };
-    let exports_set = context
-        .eval(Source::from_bytes(b"new Set()"))
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?
-        .as_object()
-        .ok_or_else(|| {
-            js_error(sandbox_execution_error(
-                "failed to create Set for cjs lexer",
-            ))
-        })?;
-    let add = exports_set
-        .get(js_string!("add"), context)?
-        .as_callable()
-        .ok_or_else(|| js_error(sandbox_execution_error("cjs lexer Set.add is not callable")))?;
+    let exports_set = JsSet::new(context);
     let mut export_names = BTreeSet::new();
     let mut reexports = Vec::new();
     for name in node_cjs_lexer_collect_named_exports(&source) {
@@ -16543,15 +17447,14 @@ fn node_cjs_lexer_parse(
         reexports.push(JsValue::from(JsString::from(specifier)));
     }
     for name in export_names {
-        let _ = add.call(
-            &JsValue::from(exports_set.clone()),
-            &[JsValue::from(JsString::from(name))],
-            context,
-        )?;
+        let _ = exports_set
+            .add(JsValue::from(JsString::from(name)), context)
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
     }
     let reexports = JsValue::from(JsArray::from_iter(reexports, context)?);
     Ok(JsValue::from(JsArray::from_iter(
-        [JsValue::from(exports_set), reexports],
+        [JsValue::from(exports_set.clone()), reexports],
         context,
     )?))
 }
@@ -16595,20 +17498,25 @@ fn node_mksnapshot_run_embedder_preload(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let preload = args.first().and_then(JsValue::as_object);
     let receiver = args.get(1).cloned().unwrap_or_else(JsValue::undefined);
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         node_debug_event(host, "bootstrap", "mksnapshot.runEmbedderPreload")?;
         if let Some(preload) = preload {
             let callable = JsValue::from(preload)
                 .as_callable()
                 .ok_or_else(|| sandbox_execution_error("mksnapshot preload must be callable"))?;
-            callable
-                .call(&receiver, &[], context)
-                .map_err(sandbox_execution_error)?;
+            return node_call_ignored_callback_interruptible(
+                &callable,
+                &receiver,
+                &[],
+                JsValue::undefined(),
+                context,
+            )
+            .map_err(sandbox_execution_error);
         }
-        Ok(JsValue::undefined())
+        Ok(NativeFunctionResult::complete(JsValue::undefined()))
     })
 }
 
@@ -16818,8 +17726,8 @@ fn node_performance_notify(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
-    node_with_host_js(context, |host, context| {
+) -> JsResult<NativeFunctionResult> {
+    node_with_host_native_result(context, |host, context| {
         let entry_type = args
             .first()
             .cloned()
@@ -16838,7 +17746,7 @@ fn node_performance_notify(
         };
         let state = host.bootstrap.borrow();
         let Some(callback) = state.performance_observer_callback.clone() else {
-            return Ok(JsValue::undefined());
+            return Ok(NativeFunctionResult::complete(JsValue::undefined()));
         };
         if let Some(index) = observer_index
             && let Some(observer_counts) = state.performance_observer_counts.clone()
@@ -16849,16 +17757,20 @@ fn node_performance_notify(
                 .to_u32(context)
                 .map_err(sandbox_execution_error)?;
             if count == 0 {
-                return Ok(JsValue::undefined());
+                return Ok(NativeFunctionResult::complete(JsValue::undefined()));
             }
         }
         let callable = JsValue::from(callback).as_callable().ok_or_else(|| {
             sandbox_execution_error("performance observer callback is not callable")
         })?;
-        callable
-            .call(&JsValue::undefined(), &[entry], context)
-            .map_err(sandbox_execution_error)?;
-        Ok(JsValue::undefined())
+        node_call_ignored_callback_interruptible(
+            &callable,
+            &JsValue::undefined(),
+            &[entry],
+            JsValue::undefined(),
+            context,
+        )
+        .map_err(sandbox_execution_error)
     })
 }
 
@@ -17522,12 +18434,12 @@ fn node_trace_events_category_set_construct(
         (
             "enable",
             node_trace_events_category_set_enable
-                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+                as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<NativeFunctionResult>,
         ),
         ("disable", node_trace_events_category_set_disable),
     ] {
         let value =
-            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(function))
+            FunctionObjectBuilder::new(context.realm(), NativeFunction::from_suspend_fn_ptr(function))
                 .name(JsString::from(name))
                 .length(0)
                 .constructor(false)
@@ -17544,7 +18456,7 @@ fn node_trace_events_category_set_enable(
     this: &JsValue,
     _args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let host = active_node_host().map_err(js_error)?;
     let categories_symbol =
         node_host_private_symbol(&host, "trace_events.categories").map_err(js_error)?;
@@ -17570,7 +18482,7 @@ fn node_trace_events_category_set_enable(
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         node_trace_events_sync_category_buffers(host, context)?;
         if let Some(callback) = host
             .bootstrap
@@ -17581,11 +18493,16 @@ fn node_trace_events_category_set_enable(
             let callable = JsValue::from(callback).as_callable().ok_or_else(|| {
                 sandbox_execution_error("trace category state update handler is not callable")
             })?;
-            let _ = callable
-                .call(&JsValue::undefined(), &[], context)
-                .map_err(sandbox_execution_error)?;
+            return node_call_ignored_callback_interruptible(
+                &callable,
+                &JsValue::undefined(),
+                &[],
+                JsValue::undefined(),
+                context,
+            )
+            .map_err(sandbox_execution_error);
         }
-        Ok(JsValue::undefined())
+        Ok(NativeFunctionResult::complete(JsValue::undefined()))
     })
 }
 
@@ -17593,7 +18510,7 @@ fn node_trace_events_category_set_disable(
     this: &JsValue,
     _args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let host = active_node_host().map_err(js_error)?;
     let categories_symbol =
         node_host_private_symbol(&host, "trace_events.categories").map_err(js_error)?;
@@ -17619,7 +18536,7 @@ fn node_trace_events_category_set_disable(
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         node_trace_events_sync_category_buffers(host, context)?;
         if let Some(callback) = host
             .bootstrap
@@ -17630,11 +18547,16 @@ fn node_trace_events_category_set_disable(
             let callable = JsValue::from(callback).as_callable().ok_or_else(|| {
                 sandbox_execution_error("trace category state update handler is not callable")
             })?;
-            let _ = callable
-                .call(&JsValue::undefined(), &[], context)
-                .map_err(sandbox_execution_error)?;
+            return node_call_ignored_callback_interruptible(
+                &callable,
+                &JsValue::undefined(),
+                &[],
+                JsValue::undefined(),
+                context,
+            )
+            .map_err(sandbox_execution_error);
         }
-        Ok(JsValue::undefined())
+        Ok(NativeFunctionResult::complete(JsValue::undefined()))
     })
 }
 
@@ -18812,10 +19734,13 @@ fn node_task_queue_run_microtasks(
     _this: &JsValue,
     _args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
-    node_with_host_js(context, |host, context| {
-        node_run_microtask_checkpoint(context, host)?;
-        Ok(JsValue::undefined())
+) -> JsResult<NativeFunctionResult> {
+    node_with_host_native_result(context, |host, context| {
+        context.run_jobs().map_err(sandbox_execution_error)?;
+        let queue = std::mem::take(&mut host.bootstrap.borrow_mut().microtask_queue);
+        node_sync_live_task_queue_budget(host)?;
+        node_continue_microtask_queue_interruptible(&queue, 0, context)
+            .map_err(sandbox_execution_error)
     })
 }
 
@@ -18971,7 +19896,7 @@ fn node_async_wrap_queue_destroy_async_id(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let async_id = args
         .first()
         .cloned()
@@ -18993,13 +19918,15 @@ fn node_async_wrap_queue_destroy_async_id(
         let callable = JsValue::from(callback).as_callable().ok_or_else(|| {
             JsNativeError::typ().with_message("async_hooks.destroy must be callable")
         })?;
-        let _ = callable.call(
+        return node_call_ignored_callback_interruptible(
+            &callable,
             &JsValue::undefined(),
             &[JsValue::from(async_id as f64)],
+            JsValue::undefined(),
             context,
-        )?;
+        );
     }
-    Ok(JsValue::undefined())
+    Ok(NativeFunctionResult::complete(JsValue::undefined()))
 }
 
 fn node_async_wrap_set_promise_hooks(
@@ -19186,15 +20113,10 @@ fn node_async_wrap_pop_async_context(
         Ok(JsValue::undefined())
     })
     .map_err(js_error)?;
-    let _ = resources
-        .get(js_string!("pop"), context)
+    resources
+        .set(js_string!("length"), JsValue::from(offset), true, context)
         .map_err(sandbox_execution_error)
-        .map_err(js_error)?
-        .as_callable()
-        .ok_or_else(|| {
-            JsNativeError::typ().with_message("execution_async_resources.pop is not callable")
-        })?
-        .call(&JsValue::from(resources.clone()), &[], context)?;
+        .map_err(js_error)?;
     Ok(JsValue::from(offset > 0))
 }
 
@@ -19417,6 +20339,229 @@ fn node_contextify_sync_global_back_into_context(
     Ok(())
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct NodeContextifyCompileFunctionState {
+    context_extensions: Vec<JsObject>,
+    source_url: String,
+    source_map_url: Option<String>,
+    include_cached_data_rejected: bool,
+    cached_data_rejected: bool,
+    produce_cached_data: bool,
+    cached_data_value: Option<JsValue>,
+    host_defined_option: Option<JsValue>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeContextifyCompileFunctionEvalResume {
+    continuation: boa_engine::native_function::NativeResume,
+    state: NodeContextifyCompileFunctionState,
+    parsing_context: Option<JsObject>,
+    global: JsObject,
+    previous: Vec<(JsValue, Option<JsValue>)>,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeContextifyCompileFunctionCallResume {
+    continuation: boa_engine::native_function::NativeResume,
+    state: NodeContextifyCompileFunctionState,
+}
+
+fn node_contextify_restore_compile_parsing_context(
+    parsing_context: Option<&JsObject>,
+    global: &JsObject,
+    previous: &[(JsValue, Option<JsValue>)],
+    context: &mut Context,
+) -> JsResult<()> {
+    if let Some(parsing_context) = parsing_context {
+        let previous = previous
+            .iter()
+            .cloned()
+            .map(|(key, value)| key.to_property_key(context).map(|key| (key, value)))
+            .collect::<JsResult<Vec<_>>>()?;
+        node_contextify_sync_global_back_into_context(parsing_context, global, &previous, context)
+            .map_err(js_error)?;
+    }
+    Ok(())
+}
+
+fn node_contextify_capture_previous(
+    previous: Vec<(PropertyKey, Option<JsValue>)>,
+) -> Vec<(JsValue, Option<JsValue>)> {
+    previous
+        .into_iter()
+        .map(|(key, value)| (JsValue::from(key), value))
+        .collect()
+}
+
+fn node_contextify_build_compile_function_result(
+    function: JsValue,
+    state: &NodeContextifyCompileFunctionState,
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let result = JsObject::with_null_proto();
+    result
+        .set(js_string!("function"), function.clone(), true, context)
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)?;
+    result
+        .set(
+            js_string!("sourceURL"),
+            JsValue::from(JsString::from(state.source_url.clone())),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)?;
+    result
+        .set(
+            js_string!("sourceMapURL"),
+            state
+                .source_map_url
+                .clone()
+                .map(|value| JsValue::from(JsString::from(value)))
+                .unwrap_or_else(JsValue::undefined),
+            true,
+            context,
+        )
+        .map_err(sandbox_execution_error)
+        .map_err(js_error)?;
+    if state.include_cached_data_rejected {
+        result
+            .set(
+                js_string!("cachedDataRejected"),
+                JsValue::from(state.cached_data_rejected),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+    }
+    if state.produce_cached_data {
+        result
+            .set(
+                js_string!("cachedDataProduced"),
+                JsValue::from(true),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+        result
+            .set(
+                js_string!("cachedData"),
+                state
+                    .cached_data_value
+                    .clone()
+                    .unwrap_or_else(JsValue::undefined),
+                true,
+                context,
+            )
+            .map_err(sandbox_execution_error)
+            .map_err(js_error)?;
+    }
+    if let Some(function_object) = function.as_object() {
+        node_contextify_attach_host_defined_option(
+            &function_object,
+            state.host_defined_option.clone(),
+            context,
+        )
+        .map_err(js_error)?;
+    }
+    Ok(JsValue::from(result))
+}
+
+fn node_contextify_invoke_compile_factory(
+    factory_value: JsValue,
+    state: &NodeContextifyCompileFunctionState,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let factory = factory_value.as_callable().ok_or_else(|| {
+        JsNativeError::typ().with_message("compileFunction factory is not callable")
+    })?;
+    let args = state
+        .context_extensions
+        .iter()
+        .cloned()
+        .map(JsValue::from)
+        .collect::<Vec<_>>();
+    match factory.call_interruptible(&JsValue::undefined(), &args, context)? {
+        InterruptibleCallOutcome::Complete(function) => Ok(NativeFunctionResult::complete(
+            node_contextify_build_compile_function_result(function, state, context)?,
+        )),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_contextify_compile_function_call,
+                NodeContextifyCompileFunctionCallResume {
+                    continuation,
+                    state: state.clone(),
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_contextify_compile_function_eval(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeContextifyCompileFunctionEvalResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion) {
+        Ok(InterruptibleCallOutcome::Complete(factory)) => {
+            node_contextify_restore_compile_parsing_context(
+                capture.parsing_context.as_ref(),
+                &capture.global,
+                &capture.previous,
+                context,
+            )?;
+            node_contextify_invoke_compile_factory(factory, &capture.state, context)
+        }
+        Ok(InterruptibleCallOutcome::Suspend(continuation)) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_contextify_compile_function_eval,
+                NodeContextifyCompileFunctionEvalResume {
+                    continuation,
+                    state: capture.state.clone(),
+                    parsing_context: capture.parsing_context.clone(),
+                    global: capture.global.clone(),
+                    previous: capture.previous.clone(),
+                },
+            ),
+        ),
+        Err(error) => {
+            node_contextify_restore_compile_parsing_context(
+                capture.parsing_context.as_ref(),
+                &capture.global,
+                &capture.previous,
+                context,
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn node_resume_contextify_compile_function_call(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeContextifyCompileFunctionCallResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(function) => Ok(NativeFunctionResult::complete(
+            node_contextify_build_compile_function_result(function, &capture.state, context)?,
+        )),
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_contextify_compile_function_call,
+                NodeContextifyCompileFunctionCallResume {
+                    continuation,
+                    state: capture.state.clone(),
+                },
+            ),
+        ),
+    }
+}
+
 fn node_contextify_contains_module_syntax(
     _this: &JsValue,
     args: &[JsValue],
@@ -19596,10 +20741,17 @@ fn node_contextify_measure_memory(
             let value = JsValue::from_json(&payload, context)
                 .map_err(sandbox_execution_error)
                 .map_err(js_error)?;
-            resolvers
+            match resolvers
                 .resolve
-                .call(&JsValue::undefined(), &[value], context)?;
-            Ok(JsValue::undefined())
+                .call_interruptible(&JsValue::undefined(), &[value], context)?
+            {
+                InterruptibleCallOutcome::Complete(_) => Ok(
+                    NativeFunctionResult::complete(JsValue::undefined()),
+                ),
+                InterruptibleCallOutcome::Suspend(continuation) => {
+                    Ok(NativeFunctionResult::Suspend(continuation))
+                }
+            }
         })
         .into(),
     );
@@ -19626,19 +20778,14 @@ fn node_contextify_compile_cache_bytes(
 }
 
 fn node_js_buffer_from_bytes(bytes: Vec<u8>, context: &mut Context) -> JsResult<JsValue> {
-    let buffer_ctor = context.global_object().get(js_string!("Buffer"), context)?;
-    if let Some(buffer_ctor) = buffer_ctor.as_object() {
-        let from = buffer_ctor.get(js_string!("from"), context)?;
-        if let Some(from) = from.as_callable() {
-            let view = JsUint8Array::from_iter(bytes, context)?;
-            return from.call(&JsValue::from(buffer_ctor), &[JsValue::from(view)], context);
-        }
+    let view = JsUint8Array::from_iter(bytes, context)?;
+    let view_object: JsObject = view.clone().into();
+    if let Ok(host) = active_node_host()
+        && let Some(prototype) = host.bootstrap.borrow().buffer_prototype.clone()
+    {
+        view_object.set_prototype(Some(prototype));
     }
-    Ok(JsValue::from(
-        JsUint8Array::from_iter(bytes, context)?
-            .buffer(context)?
-            .clone(),
-    ))
+    Ok(JsValue::from(view_object))
 }
 
 fn node_contextify_array_like_strings(
@@ -19821,7 +20968,7 @@ fn node_contextify_compile_function(
     _this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let content = node_arg_string(args, 0, context)?;
     let filename = node_arg_string(args, 1, context)?;
     let line_offset = args
@@ -19874,13 +21021,14 @@ fn node_contextify_compile_function(
         .unwrap_or(false);
     let global = context.global_object().clone();
     let previous = if let Some(parsing_context) = parsing_context.as_ref() {
-        Some(
-            node_contextify_sync_context_into_global(parsing_context, &global, context)
-                .map_err(js_error)?,
-        )
+        node_contextify_sync_context_into_global(parsing_context, &global, context)
+            .map(Some)
+            .map_err(js_error)?
     } else {
         None
     };
+    let previous = previous.unwrap_or_default();
+    let previous_capture = node_contextify_capture_previous(previous.clone());
     let padding = "\n".repeat(line_offset.max(0) as usize);
     let prefix = " ".repeat(column_offset.max(0) as usize);
     let extension_params = (0..context_extensions.len())
@@ -19901,98 +21049,57 @@ fn node_contextify_compile_function(
         filename.replace('\\', "\\\\"),
         with_suffix,
     );
-    let factory = context
-        .eval(Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(filename.clone())))
-        .map_err(sandbox_execution_error)
-        .map_err(js_error);
-    if let (Some(parsing_context), Some(previous)) = (parsing_context.as_ref(), previous.as_ref()) {
-        node_contextify_sync_global_back_into_context(parsing_context, &global, previous, context)
-            .map_err(js_error)?;
-    }
-    let factory = factory?;
-    let factory = factory.as_callable().ok_or_else(|| {
-        JsNativeError::typ().with_message("compileFunction factory is not callable")
-    })?;
-    let function = factory
-        .call(
-            &JsValue::undefined(),
-            &context_extensions
-                .iter()
-                .cloned()
-                .map(JsValue::from)
-                .collect::<Vec<_>>(),
-            context,
-        )
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?;
-    let result = JsObject::with_null_proto();
-    result
-        .set(js_string!("function"), function.clone(), true, context)
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?;
-    result
-        .set(
-            js_string!("sourceURL"),
-            JsValue::from(JsString::from(
-                source_url.unwrap_or_else(|| filename.clone()),
-            )),
-            true,
-            context,
-        )
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?;
-    result
-        .set(
-            js_string!("sourceMapURL"),
-            source_map_url
-                .map(|value| JsValue::from(JsString::from(value)))
-                .unwrap_or_else(JsValue::undefined),
-            true,
-            context,
-        )
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?;
-    if let Some(_cached) = cached_data.as_ref() {
-        result
-            .set(
-                js_string!("cachedDataRejected"),
-                JsValue::from(cached_data_rejected),
-                true,
+    let state = NodeContextifyCompileFunctionState {
+        context_extensions,
+        source_url: source_url.unwrap_or_else(|| filename.clone()),
+        source_map_url,
+        include_cached_data_rejected: cached_data.is_some(),
+        cached_data_rejected,
+        produce_cached_data,
+        cached_data_value: produce_cached_data
+            .then(|| node_js_buffer_from_bytes(cache_bytes.clone(), context))
+            .transpose()?,
+        host_defined_option: args.get(9).cloned(),
+    };
+    let script = Script::parse(
+        Source::from_bytes(wrapped.as_bytes()).with_path(&PathBuf::from(filename.clone())),
+        None,
+        context,
+    )
+    .map_err(sandbox_execution_error)
+    .map_err(js_error)?;
+    match script.evaluate_interruptible(context) {
+        Ok(InterruptibleCallOutcome::Complete(factory)) => {
+            node_contextify_restore_compile_parsing_context(
+                parsing_context.as_ref(),
+                &global,
+                &previous_capture,
                 context,
-            )
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-    }
-    if produce_cached_data {
-        result
-            .set(
-                js_string!("cachedDataProduced"),
-                JsValue::from(true),
-                true,
+            )?;
+            node_contextify_invoke_compile_factory(factory, &state, context)
+        }
+        Ok(InterruptibleCallOutcome::Suspend(continuation)) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_contextify_compile_function_eval,
+                NodeContextifyCompileFunctionEvalResume {
+                    continuation,
+                    state,
+                    parsing_context,
+                    global,
+                    previous: previous_capture,
+                },
+            ),
+        ),
+        Err(error) => {
+            node_contextify_restore_compile_parsing_context(
+                parsing_context.as_ref(),
+                &global,
+                &previous_capture,
                 context,
-            )
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
-        result
-            .set(
-                js_string!("cachedData"),
-                node_js_buffer_from_bytes(cache_bytes.clone(), context)?,
-                true,
-                context,
-            )
-            .map_err(sandbox_execution_error)
-            .map_err(js_error)?;
+            )?;
+            Err(error)
+        }
     }
-    if let Some(function_object) = result
-        .get(js_string!("function"), context)
-        .map_err(sandbox_execution_error)
-        .map_err(js_error)?
-        .as_object()
-    {
-        node_contextify_attach_host_defined_option(&function_object, args.get(9).cloned(), context)
-            .map_err(js_error)?;
-    }
-    Ok(JsValue::from(result))
 }
 
 fn node_contextify_script_run_in_context(
@@ -21303,7 +22410,7 @@ fn node_blob_reader_make(
         .map_err(sandbox_execution_error)?;
     let pull = FunctionObjectBuilder::new(
         context.realm(),
-        NativeFunction::from_fn_ptr(node_blob_reader_pull),
+        NativeFunction::from_suspend_fn_ptr(node_blob_reader_pull),
     )
     .name(js_string!("pull"))
     .length(1)
@@ -21545,7 +22652,7 @@ fn node_blob_reader_pull(
     this: &JsValue,
     args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let host = active_node_host().map_err(js_error)?;
     let blob_id_symbol = node_host_private_symbol(&host, "blob.id").map_err(js_error)?;
     let blob_offset_symbol = node_host_private_symbol(&host, "blob.offset").map_err(js_error)?;
@@ -21569,8 +22676,13 @@ fn node_blob_reader_pull(
         .to_length(context)? as usize;
     let bytes = node_with_host(|host| node_blob_bytes_from_id(host, blob_id)).map_err(js_error)?;
     if offset >= bytes.len() {
-        let _ = callback.call(&JsValue::undefined(), &[JsValue::from(0)], context)?;
-        return Ok(JsValue::from(0));
+        return node_call_ignored_callback_interruptible(
+            &callback,
+            &JsValue::undefined(),
+            &[JsValue::from(0)],
+            JsValue::from(0),
+            context,
+        );
     }
     reader.set(
         blob_offset_symbol,
@@ -21583,8 +22695,13 @@ fn node_blob_reader_pull(
             .buffer(context)?
             .clone(),
     );
-    let _ = callback.call(&JsValue::undefined(), &[JsValue::from(1), chunk], context)?;
-    Ok(JsValue::from(1))
+    node_call_ignored_callback_interruptible(
+        &callback,
+        &JsValue::undefined(),
+        &[JsValue::from(1), chunk],
+        JsValue::from(1),
+        context,
+    )
 }
 
 fn node_url_can_parse(
@@ -24010,15 +25127,20 @@ fn node_module_wrap_evaluate_sync(
                     .ok_or_else(|| {
                         sandbox_execution_error("synthetic evaluation step is not callable")
                     })?;
-                if let Err(error) = callable.call(&JsValue::from(object.clone()), &[], context) {
-                    state.status = 5;
-                    state.error = Some(
-                        error
-                            .clone()
-                            .into_opaque(context)
-                            .map_err(sandbox_execution_error)?,
-                    );
-                    return Err(sandbox_execution_error(error));
+                match callable
+                    .call_interruptible(&JsValue::from(object.clone()), &[], context)
+                    .map_err(sandbox_execution_error)?
+                {
+                    InterruptibleCallOutcome::Complete(_) => {}
+                    InterruptibleCallOutcome::Suspend(_) => {
+                        state.status = 5;
+                        state.error = Some(JsValue::from(js_string!(
+                            "synthetic evaluation suspended during evaluateSync()"
+                        )));
+                        return Err(sandbox_execution_error(
+                            "synthetic evaluation suspended during evaluateSync()",
+                        ));
+                    }
                 }
             }
             node_module_wrap_synthetic_namespace(state, context).map_err(sandbox_execution_error)?
@@ -24043,15 +25165,80 @@ fn node_module_wrap_evaluate_sync(
     })
 }
 
+#[derive(Clone, Trace, Finalize)]
+struct NodeModuleWrapSyntheticEvaluateResume {
+    module_id: u64,
+    continuation: boa_engine::native_function::NativeResume,
+}
+
+fn node_module_wrap_record_synthetic_error(
+    host: &NodeRuntimeHost,
+    module_id: u64,
+    error: boa_engine::JsError,
+    context: &mut Context,
+) -> Result<(), SandboxError> {
+    if let Some(state) = host.bootstrap.borrow_mut().module_wraps.get_mut(&module_id) {
+        state.status = 5;
+        state.error = Some(
+            error
+                .clone()
+                .into_opaque(context)
+                .map_err(sandbox_execution_error)?,
+        );
+    }
+    Ok(())
+}
+
+fn node_module_wrap_finish_synthetic_evaluate(
+    host: &NodeRuntimeHost,
+    module_id: u64,
+    context: &mut Context,
+) -> Result<NativeFunctionResult, SandboxError> {
+    if let Some(state) = host.bootstrap.borrow_mut().module_wraps.get_mut(&module_id) {
+        state.status = 4;
+    }
+    Ok(NativeFunctionResult::complete(
+        JsValue::from(JsPromise::resolve(JsValue::undefined(), context).map_err(sandbox_execution_error)?),
+    ))
+}
+
+fn node_resume_module_wrap_synthetic_evaluate(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeModuleWrapSyntheticEvaluateResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    node_with_host_native_result(context, |host, context| {
+        context.install_interruptible_resume(capture.continuation.clone());
+        match context.resume_interruptible_with(completion) {
+            Ok(InterruptibleCallOutcome::Complete(_)) => {
+                node_module_wrap_finish_synthetic_evaluate(host, capture.module_id, context)
+            }
+            Ok(InterruptibleCallOutcome::Suspend(continuation)) => Ok(
+                NativeFunctionResult::suspend_with_copy_closure(
+                    node_resume_module_wrap_synthetic_evaluate,
+                    NodeModuleWrapSyntheticEvaluateResume {
+                        module_id: capture.module_id,
+                        continuation,
+                    },
+                ),
+            ),
+            Err(error) => {
+                node_module_wrap_record_synthetic_error(host, capture.module_id, error.clone(), context)?;
+                Err(sandbox_execution_error(error))
+            }
+        }
+    })
+}
+
 fn node_module_wrap_evaluate(
     this: &JsValue,
     _args: &[JsValue],
     context: &mut Context,
-) -> JsResult<JsValue> {
+) -> JsResult<NativeFunctionResult> {
     let Some(object) = this.as_object() else {
-        return Ok(JsValue::undefined());
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
     };
-    node_with_host_js(context, |host, context| {
+    node_with_host_native_result(context, |host, context| {
         let id = node_module_wrap_id(host, &object, context)?;
         let mut bootstrap = host.bootstrap.borrow_mut();
         let state = bootstrap
@@ -24074,22 +25261,23 @@ fn node_module_wrap_evaluate(
                     .ok_or_else(|| {
                         sandbox_execution_error("synthetic evaluation step is not callable")
                     })?;
-                if let Err(error) = callable.call(&JsValue::from(object.clone()), &[], context) {
-                    state.status = 5;
-                    state.error = Some(
-                        error
-                            .clone()
-                            .into_opaque(context)
-                            .map_err(sandbox_execution_error)?,
-                    );
-                    return Err(sandbox_execution_error(error));
+                match callable
+                    .call_interruptible(&JsValue::from(object.clone()), &[], context)
+                    .map_err(sandbox_execution_error)?
+                {
+                    InterruptibleCallOutcome::Complete(_) => {}
+                    InterruptibleCallOutcome::Suspend(continuation) => {
+                        return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                            node_resume_module_wrap_synthetic_evaluate,
+                            NodeModuleWrapSyntheticEvaluateResume {
+                                module_id: id,
+                                continuation,
+                            },
+                        ));
+                    }
                 }
             }
-            state.status = 4;
-            JsValue::from(
-                JsPromise::resolve(JsValue::undefined(), context)
-                    .map_err(sandbox_execution_error)?,
-            )
+            return node_module_wrap_finish_synthetic_evaluate(host, id, context);
         } else if let Some(module) = state.module.clone() {
             let promise = module.evaluate(context).map_err(sandbox_execution_error)?;
             let on_fulfilled = FunctionObjectBuilder::new(
@@ -24144,7 +25332,7 @@ fn node_module_wrap_evaluate(
         } else {
             JsValue::undefined()
         };
-        Ok(result)
+        Ok(NativeFunctionResult::complete(result))
     })
 }
 
@@ -24714,53 +25902,23 @@ fn node_util_get_own_non_index_properties(
     let skip_strings = filter & 8 != 0;
     let skip_symbols = filter & 16 != 0;
     let keys = target.own_property_keys(context)?;
-    let object_ctor = context.global_object().get(js_string!("Object"), context)?;
-    let object_ctor = object_ctor
-        .as_object()
-        .ok_or_else(|| JsNativeError::typ().with_message("Object is unavailable"))?;
-    let get_own_property_descriptor = object_ctor
-        .get(js_string!("getOwnPropertyDescriptor"), context)?
-        .as_callable()
-        .ok_or_else(|| {
-            JsNativeError::typ().with_message("Object.getOwnPropertyDescriptor is not callable")
-        })?;
     let mut result = Vec::new();
     for key in keys {
-        let key_value = match &key {
-            boa_engine::property::PropertyKey::Index(index) => JsValue::from(index.get()),
-            boa_engine::property::PropertyKey::String(name) => JsValue::from(name.clone()),
-            boa_engine::property::PropertyKey::Symbol(symbol) => JsValue::from(symbol.clone()),
-        };
-        let descriptor = get_own_property_descriptor.call(
-            &JsValue::from(object_ctor.clone()),
-            &[JsValue::from(target.clone()), key_value],
-            context,
-        )?;
-        let Some(descriptor) = descriptor.as_object() else {
+        let Some(descriptor) = target.get_own_property_descriptor(key.clone(), context)? else {
             continue;
         };
         if only_enumerable
-            && !descriptor
-                .get(js_string!("enumerable"), context)?
-                .to_boolean()
+            && !descriptor.expect_enumerable()
         {
             continue;
         }
         if only_configurable
-            && !descriptor
-                .get(js_string!("configurable"), context)?
-                .to_boolean()
+            && !descriptor.expect_configurable()
         {
             continue;
         }
         if only_writable {
-            let writable = descriptor
-                .get(js_string!("writable"), context)?
-                .to_boolean()
-                || descriptor
-                    .get(js_string!("set"), context)?
-                    .as_object()
-                    .is_some();
+            let writable = descriptor.expect_writable() || descriptor.set().is_some();
             if !writable {
                 continue;
             }
@@ -24836,40 +25994,31 @@ fn node_util_sleep(_this: &JsValue, args: &[JsValue], context: &mut Context) -> 
     Ok(JsValue::undefined())
 }
 
-fn node_util_preview_entries(
-    _this: &JsValue,
-    args: &[JsValue],
+#[derive(Clone, Trace, Finalize)]
+struct NodeUtilPreviewEntriesResume {
+    continuation: boa_engine::native_function::NativeResume,
+    object: JsObject,
+    iterator: JsObject,
+    values: Vec<JsValue>,
+    with_constructor: bool,
+}
+
+#[derive(Clone, Trace, Finalize)]
+struct NodeUtilPreviewEntriesStartResume {
+    continuation: boa_engine::native_function::NativeResume,
+    object: JsObject,
+    with_constructor: bool,
+}
+
+fn node_util_preview_entries_finalize(
+    object: &JsObject,
+    values: Vec<JsValue>,
+    with_constructor: bool,
     context: &mut Context,
-) -> JsResult<JsValue> {
-    let Some(object) = args.first().and_then(JsValue::as_object) else {
-        return Ok(JsValue::undefined());
-    };
-    let entries_method = object.get(js_string!("entries"), context)?;
-    let Some(entries_method) = entries_method.as_callable() else {
-        return Ok(JsValue::undefined());
-    };
-    let iterator = entries_method.call(&JsValue::from(object.clone()), &[], context)?;
-    let Some(iterator) = iterator.as_object() else {
-        return Ok(JsValue::undefined());
-    };
-    let next = iterator.get(js_string!("next"), context)?;
-    let Some(next) = next.as_callable() else {
-        return Ok(JsValue::undefined());
-    };
-    let mut values = Vec::new();
-    loop {
-        let step = next.call(&JsValue::from(iterator.clone()), &[], context)?;
-        let Some(step) = step.as_object() else {
-            break;
-        };
-        if step.get(js_string!("done"), context)?.to_boolean() {
-            break;
-        }
-        values.push(step.get(js_string!("value"), context)?);
-    }
+) -> JsResult<NativeFunctionResult> {
     let entries = JsValue::from(JsArray::from_iter(values, context)?);
-    if args.len() == 1 {
-        return Ok(entries);
+    if !with_constructor {
+        return Ok(NativeFunctionResult::complete(entries));
     }
     let constructor_name = object
         .get(js_string!("constructor"), context)?
@@ -24877,10 +26026,176 @@ fn node_util_preview_entries(
         .and_then(|ctor| ctor.get(js_string!("name"), context).ok())
         .and_then(|value| value.as_string().map(|value| value.to_std_string_escaped()))
         .unwrap_or_default();
-    Ok(JsValue::from(JsArray::from_iter(
-        [entries, JsValue::from(constructor_name == "Map")],
-        context,
-    )?))
+    Ok(NativeFunctionResult::complete(JsValue::from(
+        JsArray::from_iter([entries, JsValue::from(constructor_name == "Map")], context)?,
+    )))
+}
+
+fn node_util_preview_entries_continue(
+    object: JsObject,
+    iterator: JsObject,
+    mut values: Vec<JsValue>,
+    with_constructor: bool,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let next = iterator.get(js_string!("next"), context)?;
+    let Some(next) = next.as_callable() else {
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
+    };
+    loop {
+        match next.call_interruptible(&JsValue::from(iterator.clone()), &[], context)? {
+            InterruptibleCallOutcome::Complete(step) => {
+                let Some(step) = step.as_object() else {
+                    return node_util_preview_entries_finalize(
+                        &object,
+                        values,
+                        with_constructor,
+                        context,
+                    );
+                };
+                if step.get(js_string!("done"), context)?.to_boolean() {
+                    return node_util_preview_entries_finalize(
+                        &object,
+                        values,
+                        with_constructor,
+                        context,
+                    );
+                }
+                values.push(step.get(js_string!("value"), context)?);
+            }
+            InterruptibleCallOutcome::Suspend(continuation) => {
+                return Ok(NativeFunctionResult::suspend_with_copy_closure(
+                    node_resume_util_preview_entries,
+                    NodeUtilPreviewEntriesResume {
+                        continuation,
+                        object,
+                        iterator,
+                        values,
+                        with_constructor,
+                    },
+                ));
+            }
+        }
+    }
+}
+
+fn node_resume_util_preview_entries(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeUtilPreviewEntriesResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(step) => {
+            let mut values = capture.values.clone();
+            if let Some(step) = step.as_object() {
+                if !step
+                    .get(js_string!("done"), context)?
+                    .to_boolean()
+                {
+                    values.push(
+                        step.get(js_string!("value"), context)?,
+                    );
+                    return node_util_preview_entries_continue(
+                        capture.object.clone(),
+                        capture.iterator.clone(),
+                        values,
+                        capture.with_constructor,
+                        context,
+                    );
+                }
+            }
+            node_util_preview_entries_finalize(
+                &capture.object,
+                values,
+                capture.with_constructor,
+                context,
+            )
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_preview_entries,
+                NodeUtilPreviewEntriesResume {
+                    continuation,
+                    object: capture.object.clone(),
+                    iterator: capture.iterator.clone(),
+                    values: capture.values.clone(),
+                    with_constructor: capture.with_constructor,
+                },
+            ),
+        ),
+    }
+}
+
+fn node_resume_util_preview_entries_start(
+    completion: boa_engine::vm::CompletionRecord,
+    capture: &NodeUtilPreviewEntriesStartResume,
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    context.install_interruptible_resume(capture.continuation.clone());
+    match context.resume_interruptible_with(completion)? {
+        InterruptibleCallOutcome::Complete(iterator) => {
+            let Some(iterator) = iterator.as_object() else {
+                return Ok(NativeFunctionResult::complete(JsValue::undefined()));
+            };
+            node_util_preview_entries_continue(
+                capture.object.clone(),
+                iterator.clone(),
+                Vec::new(),
+                capture.with_constructor,
+                context,
+            )
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => Ok(
+            NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_preview_entries_start,
+                NodeUtilPreviewEntriesStartResume {
+                    continuation,
+                    object: capture.object.clone(),
+                    with_constructor: capture.with_constructor,
+                },
+            ),
+        ),
+    }
+}
+
+fn node_util_preview_entries(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<NativeFunctionResult> {
+    let Some(object) = args.first().and_then(JsValue::as_object) else {
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
+    };
+    let entries_method = object.get(js_string!("entries"), context)?;
+    let Some(entries_method) = entries_method.as_callable() else {
+        return Ok(NativeFunctionResult::complete(JsValue::undefined()));
+    };
+    let with_constructor = args.len() > 1;
+    match entries_method.call_interruptible(&JsValue::from(object.clone()), &[], context)? {
+        InterruptibleCallOutcome::Complete(iterator) => {
+            let Some(iterator) = iterator.as_object() else {
+                return Ok(NativeFunctionResult::complete(JsValue::undefined()));
+            };
+            node_util_preview_entries_continue(
+                object.clone(),
+                iterator.clone(),
+                Vec::new(),
+                with_constructor,
+                context,
+            )
+        }
+        InterruptibleCallOutcome::Suspend(continuation) => {
+            Ok(NativeFunctionResult::suspend_with_copy_closure(
+                node_resume_util_preview_entries_start,
+                NodeUtilPreviewEntriesStartResume {
+                    continuation,
+                    object: object.clone(),
+                    with_constructor,
+                },
+            ))
+        }
+    }
 }
 
 fn node_util_get_caller_location(
@@ -25193,14 +26508,8 @@ fn node_uv_get_error_map(
 }
 
 fn node_make_js_map(context: &mut Context) -> Result<JsObject, SandboxError> {
-    context
-        .eval(Source::from_bytes(b"new Map()"))
-        .map_err(sandbox_execution_error)?
-        .as_object()
-        .ok_or_else(|| SandboxError::Execution {
-            entrypoint: "<node-runtime>".to_string(),
-            message: "failed to allocate Map".to_string(),
-        })
+    let map = JsMap::new(context);
+    Ok((*map).clone())
 }
 
 fn node_js_map_set(
@@ -25209,11 +26518,9 @@ fn node_js_map_set(
     value: JsValue,
     context: &mut Context,
 ) -> Result<(), JsError> {
-    let set = map
-        .get(js_string!("set"), context)?
-        .as_callable()
-        .ok_or_else(|| JsNativeError::typ().with_message("Map.set is not callable"))?;
-    set.call(&JsValue::from(map.clone()), &[key, value], context)?;
+    let map = JsMap::from_object(map.clone())
+        .map_err(|_| JsNativeError::typ().with_message("Map.set receiver must be a Map"))?;
+    map.set(key, value, context)?;
     Ok(())
 }
 

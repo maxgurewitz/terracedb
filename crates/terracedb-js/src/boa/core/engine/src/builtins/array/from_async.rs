@@ -6,7 +6,7 @@ use crate::builtins::iterable::IteratorRecord;
 use crate::builtins::promise::ResolvingFunctions;
 use crate::error::PanicError;
 use crate::native_function::{CoroutineBranch, CoroutineState, NativeCoroutine};
-use crate::object::{JsFunction, JsPromise};
+use crate::object::{InterruptibleCallOutcome, JsFunction, JsPromise};
 use crate::vm::CompletionRecord;
 use crate::{
     Context, JsArgs, JsError, JsExpect, JsNativeError, JsObject, JsResult, JsSymbol, JsValue,
@@ -89,7 +89,16 @@ impl Array {
                 // iv. If IsConstructor(C) is true, then
                 let a = if let Some(c) = this.as_constructor() {
                     // 1. Let A be ? Construct(C, « 𝔽(len) »).
-                    c.construct(&[len.into()], None, context)?
+                    match c.construct_interruptible(&[len.into()], None, context)? {
+                        InterruptibleCallOutcome::Complete(object) => object,
+                        InterruptibleCallOutcome::Suspend(_) => {
+                            return Err(JsNativeError::error()
+                                .with_message(
+                                    "suspendable Array.fromAsync constructor requires interruptible execution",
+                                )
+                                .into())
+                        }
+                    }
                 }
                 // v. Else,
                 else {
@@ -141,7 +150,16 @@ impl Array {
             // i. If IsConstructor(C) is true, then
             let a = if let Some(c) = this.as_constructor() {
                 // 1. Let A be ? Construct(C).
-                c.construct(&[], None, context)?
+                match c.construct_interruptible(&[], None, context)? {
+                    InterruptibleCallOutcome::Complete(object) => object,
+                    InterruptibleCallOutcome::Suspend(_) => {
+                        return Err(JsNativeError::error()
+                            .with_message(
+                                "suspendable Array.fromAsync constructor requires interruptible execution",
+                            )
+                            .into())
+                    }
+                }
             }
             // ii. Else,
             else {
@@ -195,10 +213,20 @@ impl Array {
         // i. Assert: result is a throw completion.
         if let Err(err) = result {
             // ii. Perform ! Call(promiseCapability.[[Reject]], undefined, « result.[[Value]] »).
-            resolvers
-                .reject
-                .call(&JsValue::undefined(), &[err.into_opaque(context)?], context)
-                .js_expect("resolving functions cannot fail")?;
+            match resolvers.reject.call_interruptible(
+                &JsValue::undefined(),
+                &[err.into_opaque(context)?],
+                context,
+            )? {
+                InterruptibleCallOutcome::Complete(_) => {}
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable Array.fromAsync rejection requires interruptible execution",
+                        )
+                        .into())
+                }
+            }
         }
 
         // 5. Return promiseCapability.[[Promise]].
@@ -264,10 +292,23 @@ fn from_async_iterator(
                     if k < 2u64.pow(53) - 1 {
                         // 2. Let Pk be ! ToString(𝔽(k)).
                         // 3. Let nextResult be ? Call(iteratorRecord.[[NextMethod]], iteratorRecord.[[Iterator]]).
-                        let next_result = iterator_record
+                        let next_result = match iterator_record
                             .next_method()
-                            .call(&iterator_record.iterator().clone().into(), &[], context)
-                            .branch()?;
+                            .call_interruptible(
+                                &iterator_record.iterator().clone().into(),
+                                &[],
+                                context,
+                            )?
+                        {
+                            InterruptibleCallOutcome::Complete(value) => value,
+                            InterruptibleCallOutcome::Suspend(_) => {
+                                return CoroutineState::Break(Err(JsNativeError::error()
+                                    .with_message(
+                                        "suspendable Array.fromAsync next method requires interruptible execution",
+                                    )
+                                    .into()))
+                            }
+                        };
 
                         state_machine.set(Some(AsyncIteratorStateMachine::LoopContinue {
                             a,
@@ -326,12 +367,20 @@ fn from_async_iterator(
 
                         // g. Else if result is a return completion, then
                         //        i. Perform ! Call(promiseCapability.[[Resolve]], undefined, « result.[[Value]] »).
-                        global_state
+                        match global_state
                             .resolvers
                             .resolve
-                            .call(&JsValue::undefined(), &[a.into()], context)
-                            .js_expect("resolving functions cannot fail")
-                            .branch()?;
+                            .call_interruptible(&JsValue::undefined(), &[a.into()], context)?
+                        {
+                            InterruptibleCallOutcome::Complete(_) => {}
+                            InterruptibleCallOutcome::Suspend(_) => {
+                                return CoroutineState::Break(Err(JsNativeError::error()
+                                    .with_message(
+                                        "suspendable Array.fromAsync resolve requires interruptible execution",
+                                    )
+                                    .into()))
+                            }
+                        }
 
                         return CoroutineState::Break(Ok(()));
                     }
@@ -343,12 +392,23 @@ fn from_async_iterator(
                         // a. Let mappedValue be Call(mapfn, thisArg, « nextValue, 𝔽(k) »).
                         // b. IfAbruptCloseAsyncIterator(mappedValue, iteratorRecord).
                         // https://tc39.es/proposal-array-from-async/#sec-ifabruptcloseasynciterator
-                        let mapped_value = match mapfn.call(
+                        let mapped_value = match mapfn.call_interruptible(
                             &global_state.this_arg,
                             &[next_value, k.into()],
                             context,
                         ) {
                             // 1. If value is an abrupt completion, then
+                            Ok(InterruptibleCallOutcome::Suspend(_)) => {
+                                sm = AsyncIteratorStateMachine::AsyncIteratorCloseStart {
+                                    err: JsNativeError::error()
+                                        .with_message(
+                                            "suspendable Array.fromAsync mapfn requires interruptible execution",
+                                        )
+                                        .into(),
+                                    iterator: iterator_record.iterator().clone(),
+                                };
+                                continue;
+                            }
                             Err(err) => {
                                 // a. Perform ? AsyncIteratorClose(iteratorRecord, value).
                                 // b. Return value.
@@ -359,7 +419,7 @@ fn from_async_iterator(
                                 continue;
                             }
                             // 2. Else if value is a Completion Record, set value to value.[[Value]].
-                            Ok(value) => value,
+                            Ok(InterruptibleCallOutcome::Complete(value)) => value,
                         };
                         state_machine.set(Some(AsyncIteratorStateMachine::LoopEnd {
                             a,
@@ -453,7 +513,9 @@ fn from_async_iterator(
                         return CoroutineState::Break(Err(err));
                     };
 
-                    let Ok(value) = ret.call(&iterator.into(), &[], context) else {
+                    let Ok(InterruptibleCallOutcome::Complete(value)) =
+                        ret.call_interruptible(&iterator.into(), &[], context)
+                    else {
                         return CoroutineState::Break(Err(err));
                     };
 
@@ -480,16 +542,24 @@ fn from_async_iterator(
         // i. Assert: result is a throw completion.
         CoroutineState::Break(Err(err)) => {
             // ii. Perform ! Call(promiseCapability.[[Reject]], undefined, « result.[[Value]] »).
-            global_state
+            match global_state
                 .resolvers
                 .reject
-                .call(
+                .call_interruptible(
                     &JsValue::undefined(),
                     &[err.into_opaque(context).branch()?],
                     context,
-                )
-                .js_expect("resolving functions cannot fail")
-                .branch()?;
+                )?
+            {
+                InterruptibleCallOutcome::Complete(_) => {}
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return CoroutineState::Break(Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable Array.fromAsync rejection requires interruptible execution",
+                        )
+                        .into()))
+                }
+            }
             CoroutineState::Break(Ok(()))
         }
         result => result,
@@ -555,12 +625,20 @@ fn from_array_like(
 
                         // g. Else if result is a return completion, then
                         //        i. Perform ! Call(promiseCapability.[[Resolve]], undefined, « result.[[Value]] »).
-                        global_state
+                        match global_state
                             .resolvers
                             .resolve
-                            .call(&JsValue::undefined(), &[a.into()], context)
-                            .js_expect("resolving functions cannot fail")
-                            .branch()?;
+                            .call_interruptible(&JsValue::undefined(), &[a.into()], context)?
+                        {
+                            InterruptibleCallOutcome::Complete(_) => {}
+                            InterruptibleCallOutcome::Suspend(_) => {
+                                return CoroutineState::Break(Err(JsNativeError::error()
+                                    .with_message(
+                                        "suspendable Array.fromAsync resolve requires interruptible execution",
+                                    )
+                                    .into()))
+                            }
+                        }
 
                         return CoroutineState::Break(Ok(()));
                     }
@@ -594,9 +672,18 @@ fn from_array_like(
                     // 4. If mapping is true, then
                     if let Some(mapfn) = &global_state.mapfn {
                         // a. Let mappedValue be ? Call(mapfn, thisArg, « kValue, 𝔽(k) »).
-                        let mapped_value = mapfn
-                            .call(&global_state.this_arg, &[k_value, k.into()], context)
-                            .branch()?;
+                        let mapped_value = match mapfn
+                            .call_interruptible(&global_state.this_arg, &[k_value, k.into()], context)?
+                        {
+                            InterruptibleCallOutcome::Complete(value) => value,
+                            InterruptibleCallOutcome::Suspend(_) => {
+                                return CoroutineState::Break(Err(JsNativeError::error()
+                                    .with_message(
+                                        "suspendable Array.fromAsync mapfn requires interruptible execution",
+                                    )
+                                    .into()))
+                            }
+                        };
                         state_machine.set(Some(ArrayLikeStateMachine::LoopEnd {
                             array_like,
                             a,
@@ -657,16 +744,24 @@ fn from_array_like(
         // i. Assert: result is a throw completion.
         CoroutineState::Break(Err(err)) => {
             // ii. Perform ! Call(promiseCapability.[[Reject]], undefined, « result.[[Value]] »).
-            global_state
+            match global_state
                 .resolvers
                 .reject
-                .call(
+                .call_interruptible(
                     &JsValue::undefined(),
                     &[err.into_opaque(context).branch()?],
                     context,
-                )
-                .js_expect("resolving functions cannot fail")
-                .branch()?;
+                )?
+            {
+                InterruptibleCallOutcome::Complete(_) => {}
+                InterruptibleCallOutcome::Suspend(_) => {
+                    return CoroutineState::Break(Err(JsNativeError::error()
+                        .with_message(
+                            "suspendable Array.fromAsync rejection requires interruptible execution",
+                        )
+                        .into()))
+                }
+            }
             CoroutineState::Break(Ok(()))
         }
         result => result,
