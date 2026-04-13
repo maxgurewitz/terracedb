@@ -1080,7 +1080,7 @@ impl ResourcePolicy {
         visibility_indexes: &R,
     ) -> Result<Option<EffectiveRowScopeBinding>, RowScopeResolutionError>
     where
-        R: VisibilityIndexReader,
+        R: VisibilityIndexReader + ?Sized,
     {
         let Some(binding) = self.row_scope_binding.as_ref() else {
             return Ok(None);
@@ -2611,16 +2611,36 @@ impl DeterministicPolicyEngine {
         request: &PolicyResolutionRequest,
     ) -> Result<ResolvedSessionPolicy, PolicyError> {
         let subject = self.subject_resolver.resolve_subject(&request.subject)?;
+        self.resolve_for_subject(
+            subject,
+            request.session_mode,
+            request.preset_name.clone(),
+            request.profile_name.clone(),
+        )
+    }
+
+    pub fn resolve_for_subject(
+        &self,
+        subject: PolicySubject,
+        session_mode: SessionMode,
+        preset_name: Option<String>,
+        profile_name: Option<String>,
+    ) -> Result<ResolvedSessionPolicy, PolicyError> {
         let grants = self.matching_grants(&subject);
 
-        let manifest = self.resolve_manifest(&subject, &grants, request)?;
+        let manifest = self.resolve_manifest_for_subject(
+            &subject,
+            &grants,
+            preset_name.clone(),
+            profile_name.clone(),
+        )?;
         let execution_policy =
             self.execution_policy_resolver
                 .resolve_execution_policy(&ExecutionPolicyRequest {
-                    session_mode: request.session_mode,
+                    session_mode,
                     subject_id: subject.subject_id.clone(),
-                    preset_name: request.preset_name.clone(),
-                    profile_name: request.profile_name.clone(),
+                    preset_name: preset_name.clone(),
+                    profile_name: profile_name.clone(),
                 })?;
 
         let rate_limits = manifest
@@ -2647,7 +2667,7 @@ impl DeterministicPolicyEngine {
 
         Ok(ResolvedSessionPolicy {
             subject,
-            session_mode: request.session_mode,
+            session_mode,
             manifest,
             execution_policy,
             rate_limits,
@@ -2662,13 +2682,14 @@ impl DeterministicPolicyEngine {
             .collect()
     }
 
-    fn resolve_manifest(
+    fn resolve_manifest_for_subject(
         &self,
         subject: &PolicySubject,
         grants: &[&CapabilityGrant],
-        request: &PolicyResolutionRequest,
+        preset_name: Option<String>,
+        profile_name: Option<String>,
     ) -> Result<CapabilityManifest, PolicyError> {
-        let mut bindings = if let Some(preset_name) = &request.preset_name {
+        let mut bindings = if let Some(preset_name) = &preset_name {
             let preset =
                 self.presets
                     .get(preset_name)
@@ -2683,14 +2704,14 @@ impl DeterministicPolicyEngine {
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        if let Some(profile_name) = &request.profile_name {
+        if let Some(profile_name) = &profile_name {
             let profile =
                 self.profiles
                     .get(profile_name)
                     .ok_or_else(|| PolicyError::UnknownProfile {
                         profile_name: profile_name.clone(),
                     })?;
-            if request.preset_name.as_deref() != Some(profile.preset_name.as_str()) {
+            if preset_name.as_deref() != Some(profile.preset_name.as_str()) {
                 return Err(PolicyError::ProfilePresetMismatch {
                     profile_name: profile_name.clone(),
                     preset_name: profile.preset_name.clone(),
@@ -2716,8 +2737,8 @@ impl DeterministicPolicyEngine {
 
         Ok(CapabilityManifest {
             subject: Some(subject.clone()),
-            preset_name: request.preset_name.clone(),
-            profile_name: request.profile_name.clone(),
+            preset_name,
+            profile_name,
             bindings,
             metadata: BTreeMap::new(),
         })

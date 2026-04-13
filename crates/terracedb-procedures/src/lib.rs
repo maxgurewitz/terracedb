@@ -1112,8 +1112,8 @@ pub fn invoke_published_procedure<R, V>(
     visibility_indexes: &V,
 ) -> Result<ProcedureInvocationReceipt, ProcedureError>
 where
-    R: ReviewedProcedureRuntime,
-    V: VisibilityIndexReader,
+    R: ReviewedProcedureRuntime + ?Sized,
+    V: VisibilityIndexReader + ?Sized,
 {
     let prepared = prepare_published_procedure_invocation(
         store,
@@ -1134,7 +1134,7 @@ pub fn prepare_published_procedure_invocation<V>(
     visibility_indexes: &V,
 ) -> Result<PreparedProcedureInvocation, ProcedureError>
 where
-    V: VisibilityIndexReader,
+    V: VisibilityIndexReader + ?Sized,
 {
     deployment.validate()?;
     request.publication.validate()?;
