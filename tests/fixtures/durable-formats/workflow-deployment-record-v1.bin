@@ -1,1 +1,0 @@
-{"deployment_id":"deploy:orders:prod:v2","workflow_name":"orders","environment":"production","target":{"kind":"bundle","bundle_id":"bundle:orders:v2"},"rollout":{"kind":"by-instance-hash","numerator":1,"denominator":10},"created_at_millis":11,"labels":{"channel":"canary"}}

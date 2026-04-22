@@ -1,1 +1,0 @@
-{"run_id":"run:orders:order-1:1","bundle_id":"native:orders","workflow_name":"orders","instance_id":"order-1","lifecycle":"running","last_task_id":"task:order-1:1","history_len":3,"summary":{"lifecycle":"running"},"updated_at_millis":11}

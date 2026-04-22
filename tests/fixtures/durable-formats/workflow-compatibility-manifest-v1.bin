@@ -1,1 +1,0 @@
-{"target":{"kind":"bundle","bundle_id":"bundle:orders:v2"},"workflow_name":"orders","runtime_surface":"state-outbox-timers/v1","compatible_predecessors":[{"kind":"native-registration","registration_id":"native:orders:v1"}],"upgrade_policy":{"allow_continue_as_new":true,"allow_restart_as_new":false},"created_at_millis":17,"labels":{"reason":"upgrade"}}
