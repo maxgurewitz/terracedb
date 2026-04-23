@@ -1,9 +1,7 @@
-use std::time::Duration;
-
-use super::{ActorId, Addr, ConnId, FsError, FsOpId, ObjectError, ObjectKey, ObjectOpId, WorkerId};
+use std::time::Instant;
 
 pub trait Observability {
-    fn enabled(&self, _kind: ObsEventKind) -> bool {
+    fn enabled(&self, _meta: ObsMeta) -> bool {
         panic!("Observability::enabled stub")
     }
 
@@ -13,117 +11,157 @@ pub trait Observability {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ObsEventKind {
-    NetConnectStarted,
-    NetConnectSucceeded,
-    NetConnectFailed,
-    NetReadFailed,
-    NetWriteFailed,
-    FsOpStarted,
-    FsOpFinished,
-    FsOpFailed,
-    ObjectStoreRequestStarted,
-    ObjectStoreRequestFinished,
-    ObjectStoreRequestFailed,
-    MessageSent,
-    MessageDelivered,
-    MessageQueueDepth,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ObsEvent {
-    NetConnectStarted {
-        addr: Addr,
-    },
-    NetConnectSucceeded {
-        conn: ConnId,
-        addr: Addr,
-    },
-    NetConnectFailed {
-        addr: Addr,
-        error: super::NetError,
-    },
-    NetReadFailed {
-        conn: ConnId,
-        error: super::NetError,
-    },
-    NetWriteFailed {
-        conn: ConnId,
-        error: super::NetError,
-    },
-    FsOpStarted {
-        op: FsOpId,
-        kind: FsOpKind,
-    },
-    FsOpFinished {
-        op: FsOpId,
-        kind: FsOpKind,
-        result: ResultKind,
-        elapsed: Duration,
-    },
-    FsOpFailed {
-        op: FsOpId,
-        kind: FsOpKind,
-        error: FsError,
-        elapsed: Duration,
-    },
-    ObjectStoreRequestStarted {
-        op: ObjectOpId,
-        kind: ObjectOpKind,
-        key: ObjectKey,
-    },
-    ObjectStoreRequestFinished {
-        op: ObjectOpId,
-        kind: ObjectOpKind,
-        result: ResultKind,
-        elapsed: Duration,
-    },
-    ObjectStoreRequestFailed {
-        op: ObjectOpId,
-        kind: ObjectOpKind,
-        error: ObjectError,
-        elapsed: Duration,
-    },
-    MessageSent {
-        from: ActorId,
-        to: ActorId,
-    },
-    MessageDelivered {
-        to: ActorId,
-    },
-    MessageQueueDepth {
-        worker: WorkerId,
-        depth: usize,
-    },
+pub struct ObsMeta {
+    pub level: ObsLevel,
+    pub target: &'static str,
+    pub kind: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum FsOpKind {
-    Open,
-    ReadAt,
-    WriteAt,
-    Sync,
+pub enum ObsLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObsEvent {
+    pub meta: ObsMeta,
+    pub timestamp: Instant,
+    pub attributes: ObsFields,
+    pub context: Option<ObsContext>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ObjectOpKind {
-    Put,
-    Get,
-    GetRanges,
-    StartMultipartPut,
-    UploadPart,
-    CompleteMultipartPut,
-    AbortMultipartPut,
-    Delete,
-    List,
-    ListWithDelimiter,
-    Copy,
-    Rename,
+pub struct ObsContext {
+    pub trace_id: Option<TraceId>,
+    pub span_id: Option<SpanId>,
+    pub parent_span_id: Option<SpanId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ResultKind {
-    Success,
-    Cancelled,
-    Timeout,
+pub struct TraceId;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SpanId;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObsFields {
+    pub fields: Vec<ObsField>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObsField {
+    pub key: &'static str,
+    pub value: ObsValue,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObsValue {
+    Str(String),
+    StaticStr(&'static str),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Bool(bool),
+}
+
+impl From<String> for ObsValue {
+    fn from(value: String) -> Self {
+        Self::Str(value)
+    }
+}
+
+impl From<&'static str> for ObsValue {
+    fn from(value: &'static str) -> Self {
+        Self::StaticStr(value)
+    }
+}
+
+impl From<i64> for ObsValue {
+    fn from(value: i64) -> Self {
+        Self::I64(value)
+    }
+}
+
+impl From<u64> for ObsValue {
+    fn from(value: u64) -> Self {
+        Self::U64(value)
+    }
+}
+
+impl From<f64> for ObsValue {
+    fn from(value: f64) -> Self {
+        Self::F64(value)
+    }
+}
+
+impl From<bool> for ObsValue {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
+    }
+}
+
+pub struct NoopObservability;
+
+impl Observability for NoopObservability {
+    fn enabled(&self, _meta: ObsMeta) -> bool {
+        false
+    }
+
+    fn emit(&mut self, _event: ObsEvent) {}
+}
+
+#[macro_export]
+macro_rules! obs_fields {
+    () => {
+        $crate::ObsFields {
+            fields: std::vec::Vec::new(),
+        }
+    };
+    ($($key:ident = $value:expr),+ $(,)?) => {
+        $crate::ObsFields {
+            fields: vec![
+                $(
+                    $crate::ObsField {
+                        key: stringify!($key),
+                        value: $crate::ObsValue::from($value),
+                    }
+                ),+
+            ],
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! observe {
+    (
+        $env:expr,
+        level: $level:expr,
+        target: $target:expr,
+        kind: $kind:expr,
+        { $($fields:tt)* }
+    ) => {{
+        #[cfg(feature = "observability")]
+        {
+            let meta = $crate::ObsMeta {
+                level: $level,
+                target: $target,
+                kind: $kind,
+            };
+
+            if $env.observability().enabled(meta) {
+                let timestamp = $env.clock().now();
+
+                $env.observability().emit($crate::ObsEvent {
+                    meta,
+                    timestamp,
+                    attributes: $crate::obs_fields! { $($fields)* },
+                    context: None,
+                });
+            }
+        }
+    }};
 }

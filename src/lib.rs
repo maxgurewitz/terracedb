@@ -8,11 +8,12 @@ pub use actor::{
 };
 pub use env::{
     ActorId, Addr, ByteRange, Bytes, Clock, CompletionTarget, ConnId, CopyOptions, ETag, Entropy,
-    Env, FileHandle, Fs, FsCompletion, FsError, FsOpId, FsOpKind, GetOptions, GetResult,
-    ListResult, ListenerId, Msg, MultipartUploadId, Net, NetCompletion, NetError, NetOpId,
+    Env, FileHandle, Fs, FsCompletion, FsError, FsOpId, GetOptions, GetResult, ListResult,
+    ListenerId, Msg, MultipartUploadId, Net, NetCompletion, NetError, NetOpId, NoopObservability,
     ObjectAttributes, ObjectCompletion, ObjectError, ObjectKey, ObjectMeta, ObjectOpId,
-    ObjectOpKind, ObjectPrefix, ObjectStore, ObjectTag, ObsEvent, ObsEventKind, Observability,
-    OpId, OpenOptions, PartNumber, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    RenameOptions, ResultKind, Task, TimerId, Timers, UploadedPart, WorkerId,
+    ObjectPrefix, ObjectStore, ObjectTag, ObsContext, ObsEvent, ObsField, ObsFields, ObsLevel,
+    ObsMeta, ObsValue, Observability, OpId, OpenOptions, PartNumber, PutMode, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, RenameOptions, SpanId, Task, TimerId, Timers, TraceId,
+    UploadedPart, WorkerId,
 };
 pub use error::Error;

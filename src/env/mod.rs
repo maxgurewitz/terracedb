@@ -28,7 +28,8 @@ pub use object_store::{
     PutPayload, PutResult, RenameOptions, UploadedPart,
 };
 pub use observability::{
-    FsOpKind, ObjectOpKind, ObsEvent, ObsEventKind, Observability, ResultKind,
+    NoopObservability, ObsContext, ObsEvent, ObsField, ObsFields, ObsLevel, ObsMeta, ObsValue,
+    Observability, SpanId, TraceId,
 };
 pub use task::Task;
 pub use timers::{TimerId, Timers};
