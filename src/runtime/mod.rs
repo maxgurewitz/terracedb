@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
-    ActorId, Clock, Entropy, Env, ErasedActorMsg, ErasedResponse, Error, Fs, HostReply,
-    NoopObservability, ObjectStore, Observability, RequestId, Timers, WorkerHandle, WorkerId,
-    WorkerMsg,
+    Actor, ActorId, ActorRef, Clock, Entropy, Env, ErasedActorMsg, ErasedResponse, Error, Fs,
+    HostReply, NoopObservability, ObjectStore, Observability, RequestId, Timers, WorkerHandle,
+    WorkerId, WorkerMsg,
 };
 
 mod sim;
@@ -34,7 +34,7 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn builder() -> RuntimeBuilder {
-        RuntimeBuilder
+        RuntimeBuilder { worker_count: None }
     }
 
     pub fn workers(&self) -> &[WorkerHandle] {
@@ -48,6 +48,13 @@ impl Runtime {
         msg: ErasedActorMsg,
     ) -> Result<CallHandle, Error> {
         submit_host_call(worker, actor, msg)
+    }
+
+    pub fn register_actor<A>(&self, worker: &WorkerHandle, actor: A) -> Result<ActorRef<A>, Error>
+    where
+        A: Actor<crate::worker::WorkerShardCtx> + Send + 'static,
+    {
+        worker.register_actor(actor)
     }
 
     pub fn shutdown(self) -> Result<(), Error> {
@@ -88,29 +95,47 @@ impl Shutdown for Runtime {
     }
 }
 
-pub struct RuntimeBuilder;
+pub struct RuntimeBuilder {
+    worker_count: Option<usize>,
+}
 
 impl RuntimeBuilder {
+    pub fn workers(mut self, workers: usize) -> Self {
+        self.worker_count = Some(workers);
+        self
+    }
+
     pub fn build(self) -> Result<Runtime, Error> {
-        build_real_runtime()
+        build_real_runtime(self)
     }
 }
 
-fn build_real_runtime() -> Result<Runtime, Error> {
+fn build_real_runtime(builder: RuntimeBuilder) -> Result<Runtime, Error> {
     let core_ids = core_affinity::get_core_ids().ok_or(Error::NoCores)?;
 
     if core_ids.is_empty() {
         return Err(Error::NoCores);
     }
 
-    let mut workers = Vec::with_capacity(core_ids.len());
-    let mut thread_handles = Vec::with_capacity(core_ids.len());
-    let mut init_receivers = Vec::with_capacity(core_ids.len());
+    let worker_count = builder.worker_count.unwrap_or(core_ids.len());
 
-    for (index, core_id) in core_ids.into_iter().enumerate() {
+    if worker_count == 0 {
+        return Err(Error::NoWorkers);
+    }
+
+    if worker_count > core_ids.len() {
+        return Err(Error::NoCores);
+    }
+
+    let mut workers = Vec::with_capacity(worker_count);
+    let mut thread_handles = Vec::with_capacity(worker_count);
+    let mut init_receivers = Vec::with_capacity(worker_count);
+
+    for (index, core_id) in core_ids.into_iter().take(worker_count).enumerate() {
         let worker_id = WorkerId(index);
         let env = Box::new(RealEnv::new(worker_id)?);
-        let (worker, worker_handle) = crate::worker::Worker::new(worker_id, env)?;
+        let (worker, worker_handle) = crate::worker::RealWorker::new(worker_id)?;
+        let _ = crate::worker::Worker::id(&worker);
 
         workers.push(worker_handle.clone());
 
@@ -140,7 +165,7 @@ fn build_real_runtime() -> Result<Runtime, Error> {
 
                 let _ = init_tx.send(Ok(()));
 
-                compio_rt.block_on(async move { worker.run().await })
+                compio_rt.block_on(async move { worker.run(env).await })
             })
             .map_err(|err| Error::ThreadSpawn {
                 worker: worker_id,
@@ -313,3 +338,65 @@ impl Timers for StubTimers {}
 impl Fs for StubFs {}
 impl crate::Net for StubNet {}
 impl ObjectStore for StubObjectStore {}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Actor, Env, Error};
+
+    use super::Runtime;
+    use crate::worker::WorkerShardCtx;
+
+    struct Increment;
+
+    struct CounterActor {
+        value: u64,
+    }
+
+    impl Actor<WorkerShardCtx> for CounterActor {
+        type Msg = Increment;
+        type Reply = String;
+
+        fn handle(
+            &mut self,
+            _msg: Self::Msg,
+            _ctx: &mut WorkerShardCtx,
+            _env: &mut dyn Env,
+        ) -> Result<Self::Reply, Error> {
+            self.value += 1;
+
+            Ok(format!("hello world {}", self.value))
+        }
+    }
+
+    #[test]
+    fn real_runtime_host_calls_increment_actor_counter() {
+        let runtime = Runtime::builder().workers(1).build().unwrap();
+        let actor_ref = runtime
+            .register_actor(&runtime.workers()[0], CounterActor { value: 0 })
+            .unwrap();
+
+        let mut replies = Vec::new();
+
+        for _ in 0..3 {
+            let response = runtime
+                .call(&runtime.workers()[0], actor_ref.id, Box::new(Increment))
+                .unwrap()
+                .wait()
+                .unwrap();
+            let response = *response.downcast::<String>().unwrap();
+
+            replies.push(response);
+        }
+
+        runtime.shutdown().unwrap();
+
+        assert_eq!(
+            replies,
+            vec![
+                "hello world 1".to_owned(),
+                "hello world 2".to_owned(),
+                "hello world 3".to_owned(),
+            ]
+        );
+    }
+}

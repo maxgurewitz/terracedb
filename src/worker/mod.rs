@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod actor_registry;
 mod erased;
 mod handle;
@@ -18,4 +16,5 @@ pub(crate) use inbox::WorkerInbox;
 pub use ingress::WorkerIngress;
 pub use message::WorkerMsg;
 pub(crate) use pending_response::PendingResponse;
-pub(crate) use worker::Worker;
+pub use worker::WorkerShardCtx;
+pub(crate) use worker::{ConnectionHandle, RealWorker, SimWorker, Worker};

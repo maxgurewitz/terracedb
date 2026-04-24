@@ -8,6 +8,7 @@ pub enum Error {
     ActorReplyTypeMismatch,
     CompioRuntimeInit { worker: WorkerId, source: String },
     HostReplyClosed,
+    InvalidWorkerIndex { worker: usize },
     MissingSimulationSeed,
     MissingSimulationWorkerCount,
     NoCores,

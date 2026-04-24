@@ -1,4 +1,5 @@
-use crate::{ActorId, ErasedActorMsg, Error, WorkerHandle, WorkerId};
+use crate::worker::WorkerShardCtx;
+use crate::{Actor, ActorId, ActorRef, ErasedActorMsg, Error, WorkerHandle, WorkerId};
 
 use super::{RuntimeApi, SimEnv};
 
@@ -27,6 +28,17 @@ impl SimRuntime {
         msg: ErasedActorMsg,
     ) -> Result<crate::CallHandle, Error> {
         super::submit_host_call(worker, actor, msg)
+    }
+
+    pub fn register_actor<A>(
+        &mut self,
+        worker: &WorkerHandle,
+        actor: A,
+    ) -> Result<ActorRef<A>, Error>
+    where
+        A: Actor<WorkerShardCtx> + Send + 'static,
+    {
+        self.scheduler.register_actor(worker.id(), actor)
     }
 
     pub fn run_until_idle(&mut self) -> Result<(), Error> {
@@ -92,7 +104,8 @@ fn build_sim_runtime(seed: u64, worker_count: usize) -> Result<SimRuntime, Error
     for index in 0..worker_count {
         let worker_id = WorkerId(index);
         let env = Box::new(SimEnv::new(worker_id, seed)?);
-        let (worker, worker_handle) = crate::worker::Worker::new(worker_id, env)?;
+        let (worker, worker_handle) = crate::worker::SimWorker::new(worker_id, env)?;
+        let _ = crate::worker::Worker::id(&worker);
 
         workers.push(worker_handle);
         sim_workers.push(worker);
@@ -108,22 +121,49 @@ fn build_sim_runtime(seed: u64, worker_count: usize) -> Result<SimRuntime, Error
 }
 
 struct SimScheduler {
+    #[allow(dead_code)]
     seed: u64,
-    workers: Vec<crate::worker::Worker>,
+    workers: Vec<crate::worker::SimWorker>,
 }
 
 impl SimScheduler {
-    fn new(seed: u64, workers: Vec<crate::worker::Worker>) -> Result<Self, Error> {
+    fn new(seed: u64, workers: Vec<crate::worker::SimWorker>) -> Result<Self, Error> {
         Ok(Self { seed, workers })
     }
 
     fn run_until_idle(&mut self) -> Result<(), Error> {
-        let _ = (self.seed, &mut self.workers);
+        for worker in &mut self.workers {
+            worker.process_one_message()?;
+        }
+
         Ok(())
     }
 
-    fn run_steps(&mut self, _steps: usize) -> Result<(), Error> {
-        let _ = (self.seed, &mut self.workers);
+    fn run_steps(&mut self, steps: usize) -> Result<(), Error> {
+        if self.workers.is_empty() {
+            return Ok(());
+        }
+
+        for step in 0..steps {
+            let worker = step % self.workers.len();
+            self.workers[worker].process_one_message()?;
+        }
+
         Ok(())
+    }
+
+    fn register_actor<A>(&mut self, worker: WorkerId, actor: A) -> Result<ActorRef<A>, Error>
+    where
+        A: Actor<WorkerShardCtx> + Send + 'static,
+    {
+        let worker_index = worker.0;
+        let worker = self
+            .workers
+            .get_mut(worker_index)
+            .ok_or(Error::InvalidWorkerIndex {
+                worker: worker_index,
+            })?;
+
+        Ok(worker.register_actor(actor))
     }
 }

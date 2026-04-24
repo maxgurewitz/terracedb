@@ -23,4 +23,5 @@ pub use runtime::{
 };
 pub use worker::{
     ErasedActorMsg, ErasedResponse, HostReply, WorkerHandle, WorkerIngress, WorkerMsg,
+    WorkerShardCtx,
 };
