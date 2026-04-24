@@ -1,2 +1,22 @@
+use crate::{ActorId, WorkerId};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Error;
+pub enum Error {
+    ActorNotFound { actor: ActorId },
+    ActorMessageTypeMismatch,
+    ActorRegistryPoisoned,
+    ActorReplyTypeMismatch,
+    CompioRuntimeInit { worker: WorkerId, source: String },
+    HostReplyClosed,
+    MissingSimulationSeed,
+    MissingSimulationWorkerCount,
+    NoCores,
+    NoWorkers,
+    PinFailed { worker: WorkerId },
+    ReentrantActorCall { actor: ActorId },
+    ThreadPanicked,
+    ThreadSpawn { worker: WorkerId, source: String },
+    WorkerInboxClosed,
+    WorkerInitChannelClosed,
+    WorkerSubmit,
+}

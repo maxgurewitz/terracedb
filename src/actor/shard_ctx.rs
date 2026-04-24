@@ -1,30 +1,28 @@
-use super::{Actor, ActorRef, LocalActorRef, ReplyTo, ShardId};
-use crate::{Env, Error};
+use super::{Actor, LocalActorRef, ReplyTo};
+use crate::{Env, ErasedResponse, Error, WorkerHandle, WorkerId, WorkerMsg};
 
 pub trait ShardCtx {
-    fn shard_id(&self) -> ShardId {
-        panic!("ShardCtx::shard_id stub")
+    fn worker_id(&self) -> WorkerId {
+        panic!("ShardCtx::worker_id stub")
     }
 
-    fn call_local<A: Actor>(
+    fn call_local<A: Actor<Self>>(
         &mut self,
         _actor: LocalActorRef<A>,
         _msg: A::Msg,
         _env: &mut dyn Env,
-    ) -> Result<A::Reply, Error> {
+    ) -> Result<A::Reply, Error>
+    where
+        Self: Sized,
+    {
         panic!("ShardCtx::call_local stub")
     }
 
-    fn send<A: Actor>(
-        &mut self,
-        _actor: ActorRef<A>,
-        _msg: A::Msg,
-        _reply_to: Option<ReplyTo<A::Reply>>,
-    ) -> Result<(), Error> {
-        panic!("ShardCtx::send stub")
+    fn send_remote(&mut self, _worker: WorkerHandle, _msg: WorkerMsg) -> Result<(), Error> {
+        panic!("ShardCtx::send_remote stub")
     }
 
-    fn reply<R>(&mut self, _reply_to: ReplyTo<R>, _value: R) -> Result<(), Error> {
+    fn reply(&mut self, _reply_to: ReplyTo, _response: ErasedResponse) -> Result<(), Error> {
         panic!("ShardCtx::reply stub")
     }
 }

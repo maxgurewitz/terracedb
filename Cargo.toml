@@ -8,3 +8,5 @@ observability = []
 
 [dependencies]
 compio = "0.18.0"
+core_affinity = "0.8.3"
+flume = "0.12.0"

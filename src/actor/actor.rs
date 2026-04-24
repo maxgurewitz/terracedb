@@ -1,11 +1,11 @@
 use super::ShardCtx;
 use crate::{Env, Error};
 
-pub trait Actor {
-    type Msg;
-    type Reply;
+pub trait Actor<C: ShardCtx> {
+    type Msg: Send + 'static;
+    type Reply: Send + 'static;
 
-    fn handle<C: ShardCtx + ?Sized>(
+    fn handle(
         &mut self,
         _msg: Self::Msg,
         _ctx: &mut C,

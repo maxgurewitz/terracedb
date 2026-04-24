@@ -18,7 +18,7 @@ pub use completion::{CompletionTarget, OpId};
 pub use entropy::Entropy;
 pub use env::Env;
 pub use fs::{FileHandle, Fs, FsCompletion, FsError, FsOpId, OpenOptions};
-pub use ids::{ActorId, WorkerId};
+pub use ids::{ActorId, LocalActorId, RequestId, WorkerId};
 pub use message::Msg;
 pub use net::{Addr, ConnId, ListenerId, Net, NetCompletion, NetError, NetOpId};
 pub use object_store::{

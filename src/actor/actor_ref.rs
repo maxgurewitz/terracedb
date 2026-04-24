@@ -1,23 +1,28 @@
 use std::marker::PhantomData;
 
-use super::{Actor, LocalActorId, RemoteActorId, ShardId};
+use super::{LocalActorId, RemoteActorId, ShardId};
+use crate::{ActorId, WorkerId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LocalActorRef<A: Actor> {
+pub struct LocalActorRef<A> {
     pub id: LocalActorId,
-    pub actor: PhantomData<fn() -> A>,
+    pub _marker: PhantomData<fn() -> A>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ActorRef<A: Actor> {
-    pub location: Location,
-    pub actor: PhantomData<fn() -> A>,
+pub struct ActorRef<A> {
+    pub id: ActorId,
+    pub _marker: PhantomData<fn() -> A>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Location {
     Local(LocalActorId),
     Remote {
+        worker: WorkerId,
+        actor: RemoteActorId,
+    },
+    Shard {
         shard: ShardId,
         actor: RemoteActorId,
     },

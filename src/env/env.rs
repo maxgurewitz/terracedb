@@ -1,6 +1,6 @@
 use super::{Clock, Entropy, Fs, Net, ObjectStore, Observability, Timers};
 
-pub trait Env {
+pub trait Env: Send {
     fn observability(&mut self) -> &mut dyn Observability {
         panic!("Env::observability stub")
     }
