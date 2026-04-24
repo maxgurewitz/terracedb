@@ -132,11 +132,17 @@ impl SimScheduler {
     }
 
     fn run_until_idle(&mut self) -> Result<(), Error> {
-        for worker in &mut self.workers {
-            worker.process_one_message()?;
-        }
+        loop {
+            let mut made_progress = false;
 
-        Ok(())
+            for worker in &mut self.workers {
+                made_progress |= worker.process_one_message()?;
+            }
+
+            if !made_progress {
+                return Ok(());
+            }
+        }
     }
 
     fn run_steps(&mut self, steps: usize) -> Result<(), Error> {
@@ -146,7 +152,7 @@ impl SimScheduler {
 
         for step in 0..steps {
             let worker = step % self.workers.len();
-            self.workers[worker].process_one_message()?;
+            let _ = self.workers[worker].process_one_message()?;
         }
 
         Ok(())

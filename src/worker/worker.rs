@@ -83,13 +83,13 @@ impl WorkerCore {
             .insert(request_id, PendingResponse::Connection(conn));
     }
 
-    fn process_one_message(&mut self, env: &mut dyn Env) -> Result<(), Error> {
+    fn process_one_message(&mut self, env: &mut dyn Env) -> Result<bool, Error> {
         let Some(msg) = self.inbox.try_recv()? else {
-            return Ok(());
+            return Ok(false);
         };
 
         let _ = self.handle_envelope(msg, env)?;
-        Ok(())
+        Ok(true)
     }
 
     fn handle_envelope(
@@ -246,7 +246,7 @@ impl SimWorker {
         self.core.register_actor(actor)
     }
 
-    pub(crate) fn process_one_message(&mut self) -> Result<(), Error> {
+    pub(crate) fn process_one_message(&mut self) -> Result<bool, Error> {
         self.core.process_one_message(self.env.as_mut())
     }
 }

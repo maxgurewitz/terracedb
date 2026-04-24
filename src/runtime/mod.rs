@@ -343,7 +343,7 @@ impl ObjectStore for StubObjectStore {}
 mod tests {
     use crate::{Actor, Env, Error};
 
-    use super::Runtime;
+    use super::{Runtime, SimRuntime};
     use crate::worker::WorkerShardCtx;
 
     struct Increment;
@@ -396,6 +396,50 @@ mod tests {
                 "hello world 1".to_owned(),
                 "hello world 2".to_owned(),
                 "hello world 3".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sim_runtime_host_calls_increment_actor_counters_on_two_workers() {
+        let mut runtime = SimRuntime::builder()
+            .seed(12345)
+            .workers(2)
+            .build()
+            .unwrap();
+        let worker_0 = runtime.workers()[0].clone();
+        let worker_1 = runtime.workers()[1].clone();
+        let actor_0 = runtime
+            .register_actor(&worker_0, CounterActor { value: 0 })
+            .unwrap();
+        let actor_1 = runtime
+            .register_actor(&worker_1, CounterActor { value: 0 })
+            .unwrap();
+
+        let call_0 = runtime
+            .call(&worker_0, actor_0.id, Box::new(Increment))
+            .unwrap();
+        let call_1 = runtime
+            .call(&worker_1, actor_1.id, Box::new(Increment))
+            .unwrap();
+        let call_2 = runtime
+            .call(&worker_1, actor_1.id, Box::new(Increment))
+            .unwrap();
+
+        runtime.run_until_idle().unwrap();
+
+        let replies = vec![
+            *call_0.wait().unwrap().downcast::<String>().unwrap(),
+            *call_1.wait().unwrap().downcast::<String>().unwrap(),
+            *call_2.wait().unwrap().downcast::<String>().unwrap(),
+        ];
+
+        assert_eq!(
+            replies,
+            vec![
+                "hello world 1".to_owned(),
+                "hello world 1".to_owned(),
+                "hello world 2".to_owned(),
             ]
         );
     }
