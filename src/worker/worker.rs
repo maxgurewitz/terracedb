@@ -2,13 +2,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    Actor, ActorId, ActorRef, Env, Error, FsCompletion, LocalActorId, LocalActorRef, NetCompletion,
-    ObjectCompletion, ReplyTo, RequestId, ShardCtx, TimerId, WorkerHandle, WorkerId,
+    Actor, ActorId, ActorRef, CompletionTarget, Env, Error, FsCompletion, LocalActorId,
+    LocalActorRef, NetCompletion, ObjectCompletion, OpId, ReplyTo, RequestId, ShardCtx,
+    TimerCompletion, TimerId, WorkerHandle, WorkerId,
 };
 
 use super::{
     ErasedActorMsg, ErasedResponse, PendingResponse, WorkerInbox, WorkerMsg,
-    actor_registry::ActorRegistry, message::WorkerEnvelope,
+    actor_registry::ActorRegistry,
+    message::{DeferredResponse, WorkerEnvelope},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -34,6 +36,7 @@ pub(super) struct WorkerCore {
     registry: Arc<Mutex<ActorRegistry<WorkerShardCtx>>>,
     inbox: WorkerInbox,
     pending_requests: HashMap<RequestId, PendingResponse>,
+    pending_timer_requests: HashMap<TimerId, RequestId>,
 }
 
 impl WorkerCore {
@@ -45,6 +48,7 @@ impl WorkerCore {
             registry: Arc::new(Mutex::new(ActorRegistry::new(id))),
             inbox,
             pending_requests: HashMap::new(),
+            pending_timer_requests: HashMap::new(),
         };
 
         Ok((worker, handle))
@@ -121,7 +125,7 @@ impl WorkerCore {
                     .insert(request_id, PendingResponse::Host(reply_to));
 
                 let response = self.dispatch_actor(actor, msg, env)?;
-                self.finish_request(request_id, response)?;
+                self.handle_host_response(request_id, response)?;
             }
             WorkerMsg::RequestDone {
                 request_id,
@@ -130,16 +134,16 @@ impl WorkerCore {
                 self.finish_request(request_id, response)?;
             }
             WorkerMsg::NetCompletion(completion) => {
-                self.dispatch_completion(Completion::Net(completion))?;
+                self.dispatch_completion(Completion::Net(completion), env)?;
             }
             WorkerMsg::FsCompletion(completion) => {
-                self.dispatch_completion(Completion::Fs(completion))?;
+                self.dispatch_completion(Completion::Fs(completion), env)?;
             }
             WorkerMsg::ObjectStoreCompletion(completion) => {
-                self.dispatch_completion(Completion::ObjectStore(completion))?;
+                self.dispatch_completion(Completion::ObjectStore(completion), env)?;
             }
-            WorkerMsg::TimerFired(timer) => {
-                self.dispatch_completion(Completion::Timer(timer))?;
+            WorkerMsg::TimerFired { timer_id, target } => {
+                self.dispatch_completion(Completion::Timer { timer_id, target }, env)?;
             }
             WorkerMsg::Shutdown => {
                 return Ok(true);
@@ -158,6 +162,28 @@ impl WorkerCore {
         dispatch_registry_actor(Arc::clone(&self.registry), actor, msg, None, self.id, env)
     }
 
+    fn handle_host_response(
+        &mut self,
+        request_id: RequestId,
+        response: ErasedResponse,
+    ) -> Result<(), Error> {
+        if response.is::<DeferredResponse>() {
+            let response = *response
+                .downcast::<DeferredResponse>()
+                .map_err(|_| Error::ActorReplyTypeMismatch)?;
+
+            return match response {
+                DeferredResponse::Timer(timer_id) => {
+                    self.pending_timer_requests.insert(timer_id, request_id);
+                    Ok(())
+                }
+                DeferredResponse::Ready(response) => self.finish_request(request_id, response),
+            };
+        }
+
+        self.finish_request(request_id, response)
+    }
+
     fn finish_request(
         &mut self,
         request_id: RequestId,
@@ -170,9 +196,31 @@ impl WorkerCore {
         }
     }
 
-    fn dispatch_completion(&mut self, _completion: Completion) -> Result<(), Error> {
-        _completion.touch();
-        panic!("Worker::dispatch_completion stub")
+    fn dispatch_completion(
+        &mut self,
+        _completion: Completion,
+        env: &mut dyn Env,
+    ) -> Result<(), Error> {
+        match _completion {
+            Completion::Timer { timer_id, target } => {
+                let response = dispatch_registry_timer(
+                    Arc::clone(&self.registry),
+                    TimerCompletion { timer_id, target },
+                    self.id,
+                    env,
+                )?;
+                let request_id = self
+                    .pending_timer_requests
+                    .remove(&timer_id)
+                    .ok_or(Error::HostReplyClosed)?;
+
+                self.handle_host_response(request_id, response)
+            }
+            completion => {
+                completion.touch();
+                panic!("Worker::dispatch_completion stub")
+            }
+        }
     }
 }
 
@@ -279,6 +327,23 @@ pub struct WorkerShardCtx {
     current_actor: LocalActorId,
 }
 
+impl WorkerShardCtx {
+    pub fn current_actor_id(&self) -> ActorId {
+        ActorId {
+            worker: self.worker_id,
+            local: self.current_actor,
+        }
+    }
+
+    pub fn completion_target(&self, op: OpId) -> CompletionTarget {
+        CompletionTarget {
+            worker: self.worker_id,
+            actor: self.current_actor_id(),
+            op,
+        }
+    }
+}
+
 impl ShardCtx for WorkerShardCtx {
     fn worker_id(&self) -> WorkerId {
         self.worker_id
@@ -325,7 +390,10 @@ enum Completion {
     Net(NetCompletion),
     Fs(FsCompletion),
     ObjectStore(ObjectCompletion),
-    Timer(TimerId),
+    Timer {
+        timer_id: TimerId,
+        target: CompletionTarget,
+    },
 }
 
 impl Completion {
@@ -340,8 +408,9 @@ impl Completion {
             Self::ObjectStore(completion) => {
                 let _ = completion;
             }
-            Self::Timer(timer) => {
-                let _ = timer;
+            Self::Timer { timer_id, target } => {
+                let _ = timer_id;
+                let _ = target;
             }
         }
     }
@@ -376,6 +445,40 @@ fn dispatch_registry_actor(
         current_actor: actor.local,
     };
     let result = entry.actor.handle_erased(msg, &mut ctx, env);
+
+    registry
+        .lock()
+        .map_err(|_| Error::ActorRegistryPoisoned)?
+        .insert_entry(actor.local, entry);
+
+    result
+}
+
+fn dispatch_registry_timer(
+    registry: Arc<Mutex<ActorRegistry<WorkerShardCtx>>>,
+    completion: TimerCompletion,
+    worker_id: WorkerId,
+    env: &mut dyn Env,
+) -> Result<ErasedResponse, Error> {
+    let actor = completion.target.actor;
+
+    if actor.worker != worker_id {
+        return Err(Error::ActorNotFound { actor });
+    }
+
+    let mut entry = {
+        let mut registry = registry.lock().map_err(|_| Error::ActorRegistryPoisoned)?;
+        registry
+            .remove_entry(actor.local)
+            .ok_or(Error::ActorNotFound { actor })?
+    };
+
+    let mut ctx = WorkerShardCtx {
+        worker_id,
+        registry: Arc::clone(&registry),
+        current_actor: actor.local,
+    };
+    let result = entry.actor.handle_timer_erased(completion, &mut ctx, env);
 
     registry
         .lock()

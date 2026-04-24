@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use crate::{Actor, ActorId, ActorRef, Env, Error, LocalActorId, ShardCtx, WorkerId};
+use crate::{
+    Actor, ActorId, ActorRef, Env, Error, LocalActorId, ShardCtx, TimerCompletion, WorkerId,
+};
 
 use super::{ErasedActor, ErasedActorMsg, ErasedResponse};
 
@@ -93,6 +95,18 @@ where
         let msg = *msg
             .downcast::<A::Msg>()
             .map_err(|_| Error::ActorMessageTypeMismatch)?;
+        let reply = self.actor.handle(msg, ctx, env)?;
+
+        Ok(Box::new(reply))
+    }
+
+    fn handle_timer_erased(
+        &mut self,
+        completion: TimerCompletion,
+        ctx: &mut C,
+        env: &mut dyn Env,
+    ) -> Result<ErasedResponse, Error> {
+        let msg = A::timer_fired(completion).ok_or(Error::ActorMessageTypeMismatch)?;
         let reply = self.actor.handle(msg, ctx, env)?;
 
         Ok(Box::new(reply))

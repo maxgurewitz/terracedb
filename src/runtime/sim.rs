@@ -1,11 +1,14 @@
-use crate::worker::WorkerShardCtx;
-use crate::{Actor, ActorId, ActorRef, ErasedActorMsg, Error, WorkerHandle, WorkerId};
+use std::time::Duration;
 
-use super::{RuntimeApi, SimEnv};
+use crate::worker::WorkerShardCtx;
+use crate::{Actor, ActorId, ActorRef, ErasedActorMsg, Error, WorkerHandle, WorkerId, WorkerMsg};
+
+use super::{RuntimeApi, SimEnv, SimTime};
 
 pub struct SimRuntime {
     workers: Vec<WorkerHandle>,
     scheduler: SimScheduler,
+    time: SimTime,
     seed: u64,
 }
 
@@ -14,6 +17,7 @@ impl SimRuntime {
         SimRuntimeBuilder {
             seed: None,
             workers: None,
+            start_time: None,
         }
     }
 
@@ -49,6 +53,25 @@ impl SimRuntime {
         self.scheduler.run_steps(steps)
     }
 
+    pub fn fast_forward(&mut self, duration: Duration) -> Result<(), Error> {
+        for timer in self.time.fast_forward(duration) {
+            let worker_index = timer.target.worker.0;
+            let worker = self
+                .workers
+                .get(worker_index)
+                .ok_or(Error::InvalidWorkerIndex {
+                    worker: worker_index,
+                })?;
+
+            worker.submit(WorkerMsg::TimerFired {
+                timer_id: timer.timer_id,
+                target: timer.target,
+            })?;
+        }
+
+        Ok(())
+    }
+
     pub fn seed(&self) -> u64 {
         self.seed
     }
@@ -72,6 +95,7 @@ impl RuntimeApi for SimRuntime {
 pub struct SimRuntimeBuilder {
     seed: Option<u64>,
     workers: Option<usize>,
+    start_time: Option<u64>,
 }
 
 impl SimRuntimeBuilder {
@@ -85,25 +109,32 @@ impl SimRuntimeBuilder {
         self
     }
 
+    pub fn start_time(mut self, timestamp: u64) -> Self {
+        self.start_time = Some(timestamp);
+        self
+    }
+
     pub fn build(self) -> Result<SimRuntime, Error> {
         let seed = self.seed.ok_or(Error::MissingSimulationSeed)?;
         let worker_count = self.workers.ok_or(Error::MissingSimulationWorkerCount)?;
+        let start_time = self.start_time.unwrap_or(0);
 
         if worker_count == 0 {
             return Err(Error::NoWorkers);
         }
 
-        build_sim_runtime(seed, worker_count)
+        build_sim_runtime(seed, worker_count, start_time)
     }
 }
 
-fn build_sim_runtime(seed: u64, worker_count: usize) -> Result<SimRuntime, Error> {
+fn build_sim_runtime(seed: u64, worker_count: usize, start_time: u64) -> Result<SimRuntime, Error> {
+    let time = SimTime::new(start_time);
     let mut workers = Vec::with_capacity(worker_count);
     let mut sim_workers = Vec::with_capacity(worker_count);
 
     for index in 0..worker_count {
         let worker_id = WorkerId(index);
-        let env = Box::new(SimEnv::new(worker_id, seed)?);
+        let env = Box::new(SimEnv::new(worker_id, seed, time.clone())?);
         let (worker, worker_handle) = crate::worker::SimWorker::new(worker_id, env)?;
         let _ = crate::worker::Worker::id(&worker);
 
@@ -116,6 +147,7 @@ fn build_sim_runtime(seed: u64, worker_count: usize) -> Result<SimRuntime, Error
     Ok(SimRuntime {
         workers,
         scheduler,
+        time,
         seed,
     })
 }

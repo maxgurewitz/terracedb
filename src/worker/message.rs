@@ -1,4 +1,7 @@
-use crate::{ActorId, ActorRef, FsCompletion, NetCompletion, ObjectCompletion, RequestId, TimerId};
+use crate::{
+    ActorId, ActorRef, CompletionTarget, FsCompletion, NetCompletion, ObjectCompletion, RequestId,
+    TimerId,
+};
 
 use super::worker::{WorkerCore, WorkerShardCtx};
 use super::{ErasedActorMsg, ErasedResponse, HostReply};
@@ -21,8 +24,16 @@ pub enum WorkerMsg {
     NetCompletion(NetCompletion),
     FsCompletion(FsCompletion),
     ObjectStoreCompletion(ObjectCompletion),
-    TimerFired(TimerId),
+    TimerFired {
+        timer_id: TimerId,
+        target: CompletionTarget,
+    },
     Shutdown,
+}
+
+pub enum DeferredResponse {
+    Timer(TimerId),
+    Ready(ErasedResponse),
 }
 
 pub(super) enum WorkerEnvelope {

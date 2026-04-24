@@ -1,9 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::{
-    Actor, ActorId, ActorRef, Clock, Entropy, Env, ErasedActorMsg, ErasedResponse, Error, Fs,
-    HostReply, NoopObservability, ObjectStore, Observability, RequestId, Timers, WorkerHandle,
-    WorkerId, WorkerMsg,
+    Actor, ActorId, ActorRef, Clock, CompletionTarget, Entropy, Env, ErasedActorMsg,
+    ErasedResponse, Error, Fs, HostReply, NoopObservability, ObjectStore, Observability, RequestId,
+    TimerId, Timers, WorkerHandle, WorkerId, WorkerMsg,
 };
 
 mod sim;
@@ -227,6 +229,14 @@ impl CallHandle {
     pub fn wait(self) -> Result<ErasedResponse, Error> {
         self.receiver.recv().map_err(|_| Error::HostReplyClosed)?
     }
+
+    pub fn try_wait(&self) -> Result<Option<ErasedResponse>, Error> {
+        match self.receiver.try_recv() {
+            Ok(response) => response.map(Some),
+            Err(flume::TryRecvError::Empty) => Ok(None),
+            Err(flume::TryRecvError::Disconnected) => Err(Error::HostReplyClosed),
+        }
+    }
 }
 
 pub(crate) struct RealEnv {
@@ -287,41 +297,209 @@ impl Env for RealEnv {
     }
 }
 
-pub(crate) struct SimEnv(RealEnv);
+#[derive(Clone)]
+pub(crate) struct SimTime {
+    inner: Arc<Mutex<SimTimeState>>,
+}
+
+impl SimTime {
+    pub(crate) fn new(start_unix_timestamp: u64) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SimTimeState {
+                origin: Instant::now(),
+                elapsed: Duration::ZERO,
+                start_unix_timestamp,
+                next_timer_id: 1,
+                timers: Vec::new(),
+            })),
+        }
+    }
+
+    pub(crate) fn fast_forward(&self, duration: Duration) -> Vec<DueTimer> {
+        let mut state = self.inner.lock().expect("sim time lock poisoned");
+        state.elapsed += duration;
+
+        let now = state.now();
+        let timers = std::mem::take(&mut state.timers);
+        let mut due = Vec::new();
+
+        for timer in timers {
+            if timer.at <= now {
+                due.push(DueTimer {
+                    timer_id: timer.timer_id,
+                    target: timer.target,
+                });
+            } else {
+                state.timers.push(timer);
+            }
+        }
+
+        due
+    }
+}
+
+struct SimTimeState {
+    origin: Instant,
+    elapsed: Duration,
+    start_unix_timestamp: u64,
+    next_timer_id: u64,
+    timers: Vec<ScheduledTimer>,
+}
+
+impl SimTimeState {
+    fn now(&self) -> Instant {
+        self.origin + self.elapsed
+    }
+
+    fn unix_timestamp(&self) -> u64 {
+        self.start_unix_timestamp + self.elapsed.as_secs()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledTimer {
+    timer_id: TimerId,
+    at: Instant,
+    target: CompletionTarget,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DueTimer {
+    pub(crate) timer_id: TimerId,
+    pub(crate) target: CompletionTarget,
+}
+
+struct SimClock {
+    time: SimTime,
+}
+
+impl Clock for SimClock {
+    fn now(&self) -> Instant {
+        self.time
+            .inner
+            .lock()
+            .expect("sim time lock poisoned")
+            .now()
+    }
+
+    fn unix_timestamp(&self) -> u64 {
+        self.time
+            .inner
+            .lock()
+            .expect("sim time lock poisoned")
+            .unix_timestamp()
+    }
+}
+
+struct SimTimers {
+    time: SimTime,
+}
+
+impl Timers for SimTimers {
+    fn sleep_until(&mut self, at: Instant, target: CompletionTarget) -> TimerId {
+        let mut state = self.time.inner.lock().expect("sim time lock poisoned");
+        let timer_id = TimerId(state.next_timer_id);
+        state.next_timer_id += 1;
+        state.timers.push(ScheduledTimer {
+            timer_id,
+            at,
+            target,
+        });
+
+        timer_id
+    }
+
+    fn cancel_timer(&mut self, timer: TimerId) -> bool {
+        let mut state = self.time.inner.lock().expect("sim time lock poisoned");
+        let before = state.timers.len();
+        state.timers.retain(|scheduled| scheduled.timer_id != timer);
+
+        state.timers.len() != before
+    }
+}
+
+struct SimEntropy {
+    state: u64,
+}
+
+impl SimEntropy {
+    fn new(seed: u64, worker: WorkerId) -> Self {
+        let worker_offset = (worker.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+        Self {
+            state: seed ^ worker_offset,
+        }
+    }
+}
+
+impl Entropy for SimEntropy {
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn fill_bytes(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            let bytes = self.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+}
+
+pub(crate) struct SimEnv {
+    observability: NoopObservability,
+    clock: SimClock,
+    entropy: SimEntropy,
+    timers: SimTimers,
+    fs: StubFs,
+    net: StubNet,
+    object_store: StubObjectStore,
+}
 
 impl SimEnv {
-    pub(crate) fn new(_worker: WorkerId, _seed: u64) -> Result<Self, Error> {
-        Ok(Self(RealEnv::new_stub()))
+    pub(crate) fn new(worker: WorkerId, seed: u64, time: SimTime) -> Result<Self, Error> {
+        Ok(Self {
+            observability: NoopObservability,
+            clock: SimClock { time: time.clone() },
+            entropy: SimEntropy::new(seed, worker),
+            timers: SimTimers { time },
+            fs: StubFs,
+            net: StubNet,
+            object_store: StubObjectStore,
+        })
     }
 }
 
 impl Env for SimEnv {
     fn observability(&mut self) -> &mut dyn Observability {
-        self.0.observability()
+        &mut self.observability
     }
 
     fn clock(&mut self) -> &mut dyn Clock {
-        self.0.clock()
+        &mut self.clock
     }
 
     fn entropy(&mut self) -> &mut dyn Entropy {
-        self.0.entropy()
+        &mut self.entropy
     }
 
     fn timers(&mut self) -> &mut dyn Timers {
-        self.0.timers()
+        &mut self.timers
     }
 
     fn fs(&mut self) -> &mut dyn Fs {
-        self.0.fs()
+        &mut self.fs
     }
 
     fn net(&mut self) -> &mut dyn crate::Net {
-        self.0.net()
+        &mut self.net
     }
 
     fn object_store(&mut self) -> &mut dyn ObjectStore {
-        self.0.object_store()
+        &mut self.object_store
     }
 }
 
@@ -341,16 +519,31 @@ impl ObjectStore for StubObjectStore {}
 
 #[cfg(test)]
 mod tests {
-    use crate::{Actor, Env, Error};
+    use std::time::Duration;
+
+    use crate::{Actor, Env, Error, OpId, TimerCompletion};
 
     use super::{Runtime, SimRuntime};
-    use crate::worker::WorkerShardCtx;
+    use crate::worker::{DeferredResponse, WorkerShardCtx};
 
     struct Increment;
 
     struct CounterActor {
         value: u64,
     }
+
+    struct RandomNumbers {
+        count: usize,
+    }
+
+    struct RandomNumbersActor;
+
+    enum SleepForTimestampMsg {
+        Start,
+        TimerFired(TimerCompletion),
+    }
+
+    struct SleepForTimestampActor;
 
     impl Actor<WorkerShardCtx> for CounterActor {
         type Msg = Increment;
@@ -365,6 +558,54 @@ mod tests {
             self.value += 1;
 
             Ok(format!("hello world {}", self.value))
+        }
+    }
+
+    impl Actor<WorkerShardCtx> for RandomNumbersActor {
+        type Msg = RandomNumbers;
+        type Reply = Vec<u64>;
+
+        fn handle(
+            &mut self,
+            msg: Self::Msg,
+            _ctx: &mut WorkerShardCtx,
+            env: &mut dyn Env,
+        ) -> Result<Self::Reply, Error> {
+            Ok((0..msg.count).map(|_| env.entropy().next_u64()).collect())
+        }
+    }
+
+    impl Actor<WorkerShardCtx> for SleepForTimestampActor {
+        type Msg = SleepForTimestampMsg;
+        type Reply = DeferredResponse;
+
+        fn handle(
+            &mut self,
+            msg: Self::Msg,
+            ctx: &mut WorkerShardCtx,
+            env: &mut dyn Env,
+        ) -> Result<Self::Reply, Error> {
+            match msg {
+                SleepForTimestampMsg::Start => {
+                    let wake_at = env.clock().now() + Duration::from_secs(5 * 60);
+                    let timer_id = env
+                        .timers()
+                        .sleep_until(wake_at, ctx.completion_target(OpId));
+
+                    Ok(DeferredResponse::Timer(timer_id))
+                }
+                SleepForTimestampMsg::TimerFired(completion) => {
+                    let _ = completion;
+
+                    Ok(DeferredResponse::Ready(Box::new(
+                        env.clock().unix_timestamp(),
+                    )))
+                }
+            }
+        }
+
+        fn timer_fired(completion: TimerCompletion) -> Option<Self::Msg> {
+            Some(SleepForTimestampMsg::TimerFired(completion))
         }
     }
 
@@ -442,5 +683,69 @@ mod tests {
                 "hello world 2".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn sim_runtime_entropy_is_deterministic_from_seed() {
+        let mut runtime = SimRuntime::builder()
+            .seed(12345)
+            .workers(1)
+            .build()
+            .unwrap();
+        let worker = runtime.workers()[0].clone();
+        let actor_ref = runtime.register_actor(&worker, RandomNumbersActor).unwrap();
+        let call = runtime
+            .call(&worker, actor_ref.id, Box::new(RandomNumbers { count: 4 }))
+            .unwrap();
+
+        runtime.run_until_idle().unwrap();
+
+        let values = *call.wait().unwrap().downcast::<Vec<u64>>().unwrap();
+
+        assert_eq!(
+            values,
+            vec![
+                2_454_886_589_211_414_944,
+                3_778_200_017_661_327_597,
+                2_205_171_434_679_333_405,
+                3_248_800_117_070_709_450,
+            ]
+        );
+    }
+
+    #[test]
+    fn sim_runtime_fast_forwards_synthetic_time_for_timer_backed_call() {
+        let start_time = 1_700_000_000;
+        let partial_wait = Duration::from_secs(2 * 60);
+        let remaining_wait = Duration::from_secs(3 * 60);
+        let total_wait = partial_wait + remaining_wait;
+        let mut runtime = SimRuntime::builder()
+            .seed(12345)
+            .workers(1)
+            .start_time(start_time)
+            .build()
+            .unwrap();
+        let worker = runtime.workers()[0].clone();
+        let actor_ref = runtime
+            .register_actor(&worker, SleepForTimestampActor)
+            .unwrap();
+        let call = runtime
+            .call(&worker, actor_ref.id, Box::new(SleepForTimestampMsg::Start))
+            .unwrap();
+
+        runtime.run_until_idle().unwrap();
+        assert!(call.try_wait().unwrap().is_none());
+
+        runtime.fast_forward(partial_wait).unwrap();
+        runtime.run_until_idle().unwrap();
+        assert!(call.try_wait().unwrap().is_none());
+
+        runtime.fast_forward(remaining_wait).unwrap();
+        runtime.run_until_idle().unwrap();
+
+        let response = call.try_wait().unwrap().expect("timer response");
+        let timestamp = *response.downcast::<u64>().unwrap();
+
+        assert_eq!(timestamp, start_time + total_wait.as_secs());
     }
 }

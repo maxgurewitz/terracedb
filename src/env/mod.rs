@@ -32,4 +32,4 @@ pub use observability::{
     Observability, SpanId, TraceId,
 };
 pub use task::Task;
-pub use timers::{TimerId, Timers};
+pub use timers::{TimerCompletion, TimerId, Timers};

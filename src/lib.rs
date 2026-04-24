@@ -15,13 +15,13 @@ pub use env::{
     ObjectOpId, ObjectPrefix, ObjectStore, ObjectTag, ObsContext, ObsEvent, ObsField, ObsFields,
     ObsLevel, ObsMeta, ObsValue, Observability, OpId, OpenOptions, PartNumber, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, RequestId, SpanId, Task,
-    TimerId, Timers, TraceId, UploadedPart, WorkerId,
+    TimerCompletion, TimerId, Timers, TraceId, UploadedPart, WorkerId,
 };
 pub use error::Error;
 pub use runtime::{
     CallHandle, Runtime, RuntimeApi, RuntimeBuilder, Shutdown, SimRuntime, SimRuntimeBuilder,
 };
 pub use worker::{
-    ErasedActorMsg, ErasedResponse, HostReply, WorkerHandle, WorkerIngress, WorkerMsg,
-    WorkerShardCtx,
+    DeferredResponse, ErasedActorMsg, ErasedResponse, HostReply, WorkerHandle, WorkerIngress,
+    WorkerMsg, WorkerShardCtx,
 };

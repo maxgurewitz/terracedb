@@ -14,7 +14,7 @@ pub use handle::WorkerHandle;
 pub use host_reply::HostReply;
 pub(crate) use inbox::WorkerInbox;
 pub use ingress::WorkerIngress;
-pub use message::WorkerMsg;
+pub use message::{DeferredResponse, WorkerMsg};
 pub(crate) use pending_response::PendingResponse;
 pub use worker::WorkerShardCtx;
 pub(crate) use worker::{ConnectionHandle, RealWorker, SimWorker, Worker};
