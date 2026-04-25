@@ -1357,6 +1357,52 @@ mod tests {
     }
 
     #[test]
+    fn js_gc_collects_cycle_with_owned_child_object() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) =
+            create_pool_runtime_with_policy(&mut sim, GcPolicy::ManualOnly)?;
+        let baseline = heap_stats(&mut sim, &worker, &pool, runtime_id)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                {
+                    let a = {};
+                    let b = {};
+                    let child = {};
+
+                    a.b = b;
+                    b.a = a;
+                    a.child = child;
+                }
+
+                console.log(1);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        let before_gc = heap_stats(&mut sim, &worker, &pool, runtime_id)?;
+        assert!(before_gc.allocated_objects > baseline.allocated_objects);
+
+        let freed = force_gc(&mut sim, &worker, &pool, runtime_id)?;
+        assert!(freed >= 3);
+
+        let after_gc = heap_stats(&mut sim, &worker, &pool, runtime_id)?;
+        assert_eq!(after_gc.allocated_objects, baseline.allocated_objects);
+        assert_eq!(after_gc.allocated_bytes, baseline.allocated_bytes);
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"1\n");
+
+        Ok(())
+    }
+
+    #[test]
     fn js_gc_preserves_externally_reachable_graph() -> Result<(), Error> {
         let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
         let (worker, pool, runtime_id, output_rx) =

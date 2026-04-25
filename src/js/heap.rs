@@ -1,4 +1,7 @@
-use std::{collections::HashMap, mem};
+use std::{
+    collections::{HashMap, HashSet},
+    mem,
+};
 
 use bytes::Bytes;
 
@@ -39,6 +42,9 @@ pub struct JsHeap {
     gc_objects: Vec<ObjectId>,
     zero_ref: Vec<ObjectId>,
     tmp_cycle: Vec<ObjectId>,
+    // Future weak JS references need their own side table/list here. WeakRef,
+    // FinalizationRegistry, WeakMap, and WeakSet must be processed before cycle
+    // freeing, not represented as ordinary strong child edges.
     allocated_objects: usize,
     allocated_bytes: usize,
     freed_objects: usize,
@@ -228,8 +234,11 @@ impl JsHeap {
         self.gc_runs += 1;
         self.drain_zero_ref()?;
         self.reset_gc_marks();
+        // When weak references exist, this is the point to clear dead weak
+        // entries and enqueue finalization callbacks before removing cycles.
         self.gc_decref_all()?;
         self.gc_scan_live()?;
+        self.gc_restore_cycles()?;
         let freed = self.gc_free_cycles()?;
         self.drain_zero_ref()?;
 
@@ -352,20 +361,59 @@ impl JsHeap {
         Ok(())
     }
 
+    fn gc_restore_cycles(&mut self) -> Result<(), Error> {
+        for id in self.tmp_cycle.clone() {
+            if !self.objects.contains_key(&id) {
+                continue;
+            }
+
+            self.gc_incref_children(id)?;
+        }
+
+        Ok(())
+    }
+
+    fn gc_incref_children(&mut self, id: ObjectId) -> Result<(), Error> {
+        let mut children = Vec::new();
+
+        self.object(id)?.object.visit_children(&mut |child| {
+            children.push(child);
+        });
+
+        for child in children {
+            if let Some(child_object) = self.objects.get_mut(&child) {
+                child_object.header.ref_count += 1;
+            }
+        }
+
+        Ok(())
+    }
+
     fn gc_free_cycles(&mut self) -> Result<usize, Error> {
         let candidates = mem::take(&mut self.tmp_cycle);
+        let collected = candidates
+            .into_iter()
+            .filter(|id| {
+                self.objects
+                    .get(id)
+                    .is_some_and(|object| object.header.mark != GcMark::Live)
+            })
+            .collect::<Vec<_>>();
+        let collected_set = collected.iter().copied().collect::<HashSet<_>>();
+
+        for id in &collected {
+            self.release_cycle_object_children(*id, &collected_set)?;
+        }
+
         let mut freed = 0;
 
-        for id in candidates {
-            let should_free = self
-                .objects
-                .get(&id)
-                .is_some_and(|object| object.header.mark != GcMark::Live);
+        for id in collected {
+            let Some(heap_object) = self.objects.remove(&id) else {
+                continue;
+            };
 
-            if should_free {
-                self.free_cycle_object_now(id)?;
-                freed += 1;
-            }
+            self.account_freed_object(id, heap_object.header.bytes);
+            freed += 1;
         }
 
         self.reset_gc_marks();
@@ -373,23 +421,48 @@ impl JsHeap {
         Ok(freed)
     }
 
-    fn free_cycle_object_now(&mut self, id: ObjectId) -> Result<(), Error> {
-        let HeapObject {
-            header,
-            object: _object,
-        } = self
-            .objects
-            .remove(&id)
-            .ok_or(Error::JsObjectNotFound { object: id.0 })?;
+    fn release_cycle_object_children(
+        &mut self,
+        id: ObjectId,
+        collected: &HashSet<ObjectId>,
+    ) -> Result<(), Error> {
+        let values = self.object(id)?.object.property_values();
 
-        self.account_freed_object(id, header.bytes);
+        for value in values {
+            self.release_cycle_child_value(value, collected)?;
+        }
 
-        // Do not release child JsValues here. Cycle GC already subtracted
-        // every object-to-object child edge in gc_decref_all; decrementing
-        // those edges again would corrupt refcounts.
         Ok(())
     }
 
+    fn release_cycle_child_value(
+        &mut self,
+        value: JsValue,
+        collected: &HashSet<ObjectId>,
+    ) -> Result<(), Error> {
+        let JsValue::Object(id) = value else {
+            return Ok(());
+        };
+
+        if !collected.contains(&id) {
+            return self.free_object_ref(id);
+        }
+
+        let object = self
+            .objects
+            .get_mut(&id)
+            .ok_or(Error::JsObjectNotFound { object: id.0 })?;
+
+        if object.header.ref_count == 0 {
+            return Err(Error::JsRefCountUnderflow { object: id.0 });
+        }
+
+        // The whole collected cycle is removed as a group below, so internal
+        // edges are released without recursively draining zero-ref objects.
+        object.header.ref_count -= 1;
+
+        Ok(())
+    }
     fn reset_gc_marks(&mut self) {
         for object in self.objects.values_mut() {
             object.header.mark = GcMark::None;
@@ -456,6 +529,9 @@ impl JsObject {
                 visitor(id);
             }
         }
+
+        // Do not add WeakRef/WeakMap-style edges here. This traversal is only
+        // for strong references that keep the target object alive.
     }
 
     pub fn release_children(self, heap: &mut JsHeap) -> Result<(), Error> {
@@ -470,12 +546,19 @@ impl JsObject {
 
         Ok(())
     }
+
+    fn property_values(&self) -> Vec<JsValue> {
+        self.properties.values().map(JsProperty::value).collect()
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum ObjectKind {
     Ordinary,
     HostFunction(HostFunction),
+    // If host object kinds later own JsValue children, add explicit strong and
+    // weak child traversal hooks instead of treating all host state as ordinary
+    // object properties.
 }
 
 #[derive(Debug, Clone)]
