@@ -16,7 +16,7 @@ use boa_parser::{Parser, Source};
 
 use crate::Error;
 
-use super::{BindingKind, MiniExpr, MiniProgram, MiniStmt};
+use super::{BindingKind, MiniExpr, MiniProgram, MiniStmt, Symbol, SymbolTable};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JsSpan {
@@ -43,7 +43,10 @@ pub enum JsCompileError {
     UnsupportedSyntax { feature: &'static str, span: JsSpan },
 }
 
-pub(crate) fn parse_and_lower_minijs(source: &str) -> Result<MiniProgram, Error> {
+pub(crate) fn parse_and_lower_minijs(
+    source: &str,
+    symbols: &mut SymbolTable,
+) -> Result<MiniProgram, Error> {
     let mut interner = Interner::default();
     let scope = Scope::default();
     let mut parser = Parser::new(Source::from_bytes(source));
@@ -56,7 +59,7 @@ pub(crate) fn parse_and_lower_minijs(source: &str) -> Result<MiniProgram, Error>
     let mut program = Vec::new();
 
     for item in script.statements().statements() {
-        lower_statement_list_item(item, &interner, &mut program)?;
+        lower_statement_list_item(item, &interner, symbols, &mut program)?;
     }
 
     Ok(program)
@@ -65,27 +68,31 @@ pub(crate) fn parse_and_lower_minijs(source: &str) -> Result<MiniProgram, Error>
 fn lower_statement_list_item(
     item: &StatementListItem,
     interner: &Interner,
+    symbols: &mut SymbolTable,
     program: &mut MiniProgram,
 ) -> Result<(), Error> {
     match item {
         StatementListItem::Declaration(declaration) => {
-            lower_declaration(declaration, interner, program)
+            lower_declaration(declaration, interner, symbols, program)
         }
-        StatementListItem::Statement(statement) => lower_statement(statement, interner, program),
+        StatementListItem::Statement(statement) => {
+            lower_statement(statement, interner, symbols, program)
+        }
     }
 }
 
 fn lower_declaration(
     declaration: &Declaration,
     interner: &Interner,
+    symbols: &mut SymbolTable,
     program: &mut MiniProgram,
 ) -> Result<(), Error> {
     match declaration {
         Declaration::Lexical(LexicalDeclaration::Let(list)) => {
-            lower_lexical_declaration(list, BindingKind::Let, interner, program)
+            lower_lexical_declaration(list, BindingKind::Let, interner, symbols, program)
         }
         Declaration::Lexical(LexicalDeclaration::Const(list)) => {
-            lower_lexical_declaration(list, BindingKind::Const, interner, program)
+            lower_lexical_declaration(list, BindingKind::Const, interner, symbols, program)
         }
         _ => unsupported("declaration", JsSpan::unknown()),
     }
@@ -95,11 +102,12 @@ fn lower_lexical_declaration(
     list: &VariableList,
     kind: BindingKind,
     interner: &Interner,
+    symbols: &mut SymbolTable,
     program: &mut MiniProgram,
 ) -> Result<(), Error> {
     for variable in list.as_ref() {
         let name = match variable.binding() {
-            Binding::Identifier(identifier) => identifier.to_interned_string(interner),
+            Binding::Identifier(identifier) => lower_identifier(*identifier, interner, symbols),
             Binding::Pattern(_) => {
                 return unsupported("destructuring binding", JsSpan::unknown());
             }
@@ -109,7 +117,7 @@ fn lower_lexical_declaration(
             return unsupported("lexical declaration without initializer", JsSpan::unknown());
         };
 
-        let expr = lower_expr(expr, interner)?;
+        let expr = lower_expr(expr, interner, symbols)?;
 
         program.push(match kind {
             BindingKind::Let => MiniStmt::Let { name, expr },
@@ -123,6 +131,7 @@ fn lower_lexical_declaration(
 fn lower_statement(
     statement: &Statement,
     interner: &Interner,
+    symbols: &mut SymbolTable,
     program: &mut MiniProgram,
 ) -> Result<(), Error> {
     match statement {
@@ -130,14 +139,14 @@ fn lower_statement(
             let mut body = Vec::new();
 
             for item in block.statement_list().statements() {
-                lower_statement_list_item(item, interner, &mut body)?;
+                lower_statement_list_item(item, interner, symbols, &mut body)?;
             }
 
             program.push(MiniStmt::Block(body));
             Ok(())
         }
         Statement::Expression(expr) => {
-            program.push(lower_expression_statement(expr, interner)?);
+            program.push(lower_expression_statement(expr, interner, symbols)?);
             Ok(())
         }
         Statement::Empty => Ok(()),
@@ -145,7 +154,11 @@ fn lower_statement(
     }
 }
 
-fn lower_expression_statement(expr: &Expression, interner: &Interner) -> Result<MiniStmt, Error> {
+fn lower_expression_statement(
+    expr: &Expression,
+    interner: &Interner,
+    symbols: &mut SymbolTable,
+) -> Result<MiniStmt, Error> {
     let expr = expr.flatten();
 
     if let Expression::Assign(assign) = expr {
@@ -158,8 +171,8 @@ fn lower_expression_statement(expr: &Expression, interner: &Interner) -> Result<
         };
 
         return Ok(MiniStmt::Assign {
-            name: identifier.to_interned_string(interner),
-            expr: lower_expr(assign.rhs(), interner)?,
+            name: lower_identifier(*identifier, interner, symbols),
+            expr: lower_expr(assign.rhs(), interner, symbols)?,
         });
     }
 
@@ -173,14 +186,18 @@ fn lower_expression_statement(expr: &Expression, interner: &Interner) -> Result<
         };
 
         return Ok(MiniStmt::ConsoleLog {
-            expr: lower_expr(arg, interner)?,
+            expr: lower_expr(arg, interner, symbols)?,
         });
     }
 
     unsupported("expression statement", span_of(expr))
 }
 
-fn lower_expr(expr: &Expression, interner: &Interner) -> Result<MiniExpr, Error> {
+fn lower_expr(
+    expr: &Expression,
+    interner: &Interner,
+    symbols: &mut SymbolTable,
+) -> Result<MiniExpr, Error> {
     let expr = expr.flatten();
 
     match expr {
@@ -189,21 +206,33 @@ fn lower_expr(expr: &Expression, interner: &Interner) -> Result<MiniExpr, Error>
             LiteralKind::Int(value) => Ok(MiniExpr::Number(f64::from(*value))),
             _ => unsupported("literal", span_of(expr)),
         },
-        Expression::Identifier(identifier) => {
-            Ok(MiniExpr::Ident(identifier.to_interned_string(interner)))
-        }
+        Expression::Identifier(identifier) => Ok(MiniExpr::Ident(lower_identifier(
+            *identifier,
+            interner,
+            symbols,
+        ))),
         Expression::Binary(binary) => {
             if binary.op() != BinaryOp::Arithmetic(ArithmeticOp::Add) {
                 return unsupported("binary operator", span_of(expr));
             }
 
             Ok(MiniExpr::Add(
-                Box::new(lower_expr(binary.lhs(), interner)?),
-                Box::new(lower_expr(binary.rhs(), interner)?),
+                Box::new(lower_expr(binary.lhs(), interner, symbols)?),
+                Box::new(lower_expr(binary.rhs(), interner, symbols)?),
             ))
         }
         _ => unsupported(expression_feature(expr), span_of(expr)),
     }
+}
+
+fn lower_identifier(
+    identifier: boa_ast::expression::Identifier,
+    interner: &Interner,
+    symbols: &mut SymbolTable,
+) -> Symbol {
+    let name = identifier.to_interned_string(interner);
+
+    symbols.intern(&name)
 }
 
 fn is_console_method(expr: &Expression, method: &str, interner: &Interner) -> bool {

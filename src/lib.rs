@@ -23,7 +23,7 @@ pub use js::{
     Binding, BindingKind, ChannelByteSink, ConsoleAttachment, EnvStack, JsAttachment,
     JsCompileError, JsOutputChunk, JsOutputReceiver, JsOutputSender, JsPoolMsg, JsPoolReply,
     JsRuntimeAttachment, JsRuntimeId, JsRuntimeInstance, JsRuntimePoolActor, JsRuntimePoolConfig,
-    JsSpan, JsStreamKind, JsValue, LexicalEnv, RuntimeConsole,
+    JsSpan, JsStreamKind, JsValue, LexicalEnv, RuntimeConsole, Symbol, SymbolTable,
 };
 pub use runtime::{
     CallHandle, Runtime, RuntimeApi, RuntimeBuilder, Shutdown, SimRuntime, SimRuntimeBuilder,

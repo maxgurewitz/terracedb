@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use crate::Error;
 
-use super::JsValue;
+use super::{JsValue, Symbol, SymbolTable};
 
 pub struct EnvStack {
     scopes: Vec<LexicalEnv>,
 }
 
 pub struct LexicalEnv {
-    bindings: HashMap<String, Binding>,
+    bindings: HashMap<Symbol, Binding>,
 }
 
 pub struct Binding {
@@ -30,9 +30,17 @@ impl LexicalEnv {
         }
     }
 
-    fn declare(&mut self, name: String, kind: BindingKind, value: JsValue) -> Result<(), Error> {
+    fn declare(
+        &mut self,
+        name: Symbol,
+        kind: BindingKind,
+        value: JsValue,
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
         if self.bindings.contains_key(&name) {
-            return Err(Error::JsDuplicateBinding { name });
+            return Err(Error::JsDuplicateBinding {
+                name: symbols.resolve_expect(name).to_owned(),
+            });
         }
 
         self.bindings.insert(name, Binding { kind, value });
@@ -40,12 +48,14 @@ impl LexicalEnv {
         Ok(())
     }
 
-    fn get(&self, name: &str) -> Option<JsValue> {
-        self.bindings.get(name).map(|binding| binding.value.clone())
+    fn get(&self, name: Symbol) -> Option<JsValue> {
+        self.bindings
+            .get(&name)
+            .map(|binding| binding.value.clone())
     }
 
-    fn get_mut(&mut self, name: &str) -> Option<&mut Binding> {
-        self.bindings.get_mut(name)
+    fn get_mut(&mut self, name: Symbol) -> Option<&mut Binding> {
+        self.bindings.get_mut(&name)
     }
 }
 
@@ -72,27 +82,33 @@ impl EnvStack {
 
     pub(crate) fn declare_current(
         &mut self,
-        name: String,
+        name: Symbol,
         kind: BindingKind,
         value: JsValue,
+        symbols: &SymbolTable,
     ) -> Result<(), Error> {
         self.scopes
             .last_mut()
             .expect("env stack always has a root scope")
-            .declare(name, kind, value)
+            .declare(name, kind, value, symbols)
     }
 
-    pub(crate) fn lookup(&self, name: &str) -> Result<JsValue, Error> {
+    pub(crate) fn lookup(&self, name: Symbol, symbols: &SymbolTable) -> Result<JsValue, Error> {
         self.scopes
             .iter()
             .rev()
             .find_map(|scope| scope.get(name))
             .ok_or_else(|| Error::JsBindingNotFound {
-                name: name.to_owned(),
+                name: symbols.resolve_expect(name).to_owned(),
             })
     }
 
-    pub(crate) fn assign(&mut self, name: &str, value: JsValue) -> Result<(), Error> {
+    pub(crate) fn assign(
+        &mut self,
+        name: Symbol,
+        value: JsValue,
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
         for scope in self.scopes.iter_mut().rev() {
             let Some(binding) = scope.get_mut(name) else {
                 continue;
@@ -100,7 +116,7 @@ impl EnvStack {
 
             if binding.kind == BindingKind::Const {
                 return Err(Error::JsAssignToConst {
-                    name: name.to_owned(),
+                    name: symbols.resolve_expect(name).to_owned(),
                 });
             }
 
@@ -110,7 +126,7 @@ impl EnvStack {
         }
 
         Err(Error::JsBindingNotFound {
-            name: name.to_owned(),
+            name: symbols.resolve_expect(name).to_owned(),
         })
     }
 }

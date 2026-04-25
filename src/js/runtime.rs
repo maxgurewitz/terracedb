@@ -9,11 +9,12 @@ use crate::Error;
 
 use super::{
     BindingKind, EnvStack, JsRuntimeAttachment, JsRuntimeId, JsValue, MiniExpr, MiniProgram,
-    MiniStmt, RuntimeConsole, parse_and_lower_minijs,
+    MiniStmt, RuntimeConsole, SymbolTable, parse_and_lower_minijs,
 };
 
 pub struct JsRuntimeInstance {
     id: JsRuntimeId,
+    symbols: SymbolTable,
     env_stack: EnvStack,
     attachments: HashMap<TypeId, Box<dyn Any + Send>>,
 }
@@ -22,6 +23,7 @@ impl JsRuntimeInstance {
     pub(crate) fn new(id: JsRuntimeId) -> Self {
         Self {
             id,
+            symbols: SymbolTable::new(),
             env_stack: EnvStack::new(),
             attachments: HashMap::new(),
         }
@@ -65,7 +67,7 @@ impl JsRuntimeInstance {
     }
 
     pub fn eval(&mut self, source: &str) -> Result<JsValue, Error> {
-        let program = parse_and_lower_minijs(source)?;
+        let program = parse_and_lower_minijs(source, &mut self.symbols)?;
         self.eval_program(&program)
     }
 
@@ -83,16 +85,16 @@ impl JsRuntimeInstance {
             MiniStmt::Let { name, expr } => {
                 let value = self.eval_expr(expr)?;
                 self.env_stack
-                    .declare_current(name.clone(), BindingKind::Let, value)
+                    .declare_current(*name, BindingKind::Let, value, &self.symbols)
             }
             MiniStmt::Const { name, expr } => {
                 let value = self.eval_expr(expr)?;
                 self.env_stack
-                    .declare_current(name.clone(), BindingKind::Const, value)
+                    .declare_current(*name, BindingKind::Const, value, &self.symbols)
             }
             MiniStmt::Assign { name, expr } => {
                 let value = self.eval_expr(expr)?;
-                self.env_stack.assign(name, value)
+                self.env_stack.assign(*name, value, &self.symbols)
             }
             MiniStmt::ConsoleLog { expr } => {
                 let value = self.eval_expr(expr)?;
@@ -123,7 +125,7 @@ impl JsRuntimeInstance {
     fn eval_expr(&self, expr: &MiniExpr) -> Result<JsValue, Error> {
         match expr {
             MiniExpr::Number(value) => Ok(JsValue::Number(*value)),
-            MiniExpr::Ident(name) => self.env_stack.lookup(name),
+            MiniExpr::Ident(name) => self.env_stack.lookup(*name, &self.symbols),
             MiniExpr::Add(lhs, rhs) => {
                 let lhs = self.eval_expr(lhs)?;
                 let rhs = self.eval_expr(rhs)?;
