@@ -1778,6 +1778,68 @@ mod tests {
     }
 
     #[test]
+    fn js_gc_releases_captured_block_after_closure_becomes_unreachable() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) =
+            create_pool_runtime_with_policy(&mut sim, GcPolicy::ManualOnly)?;
+        let baseline = heap_stats(&mut sim, &worker, &pool, runtime_id)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let f = null;
+
+                {
+                    let obj = {};
+
+                    function captureObj() {
+                        return obj;
+                    }
+
+                    f = captureObj;
+                }
+
+                console.log(f());
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        let retained = heap_stats(&mut sim, &worker, &pool, runtime_id)?;
+        assert!(retained.allocated_objects > baseline.allocated_objects);
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                f = null;
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        force_gc(&mut sim, &worker, &pool, runtime_id)?;
+
+        let released = heap_stats(&mut sim, &worker, &pool, runtime_id)?;
+        assert_eq!(released.allocated_objects, baseline.allocated_objects);
+        assert_eq!(released.allocated_bytes, baseline.allocated_bytes);
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"[object Object]\n");
+
+        Ok(())
+    }
+
+    #[test]
     fn js_calling_non_callable_value_errors() -> Result<(), Error> {
         let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
         let (worker, pool, runtime_id, _output_rx) = create_pool_runtime(&mut sim)?;

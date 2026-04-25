@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::Error;
 
@@ -237,6 +237,69 @@ impl EnvStack {
         Ok(())
     }
 
+    pub(crate) fn active_frame_roots(&self) -> Vec<EnvFrameId> {
+        self.frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| {
+                frame
+                    .as_ref()
+                    .filter(|frame| frame.active)
+                    .map(|_| EnvFrameId(index as u32))
+            })
+            .collect()
+    }
+
+    pub(crate) fn frame_edges(&self, frame_id: EnvFrameId) -> Result<EnvFrameEdges, Error> {
+        let frame = self.frame(frame_id)?;
+        let mut edges = EnvFrameEdges {
+            frames: Vec::new(),
+            objects: Vec::new(),
+        };
+
+        if let Some(parent) = frame.parent {
+            edges.frames.push(parent);
+        }
+
+        for cell in frame.bindings.values() {
+            if let JsValue::Object(object) = &self.cell(*cell)?.value {
+                edges.objects.push(*object);
+            }
+        }
+
+        Ok(edges)
+    }
+
+    pub(crate) fn release_unmarked_inactive_frames(
+        &mut self,
+        marked: &HashSet<EnvFrameId>,
+        heap: &mut JsHeap,
+    ) -> Result<usize, Error> {
+        let frames = self
+            .frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| {
+                frame
+                    .as_ref()
+                    .filter(|frame| !frame.active)
+                    .map(|_| EnvFrameId(index as u32))
+            })
+            .collect::<Vec<_>>();
+        let mut released = 0;
+
+        for frame in frames {
+            if marked.contains(&frame) {
+                continue;
+            }
+
+            self.release_frame(frame, heap)?;
+            released += 1;
+        }
+
+        Ok(released)
+    }
+
     fn deactivate_frame(&mut self, frame_id: EnvFrameId, heap: &mut JsHeap) -> Result<(), Error> {
         let should_release = {
             let frame = self.frame_mut(frame_id)?;
@@ -326,4 +389,9 @@ impl EnvStack {
             .get_mut(id.0 as usize)
             .ok_or(Error::JsBindingCellNotFound { cell: id.0 })
     }
+}
+
+pub(crate) struct EnvFrameEdges {
+    pub(crate) frames: Vec<EnvFrameId>,
+    pub(crate) objects: Vec<super::ObjectId>,
 }

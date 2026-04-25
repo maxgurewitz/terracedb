@@ -237,11 +237,15 @@ impl Vm {
     }
 
     pub(crate) fn force_gc(&mut self) -> Result<usize, Error> {
-        self.heap.force_gc()
+        self.run_gc_at_safepoint()
     }
 
     pub(crate) fn maybe_run_gc(&mut self) -> Result<usize, Error> {
-        self.heap.maybe_run_gc()
+        if self.heap.should_run_gc() {
+            self.run_gc_at_safepoint()
+        } else {
+            Ok(0)
+        }
     }
 
     pub(crate) fn destroy(&mut self) -> Result<(), Error> {
@@ -387,6 +391,47 @@ impl Vm {
         }
 
         Ok(())
+    }
+
+    fn run_gc_at_safepoint(&mut self) -> Result<usize, Error> {
+        let before = self.heap.stats().freed_objects;
+
+        self.release_unreachable_inactive_frames()?;
+        self.heap.force_gc()?;
+
+        Ok(self.heap.stats().freed_objects.saturating_sub(before))
+    }
+
+    fn release_unreachable_inactive_frames(&mut self) -> Result<usize, Error> {
+        let mut marked_frames = HashSet::new();
+        let mut marked_objects = HashSet::new();
+        let mut frame_work = self.env.active_frame_roots();
+        let mut object_work = Vec::new();
+
+        while !frame_work.is_empty() || !object_work.is_empty() {
+            while let Some(frame) = frame_work.pop() {
+                if !marked_frames.insert(frame) {
+                    continue;
+                }
+
+                let edges = self.env.frame_edges(frame)?;
+                frame_work.extend(edges.frames);
+                object_work.extend(edges.objects);
+            }
+
+            while let Some(object) = object_work.pop() {
+                if !marked_objects.insert(object) {
+                    continue;
+                }
+
+                let edges = self.heap.runtime_edges(object)?;
+                frame_work.extend(edges.frames);
+                object_work.extend(edges.objects);
+            }
+        }
+
+        self.env
+            .release_unmarked_inactive_frames(&marked_frames, &mut self.heap)
     }
 }
 

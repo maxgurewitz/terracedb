@@ -236,8 +236,26 @@ impl JsHeap {
         }
     }
 
+    pub(crate) fn should_run_gc(&self) -> bool {
+        match self.gc_policy {
+            GcPolicy::ManualOnly => false,
+            GcPolicy::Automatic { threshold_bytes } => self.allocated_bytes >= threshold_bytes,
+        }
+    }
+
     pub fn force_gc(&mut self) -> Result<usize, Error> {
         self.run_gc()
+    }
+
+    pub(crate) fn runtime_edges(&self, object: ObjectId) -> Result<RuntimeEdges, Error> {
+        let mut edges = RuntimeEdges {
+            objects: Vec::new(),
+            frames: Vec::new(),
+        };
+
+        self.object(object)?.object.append_runtime_edges(&mut edges);
+
+        Ok(edges)
     }
 
     pub fn run_gc(&mut self) -> Result<usize, Error> {
@@ -537,6 +555,16 @@ impl JsObject {
         self.kind.append_child_values(&mut values);
         values
     }
+
+    fn append_runtime_edges(&self, edges: &mut RuntimeEdges) {
+        for property in self.properties.values() {
+            if let JsValue::Object(id) = &property.value {
+                edges.objects.push(*id);
+            }
+        }
+
+        self.kind.append_runtime_edges(edges);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +599,14 @@ impl ObjectKind {
             Self::Ordinary => Ok(()),
             Self::HostFunction(host_function) => host_function.release_children(heap),
             Self::JsFunction(function) => function.release_children(heap),
+        }
+    }
+
+    fn append_runtime_edges(&self, edges: &mut RuntimeEdges) {
+        match self {
+            Self::Ordinary => {}
+            Self::HostFunction(host_function) => host_function.append_runtime_edges(edges),
+            Self::JsFunction(function) => function.append_runtime_edges(edges),
         }
     }
 }
@@ -635,6 +671,12 @@ impl HostFunction {
     fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
         Ok(())
     }
+
+    fn append_runtime_edges(&self, _edges: &mut RuntimeEdges) {
+        // Console host functions currently do not hold JS heap or env-frame
+        // references. Future host state that owns JS values must expose those
+        // edges here.
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +714,15 @@ impl JsFunction {
     fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
         Ok(())
     }
+
+    fn append_runtime_edges(&self, edges: &mut RuntimeEdges) {
+        edges.frames.push(self.captured_env);
+    }
+}
+
+pub(crate) struct RuntimeEdges {
+    pub(crate) objects: Vec<ObjectId>,
+    pub(crate) frames: Vec<EnvFrameId>,
 }
 
 fn emit_console(
