@@ -20,10 +20,10 @@ pub use env::{
 };
 pub use error::Error;
 pub use js::{
-    Binding, BindingKind, ChannelByteSink, ConsoleAttachment, JsAttachment, JsCompileError,
-    JsOutputChunk, JsOutputReceiver, JsOutputSender, JsPoolMsg, JsPoolReply, JsRuntimeAttachment,
-    JsRuntimeId, JsRuntimeInstance, JsRuntimePoolActor, JsRuntimePoolConfig, JsSpan, JsStreamKind,
-    JsValue, LexicalEnv, RuntimeConsole,
+    Binding, BindingKind, ChannelByteSink, ConsoleAttachment, EnvStack, JsAttachment,
+    JsCompileError, JsOutputChunk, JsOutputReceiver, JsOutputSender, JsPoolMsg, JsPoolReply,
+    JsRuntimeAttachment, JsRuntimeId, JsRuntimeInstance, JsRuntimePoolActor, JsRuntimePoolConfig,
+    JsSpan, JsStreamKind, JsValue, LexicalEnv, RuntimeConsole,
 };
 pub use runtime::{
     CallHandle, Runtime, RuntimeApi, RuntimeBuilder, Shutdown, SimRuntime, SimRuntimeBuilder,

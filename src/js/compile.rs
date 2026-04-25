@@ -126,6 +126,16 @@ fn lower_statement(
     program: &mut MiniProgram,
 ) -> Result<(), Error> {
     match statement {
+        Statement::Block(block) => {
+            let mut body = Vec::new();
+
+            for item in block.statement_list().statements() {
+                lower_statement_list_item(item, interner, &mut body)?;
+            }
+
+            program.push(MiniStmt::Block(body));
+            Ok(())
+        }
         Statement::Expression(expr) => {
             program.push(lower_expression_statement(expr, interner)?);
             Ok(())

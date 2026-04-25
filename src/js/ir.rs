@@ -1,6 +1,7 @@
 pub(crate) type MiniProgram = Vec<MiniStmt>;
 
 pub(crate) enum MiniStmt {
+    Block(Vec<MiniStmt>),
     Let { name: String, expr: MiniExpr },
     Const { name: String, expr: MiniExpr },
     Assign { name: String, expr: MiniExpr },

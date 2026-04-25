@@ -339,4 +339,191 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn minimal_js_block_scope_shadowing() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let worker = sim.workers()[0].clone();
+        let (output_tx, output_rx) = flume::unbounded::<JsOutputChunk>();
+        let console = ConsoleAttachment { output_tx };
+        let pool = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(JsRuntimePoolConfig {
+                attachments: vec![Box::new(console)],
+            }),
+        )?;
+
+        let create = sim.call(&worker, pool.id, Box::new(JsPoolMsg::CreateRuntime))?;
+        sim.run_until_idle()?;
+
+        let runtime_id = match *create
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::RuntimeCreated(id) => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        let eval = sim.call(
+            &worker,
+            pool.id,
+            Box::new(JsPoolMsg::Eval {
+                runtime_id,
+                source: r#"
+                    let x = 1;
+
+                    {
+                        let x = 2;
+                        console.log(x);
+                    }
+
+                    console.log(x);
+                "#
+                .to_owned(),
+            }),
+        )?;
+
+        sim.run_until_idle()?;
+
+        match *eval
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        let mut stdout = Vec::new();
+
+        while let Ok(chunk) = output_rx.try_recv() {
+            if chunk.runtime_id == runtime_id && chunk.stream == JsStreamKind::Stdout {
+                stdout.extend_from_slice(&chunk.bytes);
+            }
+        }
+
+        assert_eq!(stdout, b"2\n1\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_block_assignment_updates_outer_binding() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let worker = sim.workers()[0].clone();
+        let (output_tx, output_rx) = flume::unbounded::<JsOutputChunk>();
+        let console = ConsoleAttachment { output_tx };
+        let pool = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(JsRuntimePoolConfig {
+                attachments: vec![Box::new(console)],
+            }),
+        )?;
+
+        let create = sim.call(&worker, pool.id, Box::new(JsPoolMsg::CreateRuntime))?;
+        sim.run_until_idle()?;
+
+        let runtime_id = match *create
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::RuntimeCreated(id) => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        let eval = sim.call(
+            &worker,
+            pool.id,
+            Box::new(JsPoolMsg::Eval {
+                runtime_id,
+                source: r#"
+                    let x = 1;
+
+                    {
+                        x = x + 2;
+                    }
+
+                    console.log(x);
+                "#
+                .to_owned(),
+            }),
+        )?;
+
+        sim.run_until_idle()?;
+
+        match *eval
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        let mut stdout = Vec::new();
+
+        while let Ok(chunk) = output_rx.try_recv() {
+            if chunk.runtime_id == runtime_id && chunk.stream == JsStreamKind::Stdout {
+                stdout.extend_from_slice(&chunk.bytes);
+            }
+        }
+
+        assert_eq!(stdout, b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_duplicate_binding_in_same_scope_errors() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let worker = sim.workers()[0].clone();
+        let (output_tx, _output_rx) = flume::unbounded::<JsOutputChunk>();
+        let console = ConsoleAttachment { output_tx };
+        let pool = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(JsRuntimePoolConfig {
+                attachments: vec![Box::new(console)],
+            }),
+        )?;
+
+        let create = sim.call(&worker, pool.id, Box::new(JsPoolMsg::CreateRuntime))?;
+        sim.run_until_idle()?;
+
+        let runtime_id = match *create
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::RuntimeCreated(id) => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        let eval = sim.call(
+            &worker,
+            pool.id,
+            Box::new(JsPoolMsg::Eval {
+                runtime_id,
+                source: r#"
+                    let x = 1;
+                    let x = 2;
+                "#
+                .to_owned(),
+            }),
+        )?;
+
+        sim.run_until_idle()?;
+
+        match *eval
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::EvalFailed(_) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        Ok(())
+    }
 }

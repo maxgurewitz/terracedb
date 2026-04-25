@@ -9,7 +9,7 @@ mod runtime;
 mod value;
 
 pub use attachment::{ConsoleAttachment, JsAttachment, JsRuntimeAttachment, RuntimeConsole};
-pub use bindings::{Binding, BindingKind, LexicalEnv};
+pub use bindings::{Binding, BindingKind, EnvStack, LexicalEnv};
 pub(crate) use compile::parse_and_lower_minijs;
 pub use compile::{JsCompileError, JsSpan};
 pub use ids::JsRuntimeId;
