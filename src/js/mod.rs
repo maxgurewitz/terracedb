@@ -1,4 +1,5 @@
 mod attachment;
+mod bindings;
 mod compile;
 mod ids;
 mod ir;
@@ -8,6 +9,7 @@ mod runtime;
 mod value;
 
 pub use attachment::{ConsoleAttachment, JsAttachment, JsRuntimeAttachment, RuntimeConsole};
+pub use bindings::{Binding, BindingKind, LexicalEnv};
 pub(crate) use compile::parse_and_lower_minijs;
 pub use compile::{JsCompileError, JsSpan};
 pub use ids::JsRuntimeId;

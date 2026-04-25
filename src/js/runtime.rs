@@ -8,13 +8,13 @@ use bytes::Bytes;
 use crate::Error;
 
 use super::{
-    JsRuntimeAttachment, JsRuntimeId, JsValue, MiniExpr, MiniProgram, MiniStmt, RuntimeConsole,
-    parse_and_lower_minijs,
+    BindingKind, JsRuntimeAttachment, JsRuntimeId, JsValue, LexicalEnv, MiniExpr, MiniProgram,
+    MiniStmt, RuntimeConsole, parse_and_lower_minijs,
 };
 
 pub struct JsRuntimeInstance {
     id: JsRuntimeId,
-    locals: HashMap<String, JsValue>,
+    lexical_env: LexicalEnv,
     attachments: HashMap<TypeId, Box<dyn Any + Send>>,
 }
 
@@ -22,7 +22,7 @@ impl JsRuntimeInstance {
     pub(crate) fn new(id: JsRuntimeId) -> Self {
         Self {
             id,
-            locals: HashMap::new(),
+            lexical_env: LexicalEnv::new(),
             attachments: HashMap::new(),
         }
     }
@@ -81,8 +81,17 @@ impl JsRuntimeInstance {
         match stmt {
             MiniStmt::Let { name, expr } => {
                 let value = self.eval_expr(expr)?;
-                self.locals.insert(name.clone(), value);
-                Ok(())
+                self.lexical_env
+                    .declare(name.clone(), BindingKind::Let, value)
+            }
+            MiniStmt::Const { name, expr } => {
+                let value = self.eval_expr(expr)?;
+                self.lexical_env
+                    .declare(name.clone(), BindingKind::Const, value)
+            }
+            MiniStmt::Assign { name, expr } => {
+                let value = self.eval_expr(expr)?;
+                self.lexical_env.assign(name, value)
             }
             MiniStmt::ConsoleLog { expr } => {
                 let value = self.eval_expr(expr)?;
@@ -100,11 +109,7 @@ impl JsRuntimeInstance {
     fn eval_expr(&self, expr: &MiniExpr) -> Result<JsValue, Error> {
         match expr {
             MiniExpr::Number(value) => Ok(JsValue::Number(*value)),
-            MiniExpr::Ident(name) => self
-                .locals
-                .get(name)
-                .cloned()
-                .ok_or_else(|| Error::JsIdentifierNotFound { name: name.clone() }),
+            MiniExpr::Ident(name) => self.lexical_env.get(name),
             MiniExpr::Add(lhs, rhs) => {
                 let lhs = self.eval_expr(lhs)?;
                 let rhs = self.eval_expr(rhs)?;

@@ -4,7 +4,10 @@ use boa_ast::{
     expression::{
         access::{PropertyAccess, PropertyAccessField},
         literal::LiteralKind,
-        operator::binary::{ArithmeticOp, BinaryOp},
+        operator::{
+            assign::{AssignOp, AssignTarget},
+            binary::{ArithmeticOp, BinaryOp},
+        },
     },
     scope::Scope,
 };
@@ -13,7 +16,7 @@ use boa_parser::{Parser, Source};
 
 use crate::Error;
 
-use super::{MiniExpr, MiniProgram, MiniStmt};
+use super::{BindingKind, MiniExpr, MiniProgram, MiniStmt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JsSpan {
@@ -79,17 +82,18 @@ fn lower_declaration(
 ) -> Result<(), Error> {
     match declaration {
         Declaration::Lexical(LexicalDeclaration::Let(list)) => {
-            lower_let_declaration(list, interner, program)
+            lower_lexical_declaration(list, BindingKind::Let, interner, program)
         }
-        Declaration::Lexical(LexicalDeclaration::Const(_)) => {
-            unsupported("const declaration", JsSpan::unknown())
+        Declaration::Lexical(LexicalDeclaration::Const(list)) => {
+            lower_lexical_declaration(list, BindingKind::Const, interner, program)
         }
         _ => unsupported("declaration", JsSpan::unknown()),
     }
 }
 
-fn lower_let_declaration(
+fn lower_lexical_declaration(
     list: &VariableList,
+    kind: BindingKind,
     interner: &Interner,
     program: &mut MiniProgram,
 ) -> Result<(), Error> {
@@ -102,12 +106,14 @@ fn lower_let_declaration(
         };
 
         let Some(expr) = variable.init() else {
-            return unsupported("let without initializer", JsSpan::unknown());
+            return unsupported("lexical declaration without initializer", JsSpan::unknown());
         };
 
-        program.push(MiniStmt::Let {
-            name,
-            expr: lower_expr(expr, interner)?,
+        let expr = lower_expr(expr, interner)?;
+
+        program.push(match kind {
+            BindingKind::Let => MiniStmt::Let { name, expr },
+            BindingKind::Const => MiniStmt::Const { name, expr },
         });
     }
 
@@ -132,21 +138,36 @@ fn lower_statement(
 fn lower_expression_statement(expr: &Expression, interner: &Interner) -> Result<MiniStmt, Error> {
     let expr = expr.flatten();
 
-    let Expression::Call(call) = expr else {
-        return unsupported("expression statement", span_of(expr));
-    };
+    if let Expression::Assign(assign) = expr {
+        if assign.op() != AssignOp::Assign {
+            return unsupported("compound assignment", span_of(expr));
+        }
 
-    if !is_console_method(call.function(), "log", interner) {
-        return unsupported("expression statement", span_of(expr));
+        let AssignTarget::Identifier(identifier) = assign.lhs() else {
+            return unsupported("assignment target", span_of(expr));
+        };
+
+        return Ok(MiniStmt::Assign {
+            name: identifier.to_interned_string(interner),
+            expr: lower_expr(assign.rhs(), interner)?,
+        });
     }
 
-    let [arg] = call.args() else {
-        return unsupported("console.log arity", span_of(expr));
-    };
+    if let Expression::Call(call) = expr {
+        if !is_console_method(call.function(), "log", interner) {
+            return unsupported("expression statement", span_of(expr));
+        }
 
-    Ok(MiniStmt::ConsoleLog {
-        expr: lower_expr(arg, interner)?,
-    })
+        let [arg] = call.args() else {
+            return unsupported("console.log arity", span_of(expr));
+        };
+
+        return Ok(MiniStmt::ConsoleLog {
+            expr: lower_expr(arg, interner)?,
+        });
+    }
+
+    unsupported("expression statement", span_of(expr))
 }
 
 fn lower_expr(expr: &Expression, interner: &Interner) -> Result<MiniExpr, Error> {
