@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    mem,
-};
+use std::{collections::HashMap, mem};
 
 use bytes::Bytes;
 
@@ -98,10 +95,7 @@ impl JsHeap {
     }
 
     pub fn alloc_object(&mut self, kind: ObjectKind) -> ObjectId {
-        self.alloc_js_object(JsObject::new(kind))
-    }
-
-    pub fn alloc_js_object(&mut self, object: JsObject) -> ObjectId {
+        let object = JsObject::new(kind);
         let id = ObjectId(self.next_object_id);
         self.next_object_id += 1;
 
@@ -360,20 +354,16 @@ impl JsHeap {
 
     fn gc_free_cycles(&mut self) -> Result<usize, Error> {
         let candidates = mem::take(&mut self.tmp_cycle);
-        let collected = candidates
-            .iter()
-            .copied()
-            .filter(|id| {
-                self.objects
-                    .get(id)
-                    .is_some_and(|object| object.header.mark != GcMark::Live)
-            })
-            .collect::<HashSet<_>>();
         let mut freed = 0;
 
         for id in candidates {
-            if collected.contains(&id) && self.objects.contains_key(&id) {
-                self.free_cycle_object_now(id, &collected)?;
+            let should_free = self
+                .objects
+                .get(&id)
+                .is_some_and(|object| object.header.mark != GcMark::Live);
+
+            if should_free {
+                self.free_cycle_object_now(id)?;
                 freed += 1;
             }
         }
@@ -383,20 +373,21 @@ impl JsHeap {
         Ok(freed)
     }
 
-    fn free_cycle_object_now(
-        &mut self,
-        id: ObjectId,
-        collected: &HashSet<ObjectId>,
-    ) -> Result<(), Error> {
-        let heap_object = self
+    fn free_cycle_object_now(&mut self, id: ObjectId) -> Result<(), Error> {
+        let HeapObject {
+            header,
+            object: _object,
+        } = self
             .objects
             .remove(&id)
             .ok_or(Error::JsObjectNotFound { object: id.0 })?;
 
-        self.account_freed_object(id, heap_object.header.bytes);
-        heap_object
-            .object
-            .release_children_for_cycle_free(self, collected)
+        self.account_freed_object(id, header.bytes);
+
+        // Do not release child JsValues here. Cycle GC already subtracted
+        // every object-to-object child edge in gc_decref_all; decrementing
+        // those edges again would corrupt refcounts.
+        Ok(())
     }
 
     fn reset_gc_marks(&mut self) {
@@ -465,28 +456,19 @@ impl JsObject {
                 visitor(id);
             }
         }
-
-        self.kind.visit_children(visitor);
     }
 
     pub fn release_children(self, heap: &mut JsHeap) -> Result<(), Error> {
-        for property in self.properties.into_values() {
+        let Self {
+            kind: _,
+            properties,
+        } = self;
+
+        for property in properties.into_values() {
             heap.free_value(property.value)?;
         }
 
-        self.kind.release_children(heap)
-    }
-
-    fn release_children_for_cycle_free(
-        self,
-        heap: &mut JsHeap,
-        collected: &HashSet<ObjectId>,
-    ) -> Result<(), Error> {
-        for property in self.properties.into_values() {
-            release_cycle_child_value(property.value, heap, collected)?;
-        }
-
-        self.kind.release_children_for_cycle_free(heap, collected)
+        Ok(())
     }
 }
 
@@ -494,35 +476,6 @@ impl JsObject {
 pub enum ObjectKind {
     Ordinary,
     HostFunction(HostFunction),
-}
-
-impl ObjectKind {
-    pub fn visit_children(&self, visitor: &mut impl FnMut(ObjectId)) {
-        match self {
-            Self::Ordinary => {}
-            Self::HostFunction(host_function) => host_function.visit_children(visitor),
-        }
-    }
-
-    pub fn release_children(self, heap: &mut JsHeap) -> Result<(), Error> {
-        match self {
-            Self::Ordinary => Ok(()),
-            Self::HostFunction(host_function) => host_function.release_children(heap),
-        }
-    }
-
-    fn release_children_for_cycle_free(
-        self,
-        heap: &mut JsHeap,
-        collected: &HashSet<ObjectId>,
-    ) -> Result<(), Error> {
-        match self {
-            Self::Ordinary => Ok(()),
-            Self::HostFunction(host_function) => {
-                host_function.release_children_for_cycle_free(heap, collected)
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -570,20 +523,6 @@ impl HostFunction {
             }
         }
     }
-
-    pub fn visit_children(&self, _visitor: &mut impl FnMut(ObjectId)) {}
-
-    pub fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn release_children_for_cycle_free(
-        self,
-        _heap: &mut JsHeap,
-        _collected: &HashSet<ObjectId>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -618,18 +557,6 @@ fn emit_console(
             bytes: Bytes::from(line),
         })
         .map_err(|_| Error::OutputReceiverDropped)
-}
-
-fn release_cycle_child_value(
-    value: JsValue,
-    _heap: &mut JsHeap,
-    _collected: &HashSet<ObjectId>,
-) -> Result<(), Error> {
-    // Cycle collection has already accounted for all child object edges during
-    // the temporary decref pass. Releasing them again would underflow internal
-    // cycle edges and would double-decrement edges into live objects.
-    let _ = value;
-    Ok(())
 }
 
 fn estimate_object_bytes(object: &JsObject) -> usize {

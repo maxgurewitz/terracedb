@@ -72,7 +72,7 @@ impl JsRuntimePoolActor {
         let mut runtime = JsRuntimeInstance::with_config(
             runtime_id,
             JsRuntimeConfig {
-                gc_policy: self.gc_policy(),
+                gc_policy: self.gc_policy,
             },
         );
 
@@ -83,10 +83,6 @@ impl JsRuntimePoolActor {
         self.runtimes.insert(runtime_id, runtime);
 
         Ok(JsPoolReply::RuntimeCreated(runtime_id))
-    }
-
-    fn gc_policy(&self) -> GcPolicy {
-        self.gc_policy
     }
 
     fn eval(&mut self, runtime_id: JsRuntimeId, source: &str) -> Result<JsPoolReply, Error> {
