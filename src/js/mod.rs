@@ -12,12 +12,14 @@ mod value;
 mod vm;
 
 pub use attachment::{AttachmentInstallCtx, ConsoleAttachment, JsAttachment};
-pub use bindings::{Binding, BindingKind, EnvStack, LexicalEnv};
-pub use bytecode::{BytecodeProgram, ConstId, Constant, ConstantPool, Instr};
+pub use bindings::{Binding, BindingCellId, BindingKind, EnvFrame, EnvFrameId, EnvStack};
+pub use bytecode::{
+    BytecodeProgram, CompiledFunction, ConstId, Constant, ConstantPool, FunctionId, Instr,
+};
 pub use compile::{JsCompileError, JsSpan, compile_source_to_bytecode};
 pub use heap::{
     DEFAULT_GC_THRESHOLD_BYTES, GcHeader, GcMark, GcPolicy, HeapObject, HeapStats, HostFunction,
-    HostFunctionKind, JsHeap, JsObject, JsProperty, ObjectId, ObjectKind, PropertyKey,
+    HostFunctionKind, JsFunction, JsHeap, JsObject, JsProperty, ObjectId, ObjectKind, PropertyKey,
 };
 pub use ids::JsRuntimeId;
 pub use output::{ChannelByteSink, JsOutputChunk, JsOutputReceiver, JsOutputSender, JsStreamKind};

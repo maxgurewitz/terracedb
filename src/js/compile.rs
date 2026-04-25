@@ -13,6 +13,7 @@ use boa_ast::{
             unary::UnaryOp as BoaUnaryOp,
         },
     },
+    function::{FormalParameterList, FunctionBody, FunctionDeclaration},
     property::PropertyName,
     scope::Scope,
 };
@@ -22,7 +23,8 @@ use boa_parser::{Parser, Source};
 use crate::Error;
 
 use super::{
-    BindingKind, BytecodeProgram, ConstId, Constant, Instr, PropertyKey, Symbol, SymbolTable,
+    BindingKind, BytecodeProgram, CompiledFunction, ConstId, Constant, Instr, PropertyKey, Symbol,
+    SymbolTable,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +151,9 @@ impl Compiler {
         symbols: &mut SymbolTable,
     ) -> Result<(), Error> {
         match declaration {
+            Declaration::FunctionDeclaration(function) => {
+                self.compile_function_declaration(function, interner, symbols)
+            }
             Declaration::Lexical(LexicalDeclaration::Let(list)) => {
                 self.compile_lexical_declaration(list, BindingKind::Let, interner, symbols)
             }
@@ -191,6 +196,28 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_function_declaration(
+        &mut self,
+        function: &FunctionDeclaration,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        let name = lower_identifier(function.name(), interner, symbols);
+        let params = lower_parameters(function.parameters(), interner, symbols)?;
+        let body = compile_function_body(function.body(), interner, symbols)?;
+        let function_id = self.program.push_function(CompiledFunction {
+            name: Some(name),
+            params,
+            body,
+        });
+
+        self.emit(Instr::CreateFunction(function_id));
+        self.emit(Instr::DeclareLet(name));
+        self.emit(Instr::StoreBinding(name));
+
+        Ok(())
+    }
+
     fn compile_statement(
         &mut self,
         statement: &Statement,
@@ -211,6 +238,17 @@ impl Compiler {
             }
             Statement::Expression(expr) => {
                 self.compile_expression_statement(expr, interner, symbols)
+            }
+            Statement::Return(statement) => {
+                if let Some(expr) = statement.target() {
+                    self.compile_expr(expr, interner, symbols)?;
+                } else {
+                    self.emit_load_const(Constant::Undefined);
+                }
+
+                self.emit(Instr::Return);
+
+                Ok(())
             }
             Statement::Empty => Ok(()),
             _ => unsupported("statement", JsSpan::unknown()),
@@ -459,6 +497,51 @@ impl Compiler {
 
         Ok(())
     }
+}
+
+fn compile_function_body(
+    body: &FunctionBody,
+    interner: &Interner,
+    symbols: &mut SymbolTable,
+) -> Result<BytecodeProgram, Error> {
+    let mut compiler = Compiler::new();
+
+    for item in body.statements() {
+        compiler.compile_statement_list_item(item, interner, symbols)?;
+    }
+
+    compiler.emit(Instr::Halt);
+
+    Ok(compiler.finish())
+}
+
+fn lower_parameters(
+    parameters: &FormalParameterList,
+    interner: &Interner,
+    symbols: &mut SymbolTable,
+) -> Result<Vec<Symbol>, Error> {
+    if !parameters.is_simple() {
+        return unsupported("non-simple function parameters", JsSpan::unknown());
+    }
+
+    let mut lowered = Vec::with_capacity(parameters.as_ref().len());
+
+    for parameter in parameters.as_ref() {
+        if parameter.is_rest_param() || parameter.init().is_some() {
+            return unsupported("non-simple function parameters", JsSpan::unknown());
+        }
+
+        let name = match parameter.variable().binding() {
+            Binding::Identifier(identifier) => lower_identifier(*identifier, interner, symbols),
+            Binding::Pattern(_) => {
+                return unsupported("destructuring parameter", JsSpan::unknown());
+            }
+        };
+
+        lowered.push(name);
+    }
+
+    Ok(lowered)
 }
 
 fn lower_binary_instr(op: BoaBinaryOp) -> Result<Instr, Error> {

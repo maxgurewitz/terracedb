@@ -26,6 +26,10 @@ impl Constant {
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct ConstId(pub u32);
 
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct FunctionId(pub u32);
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConstantPool {
     values: Vec<Constant>,
 }
@@ -54,17 +58,39 @@ impl Default for ConstantPool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct BytecodeProgram {
     pub constants: ConstantPool,
+    pub functions: Vec<CompiledFunction>,
     pub instructions: Vec<Instr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledFunction {
+    pub name: Option<Symbol>,
+    pub params: Vec<Symbol>,
+    pub body: BytecodeProgram,
 }
 
 impl BytecodeProgram {
     pub fn new() -> Self {
         Self {
             constants: ConstantPool::new(),
+            functions: Vec::new(),
             instructions: Vec::new(),
         }
+    }
+
+    pub fn push_function(&mut self, function: CompiledFunction) -> FunctionId {
+        let id = FunctionId(self.functions.len() as u32);
+        self.functions.push(function);
+        id
+    }
+
+    pub fn get_function(&self, id: FunctionId) -> Result<&CompiledFunction, Error> {
+        self.functions
+            .get(id.0 as usize)
+            .ok_or(Error::JsInvalidFunction { id: id.0 })
     }
 }
 
@@ -98,7 +124,9 @@ pub enum Instr {
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
+    CreateFunction(FunctionId),
     Call(usize),
+    Return,
     Pop,
     NewObject,
     DefineProperty(PropertyKey),

@@ -1,7 +1,10 @@
+use std::collections::HashSet;
+
 use crate::Error;
 
 use super::{
-    BytecodeProgram, EnvStack, GcPolicy, Instr, JsHeap, JsValue, ObjectId, ObjectKind, SymbolTable,
+    BindingKind, BytecodeProgram, EnvStack, GcPolicy, Instr, JsFunction, JsHeap, JsValue, ObjectId,
+    ObjectKind, SymbolTable,
 };
 
 pub struct Vm {
@@ -38,7 +41,7 @@ impl Vm {
         self.ip = 0;
         let base_scope_depth = self.env.depth();
 
-        let result = self.run_inner(program, symbols);
+        let result = self.run_inner(program, symbols, false);
 
         self.release_all_stack_values()?;
 
@@ -54,6 +57,7 @@ impl Vm {
         &mut self,
         program: &BytecodeProgram,
         symbols: &SymbolTable,
+        allow_return: bool,
     ) -> Result<JsValue, Error> {
         loop {
             let instr = program
@@ -144,6 +148,18 @@ impl Vm {
                         self.ip = *target;
                     }
                 }
+                Instr::CreateFunction(id) => {
+                    let function = program.get_function(*id)?;
+                    let captured_env = self.env.capture_current_frame()?;
+                    let object = self.heap.alloc_object(ObjectKind::JsFunction(JsFunction {
+                        name: function.name,
+                        params: function.params.clone(),
+                        body: function.body.clone(),
+                        captured_env,
+                    }));
+
+                    self.push_value(JsValue::Object(object));
+                }
                 Instr::Call(arg_count) => {
                     let mut args = Vec::with_capacity(*arg_count);
 
@@ -160,7 +176,19 @@ impl Vm {
                     }
 
                     self.heap.free_value(callee)?;
-                    self.push_value(result?);
+                    self.push_owned(result?);
+                }
+                Instr::Return => {
+                    let value = self.pop_value()?;
+
+                    if allow_return {
+                        return Ok(value);
+                    }
+
+                    self.heap.free_value(value)?;
+                    return Err(Error::JsTypeError {
+                        message: "return outside function".to_owned(),
+                    });
                 }
                 Instr::Pop => {
                     self.discard_value()?;
@@ -291,12 +319,74 @@ impl Vm {
         args: &[JsValue],
         symbols: &SymbolTable,
     ) -> Result<JsValue, Error> {
-        let object = expect_object(callee)?;
+        let JsValue::Object(object) = callee else {
+            return Err(Error::JsNotCallable);
+        };
 
-        match self.heap.object_kind(object)? {
+        match self.heap.object_kind(*object)? {
             ObjectKind::HostFunction(function) => function.call(args, &mut self.heap, symbols),
+            ObjectKind::JsFunction(function) => self.call_js_function(function, args, symbols),
             ObjectKind::Ordinary => Err(Error::JsNotCallable),
         }
+    }
+
+    fn call_js_function(
+        &mut self,
+        function: JsFunction,
+        args: &[JsValue],
+        symbols: &SymbolTable,
+    ) -> Result<JsValue, Error> {
+        let saved_ip = self.ip;
+        let saved_frame = self.env.set_current_frame(function.captured_env)?;
+        let captured_depth = self.env.depth();
+
+        self.env.push_scope();
+        let result = self
+            .bind_function_params(&function, args, symbols)
+            .and_then(|()| {
+                self.ip = 0;
+                self.run_inner(&function.body, symbols, true)
+            });
+
+        let cleanup_result = self.env.truncate_to_depth(captured_depth, &mut self.heap);
+        let restore_result = self.env.restore_current_frame(saved_frame);
+        self.ip = saved_ip;
+
+        match (result, cleanup_result, restore_result) {
+            (Ok(value), Ok(()), Ok(())) => Ok(value),
+            (Err(err), _, _) => Err(err),
+            (Ok(value), Err(err), _) | (Ok(value), Ok(()), Err(err)) => {
+                self.heap.free_value(value)?;
+                Err(err)
+            }
+        }
+    }
+
+    fn bind_function_params(
+        &mut self,
+        function: &JsFunction,
+        args: &[JsValue],
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
+        let mut bound = HashSet::new();
+
+        for (index, param) in function.params.iter().copied().enumerate() {
+            let value = args.get(index).cloned().unwrap_or(JsValue::Undefined);
+
+            if bound.insert(param) {
+                self.env.declare_current_value(
+                    param,
+                    BindingKind::Let,
+                    value,
+                    &mut self.heap,
+                    symbols,
+                )?;
+            } else {
+                self.env.store(param, value, &mut self.heap, symbols)?;
+            }
+        }
+
+        Ok(())
     }
 }
 

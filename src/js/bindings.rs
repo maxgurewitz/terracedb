@@ -4,19 +4,35 @@ use crate::Error;
 
 use super::{JsHeap, JsValue, Symbol, SymbolTable};
 
+#[derive(Debug)]
 pub struct EnvStack {
-    scopes: Vec<LexicalEnv>,
+    root: EnvFrameId,
+    current: EnvFrameId,
+    frames: Vec<Option<EnvFrame>>,
+    cells: Vec<Option<Binding>>,
 }
 
-pub struct LexicalEnv {
-    bindings: HashMap<Symbol, Binding>,
+#[derive(Debug)]
+pub struct EnvFrame {
+    parent: Option<EnvFrameId>,
+    bindings: HashMap<Symbol, BindingCellId>,
+    depth: usize,
+    active: bool,
+    capture_count: usize,
 }
 
+#[derive(Debug)]
 pub struct Binding {
     kind: BindingKind,
     value: JsValue,
     initialized: bool,
 }
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct BindingCellId(pub u32);
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct EnvFrameId(pub u32);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum BindingKind {
@@ -24,70 +40,90 @@ pub enum BindingKind {
     Const,
 }
 
-impl LexicalEnv {
-    fn new() -> Self {
+impl EnvFrame {
+    fn new(parent: Option<EnvFrameId>, depth: usize) -> Self {
         Self {
+            parent,
             bindings: HashMap::new(),
+            depth,
+            active: true,
+            capture_count: 0,
         }
-    }
-
-    fn declare(
-        &mut self,
-        name: Symbol,
-        kind: BindingKind,
-        symbols: &SymbolTable,
-    ) -> Result<(), Error> {
-        if self.bindings.contains_key(&name) {
-            return Err(Error::JsDuplicateBinding {
-                name: symbols.resolve_expect(name).to_owned(),
-            });
-        }
-
-        self.bindings.insert(
-            name,
-            Binding {
-                kind,
-                value: JsValue::Undefined,
-                initialized: false,
-            },
-        );
-
-        Ok(())
-    }
-
-    fn get(&self, name: Symbol) -> Option<&Binding> {
-        self.bindings.get(&name)
-    }
-
-    fn get_mut(&mut self, name: Symbol) -> Option<&mut Binding> {
-        self.bindings.get_mut(&name)
     }
 }
 
 impl EnvStack {
     pub(crate) fn new() -> Self {
+        let root = EnvFrameId(0);
+
         Self {
-            scopes: vec![LexicalEnv::new()],
+            root,
+            current: root,
+            frames: vec![Some(EnvFrame::new(None, 1))],
+            cells: Vec::new(),
         }
     }
 
-    pub(crate) fn push_scope(&mut self) {
-        self.scopes.push(LexicalEnv::new());
-    }
+    pub(crate) fn capture_current_frame(&mut self) -> Result<EnvFrameId, Error> {
+        let mut current = Some(self.current);
 
-    pub(crate) fn pop_scope(&mut self, heap: &mut JsHeap) -> Result<(), Error> {
-        if self.scopes.len() == 1 {
-            return Err(Error::JsCannotPopRootScope);
+        while let Some(frame_id) = current {
+            let frame = self.frame_mut(frame_id)?;
+            frame.capture_count += 1;
+            current = frame.parent;
         }
 
-        let scope = self.scopes.pop().expect("scope length checked above");
-        release_scope(scope, heap)?;
+        Ok(self.current)
+    }
+
+    pub(crate) fn set_current_frame(&mut self, frame: EnvFrameId) -> Result<EnvFrameId, Error> {
+        self.frame(frame)?;
+
+        let previous = self.current;
+        self.current = frame;
+
+        Ok(previous)
+    }
+
+    pub(crate) fn restore_current_frame(&mut self, frame: EnvFrameId) -> Result<(), Error> {
+        self.frame(frame)?;
+        self.current = frame;
 
         Ok(())
     }
 
+    pub(crate) fn push_scope(&mut self) {
+        let depth = self
+            .frame(self.current)
+            .expect("current frame must exist")
+            .depth
+            + 1;
+        let id = EnvFrameId(self.frames.len() as u32);
+
+        self.frames
+            .push(Some(EnvFrame::new(Some(self.current), depth)));
+        self.current = id;
+    }
+
+    pub(crate) fn pop_scope(&mut self, heap: &mut JsHeap) -> Result<(), Error> {
+        if self.current == self.root {
+            return Err(Error::JsCannotPopRootScope);
+        }
+
+        let frame_id = self.current;
+        let parent = self
+            .frame(frame_id)?
+            .parent
+            .expect("non-root frame has parent");
+
+        self.current = parent;
+        self.deactivate_frame(frame_id, heap)
+    }
+
     pub(crate) fn depth(&self) -> usize {
-        self.scopes.len()
+        self.frame(self.current)
+            .expect("current frame must exist")
+            .depth
     }
 
     pub(crate) fn truncate_to_depth(
@@ -95,9 +131,8 @@ impl EnvStack {
         depth: usize,
         heap: &mut JsHeap,
     ) -> Result<(), Error> {
-        while self.scopes.len() > depth && self.scopes.len() > 1 {
-            let scope = self.scopes.pop().expect("scope length checked above");
-            release_scope(scope, heap)?;
+        while self.depth() > depth && self.current != self.root {
+            self.pop_scope(heap)?;
         }
 
         Ok(())
@@ -109,10 +144,21 @@ impl EnvStack {
         kind: BindingKind,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
-        self.scopes
-            .last_mut()
-            .expect("env stack always has a root scope")
-            .declare(name, kind, symbols)
+        if self.frame(self.current)?.bindings.contains_key(&name) {
+            return Err(Error::JsDuplicateBinding {
+                name: symbols.resolve_expect(name).to_owned(),
+            });
+        }
+
+        let cell = self.alloc_cell(Binding {
+            kind,
+            value: JsValue::Undefined,
+            initialized: false,
+        });
+
+        self.frame_mut(self.current)?.bindings.insert(name, cell);
+
+        Ok(())
     }
 
     pub fn declare_current_value(
@@ -133,15 +179,12 @@ impl EnvStack {
         heap: &mut JsHeap,
         symbols: &SymbolTable,
     ) -> Result<JsValue, Error> {
-        let value = self
-            .scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name))
-            .map(|binding| binding.value.clone())
+        let cell = self
+            .find_cell(name)
             .ok_or_else(|| Error::JsBindingNotFound {
                 name: symbols.resolve_expect(name).to_owned(),
             })?;
+        let value = self.cell(cell)?.value.clone();
 
         heap.dup_value(&value);
 
@@ -155,43 +198,132 @@ impl EnvStack {
         heap: &mut JsHeap,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
-        for scope in self.scopes.iter_mut().rev() {
-            let Some(binding) = scope.get_mut(name) else {
-                continue;
-            };
+        let cell = self
+            .find_cell(name)
+            .ok_or_else(|| Error::JsBindingNotFound {
+                name: symbols.resolve_expect(name).to_owned(),
+            })?;
+
+        {
+            let binding = self.cell(cell)?;
 
             if binding.kind == BindingKind::Const && binding.initialized {
                 return Err(Error::JsAssignToConst {
                     name: symbols.resolve_expect(name).to_owned(),
                 });
             }
-
-            heap.dup_value(&value);
-            let old = std::mem::replace(&mut binding.value, value);
-            heap.free_value(old)?;
-            binding.initialized = true;
-
-            return Ok(());
         }
 
-        Err(Error::JsBindingNotFound {
-            name: symbols.resolve_expect(name).to_owned(),
-        })
+        heap.dup_value(&value);
+        let old = {
+            let binding = self.cell_mut(cell)?;
+            let old = std::mem::replace(&mut binding.value, value);
+            binding.initialized = true;
+            old
+        };
+
+        heap.free_value(old)
     }
 
     pub(crate) fn release_all_scopes(&mut self, heap: &mut JsHeap) -> Result<(), Error> {
-        while let Some(scope) = self.scopes.pop() {
-            release_scope(scope, heap)?;
+        for cell in &mut self.cells {
+            if let Some(binding) = cell.take() {
+                heap.free_value(binding.value)?;
+            }
+        }
+
+        self.frames.clear();
+
+        Ok(())
+    }
+
+    fn deactivate_frame(&mut self, frame_id: EnvFrameId, heap: &mut JsHeap) -> Result<(), Error> {
+        let should_release = {
+            let frame = self.frame_mut(frame_id)?;
+            frame.active = false;
+            frame.capture_count == 0
+        };
+
+        if should_release {
+            self.release_frame(frame_id, heap)?;
         }
 
         Ok(())
     }
-}
 
-fn release_scope(scope: LexicalEnv, heap: &mut JsHeap) -> Result<(), Error> {
-    for binding in scope.bindings.into_values() {
-        heap.free_value(binding.value)?;
+    fn release_frame(&mut self, frame_id: EnvFrameId, heap: &mut JsHeap) -> Result<(), Error> {
+        let Some(frame) = self.frame_slot_mut(frame_id)?.take() else {
+            return Ok(());
+        };
+
+        for cell in frame.bindings.into_values() {
+            if let Some(binding) = self.cell_slot_mut(cell)?.take() {
+                heap.free_value(binding.value)?;
+            }
+        }
+
+        Ok(())
     }
 
-    Ok(())
+    fn find_cell(&self, name: Symbol) -> Option<BindingCellId> {
+        let mut current = Some(self.current);
+
+        while let Some(frame_id) = current {
+            let frame = self.frame(frame_id).ok()?;
+
+            if let Some(cell) = frame.bindings.get(&name) {
+                return Some(*cell);
+            }
+
+            current = frame.parent;
+        }
+
+        None
+    }
+
+    fn alloc_cell(&mut self, binding: Binding) -> BindingCellId {
+        let id = BindingCellId(self.cells.len() as u32);
+        self.cells.push(Some(binding));
+        id
+    }
+
+    fn frame(&self, id: EnvFrameId) -> Result<&EnvFrame, Error> {
+        self.frames
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::JsEnvFrameNotFound { frame: id.0 })
+    }
+
+    fn frame_mut(&mut self, id: EnvFrameId) -> Result<&mut EnvFrame, Error> {
+        self.frames
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_mut)
+            .ok_or(Error::JsEnvFrameNotFound { frame: id.0 })
+    }
+
+    fn frame_slot_mut(&mut self, id: EnvFrameId) -> Result<&mut Option<EnvFrame>, Error> {
+        self.frames
+            .get_mut(id.0 as usize)
+            .ok_or(Error::JsEnvFrameNotFound { frame: id.0 })
+    }
+
+    fn cell(&self, id: BindingCellId) -> Result<&Binding, Error> {
+        self.cells
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::JsBindingCellNotFound { cell: id.0 })
+    }
+
+    fn cell_mut(&mut self, id: BindingCellId) -> Result<&mut Binding, Error> {
+        self.cells
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_mut)
+            .ok_or(Error::JsBindingCellNotFound { cell: id.0 })
+    }
+
+    fn cell_slot_mut(&mut self, id: BindingCellId) -> Result<&mut Option<Binding>, Error> {
+        self.cells
+            .get_mut(id.0 as usize)
+            .ok_or(Error::JsBindingCellNotFound { cell: id.0 })
+    }
 }

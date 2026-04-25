@@ -1,14 +1,12 @@
-use std::{
-    collections::{HashMap, HashSet},
-    mem,
-};
+use std::{collections::HashMap, mem};
 
 use bytes::Bytes;
 
 use crate::Error;
 
 use super::{
-    JsOutputChunk, JsOutputSender, JsRuntimeId, JsStreamKind, JsValue, Symbol, SymbolTable,
+    BytecodeProgram, EnvFrameId, JsOutputChunk, JsOutputSender, JsRuntimeId, JsStreamKind, JsValue,
+    Symbol, SymbolTable,
 };
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -50,6 +48,7 @@ pub struct JsHeap {
     freed_objects: usize,
     gc_runs: u64,
     gc_policy: GcPolicy,
+    gc_phase: GcPhase,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +69,12 @@ pub enum GcMark {
     None,
     Tmp,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum GcPhase {
+    None,
+    RemoveCycles,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -97,6 +102,7 @@ impl JsHeap {
             freed_objects: 0,
             gc_runs: 0,
             gc_policy,
+            gc_phase: GcPhase::None,
         }
     }
 
@@ -160,6 +166,10 @@ impl JsHeap {
         object.header.ref_count -= 1;
 
         if object.header.ref_count == 0 {
+            if self.gc_phase == GcPhase::RemoveCycles {
+                return Ok(());
+            }
+
             self.zero_ref.push(id);
             self.drain_zero_ref()?;
         }
@@ -363,11 +373,14 @@ impl JsHeap {
 
     fn gc_restore_cycles(&mut self) -> Result<(), Error> {
         for id in self.tmp_cycle.clone() {
-            if !self.objects.contains_key(&id) {
-                continue;
-            }
+            let should_restore = self
+                .objects
+                .get(&id)
+                .is_some_and(|object| object.header.mark != GcMark::Live);
 
-            self.gc_incref_children(id)?;
+            if should_restore {
+                self.gc_incref_children(id)?;
+            }
         }
 
         Ok(())
@@ -399,11 +412,14 @@ impl JsHeap {
                     .is_some_and(|object| object.header.mark != GcMark::Live)
             })
             .collect::<Vec<_>>();
-        let collected_set = collected.iter().copied().collect::<HashSet<_>>();
 
+        self.gc_phase = GcPhase::RemoveCycles;
         for id in &collected {
-            self.release_cycle_object_children(*id, &collected_set)?;
+            if self.objects.contains_key(id) {
+                self.release_object_children(*id)?;
+            }
         }
+        self.gc_phase = GcPhase::None;
 
         let mut freed = 0;
 
@@ -421,45 +437,12 @@ impl JsHeap {
         Ok(freed)
     }
 
-    fn release_cycle_object_children(
-        &mut self,
-        id: ObjectId,
-        collected: &HashSet<ObjectId>,
-    ) -> Result<(), Error> {
-        let values = self.object(id)?.object.property_values();
+    fn release_object_children(&mut self, id: ObjectId) -> Result<(), Error> {
+        let values = self.object(id)?.object.child_values();
 
         for value in values {
-            self.release_cycle_child_value(value, collected)?;
+            self.free_value(value)?;
         }
-
-        Ok(())
-    }
-
-    fn release_cycle_child_value(
-        &mut self,
-        value: JsValue,
-        collected: &HashSet<ObjectId>,
-    ) -> Result<(), Error> {
-        let JsValue::Object(id) = value else {
-            return Ok(());
-        };
-
-        if !collected.contains(&id) {
-            return self.free_object_ref(id);
-        }
-
-        let object = self
-            .objects
-            .get_mut(&id)
-            .ok_or(Error::JsObjectNotFound { object: id.0 })?;
-
-        if object.header.ref_count == 0 {
-            return Err(Error::JsRefCountUnderflow { object: id.0 });
-        }
-
-        // The whole collected cycle is removed as a group below, so internal
-        // edges are released without recursively draining zero-ref objects.
-        object.header.ref_count -= 1;
 
         Ok(())
     }
@@ -532,23 +515,27 @@ impl JsObject {
 
         // Do not add WeakRef/WeakMap-style edges here. This traversal is only
         // for strong references that keep the target object alive.
+        self.kind.visit_children(visitor);
     }
 
     pub fn release_children(self, heap: &mut JsHeap) -> Result<(), Error> {
-        let Self {
-            kind: _,
-            properties,
-        } = self;
+        let Self { kind, properties } = self;
 
         for property in properties.into_values() {
             heap.free_value(property.value)?;
         }
 
-        Ok(())
+        kind.release_children(heap)
     }
 
-    fn property_values(&self) -> Vec<JsValue> {
-        self.properties.values().map(JsProperty::value).collect()
+    fn child_values(&self) -> Vec<JsValue> {
+        let mut values = self
+            .properties
+            .values()
+            .map(JsProperty::value)
+            .collect::<Vec<_>>();
+        self.kind.append_child_values(&mut values);
+        values
     }
 }
 
@@ -556,9 +543,36 @@ impl JsObject {
 pub enum ObjectKind {
     Ordinary,
     HostFunction(HostFunction),
+    JsFunction(JsFunction),
     // If host object kinds later own JsValue children, add explicit strong and
     // weak child traversal hooks instead of treating all host state as ordinary
     // object properties.
+}
+
+impl ObjectKind {
+    fn visit_children(&self, visitor: &mut impl FnMut(ObjectId)) {
+        match self {
+            Self::Ordinary => {}
+            Self::HostFunction(host_function) => host_function.visit_children(visitor),
+            Self::JsFunction(function) => function.visit_children(visitor),
+        }
+    }
+
+    fn append_child_values(&self, values: &mut Vec<JsValue>) {
+        match self {
+            Self::Ordinary => {}
+            Self::HostFunction(host_function) => host_function.append_child_values(values),
+            Self::JsFunction(function) => function.append_child_values(values),
+        }
+    }
+
+    fn release_children(self, heap: &mut JsHeap) -> Result<(), Error> {
+        match self {
+            Self::Ordinary => Ok(()),
+            Self::HostFunction(host_function) => host_function.release_children(heap),
+            Self::JsFunction(function) => function.release_children(heap),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -606,6 +620,21 @@ impl HostFunction {
             }
         }
     }
+
+    fn visit_children(&self, _visitor: &mut impl FnMut(ObjectId)) {
+        // Console host functions currently own only a channel sender and scalar
+        // runtime id. If a host function later owns JsValue state, expose those
+        // strong children here so cycle collection sees them.
+    }
+
+    fn append_child_values(&self, _values: &mut Vec<JsValue>) {
+        // See visit_children: console host functions do not currently own JS
+        // values that need release during object teardown.
+    }
+
+    fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +647,31 @@ pub enum HostFunctionKind {
         runtime_id: JsRuntimeId,
         output_tx: JsOutputSender,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct JsFunction {
+    pub name: Option<Symbol>,
+    pub params: Vec<Symbol>,
+    pub body: BytecodeProgram,
+    pub captured_env: EnvFrameId,
+}
+
+impl JsFunction {
+    fn visit_children(&self, _visitor: &mut impl FnMut(ObjectId)) {
+        // Captured lexical environments live in the VM-owned EnvStack tables,
+        // not in the JS object heap. Binding cells retain their JsValue
+        // contents directly, so function objects do not expose captured envs as
+        // ordinary object-to-object heap edges.
+    }
+
+    fn append_child_values(&self, _values: &mut Vec<JsValue>) {
+        // See visit_children: environment cells are released by EnvStack.
+    }
+
+    fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 fn emit_console(

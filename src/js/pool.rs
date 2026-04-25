@@ -1062,6 +1062,36 @@ mod tests {
     }
 
     #[test]
+    fn console_host_objects_survive_gc_and_release_on_destroy() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) =
+            create_pool_runtime_with_policy(&mut sim, GcPolicy::ManualOnly)?;
+
+        force_gc(&mut sim, &worker, &pool, runtime_id)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                console.log(1);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"1\n");
+
+        destroy_runtime(&mut sim, &worker, &pool, runtime_id)?;
+
+        Ok(())
+    }
+
+    #[test]
     fn minimal_js_object_literal_property_get() -> Result<(), Error> {
         let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
         let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
@@ -1443,6 +1473,50 @@ mod tests {
     }
 
     #[test]
+    fn js_gc_preserves_externally_reachable_cycle_without_leaking_refs() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) =
+            create_pool_runtime_with_policy(&mut sim, GcPolicy::ManualOnly)?;
+        let baseline = heap_stats(&mut sim, &worker, &pool, runtime_id)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let root = {};
+
+                {
+                    let a = {};
+                    let b = {};
+
+                    root.a = a;
+                    a.b = b;
+                    b.a = a;
+                }
+
+                console.log(1);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        force_gc(&mut sim, &worker, &pool, runtime_id)?;
+
+        let stats = heap_stats(&mut sim, &worker, &pool, runtime_id)?;
+        assert_eq!(stats.allocated_objects, baseline.allocated_objects + 3);
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"1\n");
+
+        destroy_runtime(&mut sim, &worker, &pool, runtime_id)?;
+
+        Ok(())
+    }
+
+    #[test]
     fn js_gc_automatic_policy_collects_cycles_at_threshold() -> Result<(), Error> {
         let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
         let (worker, pool, runtime_id, output_rx) =
@@ -1517,6 +1591,215 @@ mod tests {
             collect_stdout(&output_rx, runtime_id),
             b"10\n3\n7\ntrue\n3\n"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_function_declaration_can_be_called() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                function add(a, b) {
+                    return a + b;
+                }
+
+                console.log(add(1, 2));
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_function_without_return_returns_undefined() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                function f() {
+                }
+
+                console.log(f());
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"undefined\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_function_value_can_be_called_through_variable() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                function add(a, b) {
+                    return a + b;
+                }
+
+                let f = add;
+                console.log(f(2, 3));
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"5\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_duplicate_plain_parameter_uses_last_argument_binding() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                function pickLast(x, x) {
+                    return x;
+                }
+
+                console.log(pickLast(1, 2));
+                console.log(pickLast(1));
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"2\nundefined\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_function_object_can_have_properties() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                function add(a, b) {
+                    return a + b;
+                }
+
+                add.x = 10;
+
+                console.log(add.x);
+                console.log(add(1, 2));
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"10\n3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_function_captures_outer_binding_cell() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let x = 10;
+
+                function readX() {
+                    return x;
+                }
+
+                x = 20;
+
+                console.log(readX());
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"20\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_calling_non_callable_value_errors() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, _output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let x = 1;
+                x();
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalFailed(Error::JsTypeError { message }) => {
+                assert_eq!(message, "property access expected object");
+            }
+            JsPoolReply::EvalFailed(Error::JsNotCallable) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
 
         Ok(())
     }
