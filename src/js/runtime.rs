@@ -1,31 +1,35 @@
-use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-};
-
-use bytes::Bytes;
-
 use crate::Error;
 
+use super::compile_source_to_bytecode;
 use super::{
-    JsHostIo, JsRuntimeAttachment, JsRuntimeId, JsValue, RuntimeConsole, SymbolTable, Vm,
-    compile_source_to_bytecode,
+    AttachmentInstallCtx, GcPolicy, HeapStats, JsAttachment, JsRuntimeId, JsValue, SymbolTable, Vm,
 };
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct JsRuntimeConfig {
+    pub gc_policy: GcPolicy,
+}
+
+impl Default for JsRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            gc_policy: GcPolicy::default(),
+        }
+    }
+}
 
 pub struct JsRuntimeInstance {
     id: JsRuntimeId,
     symbols: SymbolTable,
     vm: Vm,
-    attachments: HashMap<TypeId, Box<dyn Any + Send>>,
 }
 
 impl JsRuntimeInstance {
-    pub(crate) fn new(id: JsRuntimeId) -> Self {
+    pub(crate) fn with_config(id: JsRuntimeId, config: JsRuntimeConfig) -> Self {
         Self {
             id,
             symbols: SymbolTable::new(),
-            vm: Vm::new(),
-            attachments: HashMap::new(),
+            vm: Vm::with_gc_policy(config.gc_policy),
         }
     }
 
@@ -33,58 +37,45 @@ impl JsRuntimeInstance {
         self.id
     }
 
-    pub fn install(&mut self, attachment: Box<dyn JsRuntimeAttachment>) -> Result<(), Error> {
-        attachment.install(self)
-    }
+    pub(crate) fn install_attachment(
+        &mut self,
+        attachment: &dyn JsAttachment,
+    ) -> Result<(), Error> {
+        let (heap, global_env) = self.vm.install_parts_mut();
+        let mut ctx = AttachmentInstallCtx {
+            runtime_id: self.id,
+            symbols: &mut self.symbols,
+            heap,
+            global_env,
+        };
 
-    pub fn insert_attachment<T>(&mut self, attachment: T) -> Option<T>
-    where
-        T: Send + 'static,
-    {
-        let previous = self
-            .attachments
-            .insert(TypeId::of::<T>(), Box::new(attachment));
-
-        previous.and_then(|attachment| attachment.downcast::<T>().ok().map(|value| *value))
-    }
-
-    pub fn attachment<T>(&self) -> Option<&T>
-    where
-        T: Send + 'static,
-    {
-        self.attachments
-            .get(&TypeId::of::<T>())
-            .and_then(|attachment| attachment.downcast_ref::<T>())
-    }
-
-    pub fn attachment_mut<T>(&mut self) -> Option<&mut T>
-    where
-        T: Send + 'static,
-    {
-        self.attachments
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|attachment| attachment.downcast_mut::<T>())
+        attachment.install(&mut ctx)
     }
 
     pub fn eval(&mut self, source: &str) -> Result<JsValue, Error> {
         let program = compile_source_to_bytecode(source, &mut self.symbols)?;
-        let console = self.attachment::<RuntimeConsole>().cloned();
-        let mut host = RuntimeHostIo { console };
+        let result = self.vm.run(&program, &self.symbols);
+        let gc_result = self.vm.maybe_run_gc();
 
-        self.vm.run(&program, &self.symbols, &mut host)
+        gc_result?;
+        result
+    }
+
+    pub fn heap_stats(&self) -> HeapStats {
+        self.vm.heap_stats()
+    }
+
+    pub fn force_gc(&mut self) -> Result<usize, Error> {
+        self.vm.force_gc()
+    }
+
+    pub fn destroy(mut self) -> Result<(), Error> {
+        self.vm.destroy()
     }
 }
 
-struct RuntimeHostIo {
-    console: Option<RuntimeConsole>,
-}
-
-impl JsHostIo for RuntimeHostIo {
-    fn console_log(&mut self, value: JsValue) -> Result<(), Error> {
-        let console = self.console.as_ref().ok_or(Error::MissingConsole)?;
-        let mut line = value.stringify();
-        line.push('\n');
-
-        console.stdout.write(Bytes::from(line))
+impl Drop for JsRuntimeInstance {
+    fn drop(&mut self) {
+        let _ = self.vm.destroy();
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::Error;
 
-use super::{JsValue, Symbol, SymbolTable};
+use super::{JsHeap, JsValue, Symbol, SymbolTable};
 
 pub struct EnvStack {
     scopes: Vec<LexicalEnv>,
@@ -55,10 +55,8 @@ impl LexicalEnv {
         Ok(())
     }
 
-    fn get(&self, name: Symbol) -> Option<JsValue> {
-        self.bindings
-            .get(&name)
-            .map(|binding| binding.value.clone())
+    fn get(&self, name: Symbol) -> Option<&Binding> {
+        self.bindings.get(&name)
     }
 
     fn get_mut(&mut self, name: Symbol) -> Option<&mut Binding> {
@@ -77,12 +75,13 @@ impl EnvStack {
         self.scopes.push(LexicalEnv::new());
     }
 
-    pub(crate) fn pop_scope(&mut self) -> Result<(), Error> {
+    pub(crate) fn pop_scope(&mut self, heap: &mut JsHeap) -> Result<(), Error> {
         if self.scopes.len() == 1 {
             return Err(Error::JsCannotPopRootScope);
         }
 
-        self.scopes.pop();
+        let scope = self.scopes.pop().expect("scope length checked above");
+        release_scope(scope, heap)?;
 
         Ok(())
     }
@@ -91,10 +90,17 @@ impl EnvStack {
         self.scopes.len()
     }
 
-    pub(crate) fn truncate_to_depth(&mut self, depth: usize) {
+    pub(crate) fn truncate_to_depth(
+        &mut self,
+        depth: usize,
+        heap: &mut JsHeap,
+    ) -> Result<(), Error> {
         while self.scopes.len() > depth && self.scopes.len() > 1 {
-            self.scopes.pop();
+            let scope = self.scopes.pop().expect("scope length checked above");
+            release_scope(scope, heap)?;
         }
+
+        Ok(())
     }
 
     pub(crate) fn declare_current(
@@ -109,20 +115,44 @@ impl EnvStack {
             .declare(name, kind, symbols)
     }
 
-    pub(crate) fn lookup(&self, name: Symbol, symbols: &SymbolTable) -> Result<JsValue, Error> {
-        self.scopes
+    pub fn declare_current_value(
+        &mut self,
+        name: Symbol,
+        kind: BindingKind,
+        value: JsValue,
+        heap: &mut JsHeap,
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
+        self.declare_current(name, kind, symbols)?;
+        self.store(name, value, heap, symbols)
+    }
+
+    pub(crate) fn lookup(
+        &self,
+        name: Symbol,
+        heap: &mut JsHeap,
+        symbols: &SymbolTable,
+    ) -> Result<JsValue, Error> {
+        let value = self
+            .scopes
             .iter()
             .rev()
             .find_map(|scope| scope.get(name))
+            .map(|binding| binding.value.clone())
             .ok_or_else(|| Error::JsBindingNotFound {
                 name: symbols.resolve_expect(name).to_owned(),
-            })
+            })?;
+
+        heap.dup_value(&value);
+
+        Ok(value)
     }
 
     pub(crate) fn store(
         &mut self,
         name: Symbol,
         value: JsValue,
+        heap: &mut JsHeap,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
         for scope in self.scopes.iter_mut().rev() {
@@ -136,7 +166,9 @@ impl EnvStack {
                 });
             }
 
-            binding.value = value;
+            heap.dup_value(&value);
+            let old = std::mem::replace(&mut binding.value, value);
+            heap.free_value(old)?;
             binding.initialized = true;
 
             return Ok(());
@@ -146,4 +178,20 @@ impl EnvStack {
             name: symbols.resolve_expect(name).to_owned(),
         })
     }
+
+    pub(crate) fn release_all_scopes(&mut self, heap: &mut JsHeap) -> Result<(), Error> {
+        while let Some(scope) = self.scopes.pop() {
+            release_scope(scope, heap)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn release_scope(scope: LexicalEnv, heap: &mut JsHeap) -> Result<(), Error> {
+    for binding in scope.bindings.into_values() {
+        heap.free_value(binding.value)?;
+    }
+
+    Ok(())
 }

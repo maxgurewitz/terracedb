@@ -230,22 +230,10 @@ impl Compiler {
             return Ok(());
         }
 
-        if let Expression::Call(call) = expr {
-            if !is_console_method(call.function(), "log", interner) {
-                return unsupported("expression statement", span_of(expr));
-            }
+        self.compile_expr(expr, interner, symbols)?;
+        self.emit(Instr::Pop);
 
-            let [arg] = call.args() else {
-                return unsupported("console.log arity", span_of(expr));
-            };
-
-            self.compile_expr(arg, interner, symbols)?;
-            self.emit(Instr::ConsoleLog);
-
-            return Ok(());
-        }
-
-        self.compile_expr(expr, interner, symbols)
+        Ok(())
     }
 
     fn compile_expr(
@@ -292,6 +280,15 @@ impl Compiler {
             Expression::PropertyAccess(access) => {
                 self.compile_property_access(access, interner, symbols)?;
             }
+            Expression::Call(call) => {
+                self.compile_expr(call.function(), interner, symbols)?;
+
+                for arg in call.args() {
+                    self.compile_expr(arg, interner, symbols)?;
+                }
+
+                self.emit(Instr::Call(call.args().len()));
+            }
             Expression::Unary(unary) => {
                 if unary.op() != BoaUnaryOp::Not {
                     return unsupported("unary operator", span_of(expr));
@@ -337,6 +334,10 @@ impl Compiler {
                 self.compile_expr(target, interner, symbols)?;
                 self.compile_expr(assign.rhs(), interner, symbols)?;
                 self.emit(Instr::SetProperty(key));
+
+                if !leave_value {
+                    self.emit(Instr::Pop);
+                }
             }
             AssignTarget::Pattern(_) => {
                 return unsupported("assignment pattern", span_of(assign));
@@ -523,26 +524,6 @@ fn lower_property_access<'a>(
     Ok((access.target(), key))
 }
 
-fn is_console_method(expr: &Expression, method: &str, interner: &Interner) -> bool {
-    let Expression::PropertyAccess(PropertyAccess::Simple(access)) = expr.flatten() else {
-        return false;
-    };
-
-    let Expression::Identifier(target) = access.target().flatten() else {
-        return false;
-    };
-
-    if target.to_interned_string(interner) != "console" {
-        return false;
-    }
-
-    let PropertyAccessField::Const(field) = access.field() else {
-        return false;
-    };
-
-    field.to_interned_string(interner) == method
-}
-
 fn expression_feature(expr: &Expression) -> &'static str {
     match expr {
         Expression::This(_) => "this expression",
@@ -609,7 +590,7 @@ mod tests {
     use crate::{Instr, SymbolTable};
 
     #[test]
-    fn compiler_emits_bytecode_for_let_and_console_log() {
+    fn compiler_emits_bytecode_for_let_and_member_call() {
         let mut symbols = SymbolTable::new();
         let program = compile_source_to_bytecode(
             r#"
@@ -630,7 +611,13 @@ mod tests {
             program
                 .instructions
                 .iter()
-                .any(|instr| matches!(instr, Instr::ConsoleLog))
+                .any(|instr| matches!(instr, Instr::GetProperty(_)))
+        );
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instr| matches!(instr, Instr::Call(1)))
         );
         assert!(matches!(program.instructions.last(), Some(Instr::Halt)));
     }
