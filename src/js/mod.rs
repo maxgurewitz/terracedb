@@ -2,6 +2,7 @@ mod attachment;
 mod bindings;
 mod bytecode;
 mod compile;
+mod heap;
 mod ids;
 mod output;
 mod pool;
@@ -14,6 +15,7 @@ pub use attachment::{ConsoleAttachment, JsAttachment, JsRuntimeAttachment, Runti
 pub use bindings::{Binding, BindingKind, EnvStack, LexicalEnv};
 pub use bytecode::{BytecodeProgram, ConstId, Constant, ConstantPool, Instr};
 pub use compile::{JsCompileError, JsSpan, compile_source_to_bytecode};
+pub use heap::{JsHeap, JsObject, JsProperty, ObjectId, ObjectKind, PropertyKey};
 pub use ids::JsRuntimeId;
 pub use output::{ChannelByteSink, JsOutputChunk, JsOutputReceiver, JsOutputSender, JsStreamKind};
 pub use pool::{JsPoolMsg, JsPoolReply, JsRuntimePoolActor, JsRuntimePoolConfig};

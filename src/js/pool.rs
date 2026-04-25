@@ -801,6 +801,110 @@ mod tests {
     }
 
     #[test]
+    fn minimal_js_object_literal_property_get() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let obj = { x: 1, y: 2 };
+                console.log(obj.x + obj.y);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_object_property_assignment() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let obj = {};
+                obj.x = 1;
+                obj.x = obj.x + 2;
+                console.log(obj.x);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_missing_property_is_undefined() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let obj = {};
+                console.log(obj.missing);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"undefined\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_property_access_on_non_object_errors() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, _output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let x = 1;
+                console.log(x.y);
+            "#,
+        )?;
+
+        assert!(matches!(
+            reply,
+            JsPoolReply::EvalFailed(Error::JsTypeError { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn minimal_js_bytecode_vm_preserves_existing_behavior() -> Result<(), Error> {
         let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
         let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;

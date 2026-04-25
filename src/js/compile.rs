@@ -3,7 +3,7 @@ use boa_ast::{
     declaration::{Binding, LexicalDeclaration, VariableList},
     expression::{
         access::{PropertyAccess, PropertyAccessField},
-        literal::LiteralKind,
+        literal::{LiteralKind, ObjectLiteral, PropertyDefinition},
         operator::{
             assign::{AssignOp, AssignTarget},
             binary::{
@@ -13,6 +13,7 @@ use boa_ast::{
             unary::UnaryOp as BoaUnaryOp,
         },
     },
+    property::PropertyName,
     scope::Scope,
 };
 use boa_interner::{Interner, ToInternedString};
@@ -20,7 +21,9 @@ use boa_parser::{Parser, Source};
 
 use crate::Error;
 
-use super::{BindingKind, BytecodeProgram, ConstId, Constant, Instr, Symbol, SymbolTable};
+use super::{
+    BindingKind, BytecodeProgram, ConstId, Constant, Instr, PropertyKey, Symbol, SymbolTable,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JsSpan {
@@ -283,6 +286,12 @@ impl Compiler {
             Expression::Assign(assign) => {
                 self.compile_assignment(assign, interner, symbols, true)?;
             }
+            Expression::ObjectLiteral(object) => {
+                self.compile_object_literal(object, interner, symbols)?;
+            }
+            Expression::PropertyAccess(access) => {
+                self.compile_property_access(access, interner, symbols)?;
+            }
             Expression::Unary(unary) => {
                 if unary.op() != BoaUnaryOp::Not {
                     return unsupported("unary operator", span_of(expr));
@@ -311,17 +320,63 @@ impl Compiler {
             return unsupported("compound assignment", span_of(assign));
         }
 
-        let AssignTarget::Identifier(identifier) = assign.lhs() else {
-            return unsupported("assignment target", span_of(assign));
-        };
-        let name = lower_identifier(*identifier, interner, symbols);
+        match assign.lhs() {
+            AssignTarget::Identifier(identifier) => {
+                let name = lower_identifier(*identifier, interner, symbols);
 
-        self.compile_expr(assign.rhs(), interner, symbols)?;
-        self.emit(Instr::StoreBinding(name));
+                self.compile_expr(assign.rhs(), interner, symbols)?;
+                self.emit(Instr::StoreBinding(name));
 
-        if leave_value {
-            self.emit(Instr::LoadBinding(name));
+                if leave_value {
+                    self.emit(Instr::LoadBinding(name));
+                }
+            }
+            AssignTarget::Access(access) => {
+                let (target, key) = lower_property_access(access, interner, symbols)?;
+
+                self.compile_expr(target, interner, symbols)?;
+                self.compile_expr(assign.rhs(), interner, symbols)?;
+                self.emit(Instr::SetProperty(key));
+            }
+            AssignTarget::Pattern(_) => {
+                return unsupported("assignment pattern", span_of(assign));
+            }
         }
+
+        Ok(())
+    }
+
+    fn compile_object_literal(
+        &mut self,
+        object: &ObjectLiteral,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        self.emit(Instr::NewObject);
+
+        for property in object.properties() {
+            let PropertyDefinition::Property(name, expr) = property else {
+                return unsupported("object literal property", JsSpan::unknown());
+            };
+
+            let key = lower_property_name(name, interner, symbols)?;
+            self.compile_expr(expr, interner, symbols)?;
+            self.emit(Instr::DefineProperty(key));
+        }
+
+        Ok(())
+    }
+
+    fn compile_property_access(
+        &mut self,
+        access: &PropertyAccess,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        let (target, key) = lower_property_access(access, interner, symbols)?;
+
+        self.compile_expr(target, interner, symbols)?;
+        self.emit(Instr::GetProperty(key));
 
         Ok(())
     }
@@ -432,6 +487,40 @@ fn lower_identifier(
     let name = identifier.to_interned_string(interner);
 
     symbols.intern(&name)
+}
+
+fn lower_property_name(
+    name: &PropertyName,
+    interner: &Interner,
+    symbols: &mut SymbolTable,
+) -> Result<PropertyKey, Error> {
+    let PropertyName::Literal(identifier) = name else {
+        return unsupported("computed property name", JsSpan::unknown());
+    };
+
+    Ok(PropertyKey::Symbol(lower_identifier(
+        *identifier,
+        interner,
+        symbols,
+    )))
+}
+
+fn lower_property_access<'a>(
+    access: &'a PropertyAccess,
+    interner: &Interner,
+    symbols: &mut SymbolTable,
+) -> Result<(&'a Expression, PropertyKey), Error> {
+    let PropertyAccess::Simple(access) = access else {
+        return unsupported("property access", span_of(access));
+    };
+
+    let PropertyAccessField::Const(field) = access.field() else {
+        return unsupported("computed property access", span_of(access));
+    };
+
+    let key = PropertyKey::Symbol(lower_identifier(*field, interner, symbols));
+
+    Ok((access.target(), key))
 }
 
 fn is_console_method(expr: &Expression, method: &str, interner: &Interner) -> bool {

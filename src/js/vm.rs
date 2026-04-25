@@ -1,6 +1,6 @@
 use crate::Error;
 
-use super::{BytecodeProgram, EnvStack, Instr, JsValue, SymbolTable};
+use super::{BytecodeProgram, EnvStack, Instr, JsHeap, JsValue, ObjectId, ObjectKind, SymbolTable};
 
 pub(crate) trait JsHostIo {
     fn console_log(&mut self, value: JsValue) -> Result<(), Error>;
@@ -10,6 +10,7 @@ pub struct Vm {
     ip: usize,
     stack: Vec<JsValue>,
     env: EnvStack,
+    heap: JsHeap,
 }
 
 impl Vm {
@@ -18,6 +19,7 @@ impl Vm {
             ip: 0,
             stack: Vec::new(),
             env: EnvStack::new(),
+            heap: JsHeap::new(),
         }
     }
 
@@ -118,6 +120,27 @@ impl Vm {
                     let value = self.pop()?;
                     host.console_log(value)?;
                 }
+                Instr::NewObject => {
+                    let object = self.heap.alloc_object(ObjectKind::Ordinary);
+                    self.stack.push(JsValue::Object(object));
+                }
+                Instr::DefineProperty(key) => {
+                    let value = self.pop()?;
+                    let object =
+                        expect_object(self.stack.last().cloned().ok_or(Error::JsStackUnderflow)?)?;
+                    self.heap.set_property(object, *key, value)?;
+                }
+                Instr::GetProperty(key) => {
+                    let object = expect_object(self.pop()?)?;
+                    let value = self.heap.get_property(object, *key)?;
+                    self.stack.push(value);
+                }
+                Instr::SetProperty(key) => {
+                    let value = self.pop()?;
+                    let object = expect_object(self.pop()?)?;
+                    self.heap.set_property(object, *key, value.clone())?;
+                    self.stack.push(value);
+                }
                 Instr::Halt => {
                     return Ok(JsValue::Undefined);
                 }
@@ -164,6 +187,15 @@ fn expect_bool(value: JsValue) -> Result<bool, Error> {
         JsValue::Bool(value) => Ok(value),
         _ => Err(Error::JsTypeError {
             message: "operator expected booleans".to_owned(),
+        }),
+    }
+}
+
+fn expect_object(value: JsValue) -> Result<ObjectId, Error> {
+    match value {
+        JsValue::Object(value) => Ok(value),
+        _ => Err(Error::JsTypeError {
+            message: "property access expected object".to_owned(),
         }),
     }
 }

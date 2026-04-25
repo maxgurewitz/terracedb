@@ -1,6 +1,6 @@
 use crate::Error;
 
-use super::{JsValue, Symbol};
+use super::{JsValue, PropertyKey, Symbol};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
@@ -99,5 +99,9 @@ pub enum Instr {
     JumpIfFalse(usize),
     JumpIfTrue(usize),
     ConsoleLog,
+    NewObject,
+    DefineProperty(PropertyKey),
+    GetProperty(PropertyKey),
+    SetProperty(PropertyKey),
     Halt,
 }

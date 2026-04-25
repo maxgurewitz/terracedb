@@ -1,3 +1,5 @@
+use super::ObjectId;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsValue {
     Number(f64),
@@ -5,6 +7,7 @@ pub enum JsValue {
     String(String),
     Null,
     Undefined,
+    Object(ObjectId),
 }
 
 impl JsValue {
@@ -18,6 +21,7 @@ impl JsValue {
             Self::String(value) => value.clone(),
             Self::Null => "null".to_owned(),
             Self::Undefined => "undefined".to_owned(),
+            Self::Object(_) => "[object Object]".to_owned(),
         }
     }
 }

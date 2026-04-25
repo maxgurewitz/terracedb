@@ -19,6 +19,7 @@ pub enum Error {
     JsInvalidConstant { id: u32 },
     JsInvalidConsoleCall,
     JsInvalidOperand,
+    JsObjectNotFound { object: u64 },
     JsStackUnderflow,
     JsTypeError { message: String },
     MissingConsole,
