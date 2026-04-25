@@ -20,13 +20,14 @@ pub use env::{
 };
 pub use error::Error;
 pub use js::{
-    AttachmentInstallCtx, Binding, BindingCellId, BindingKind, BytecodeProgram, ChannelByteSink,
-    ConsoleAttachment, ConstId, Constant, ConstantPool, DEFAULT_GC_THRESHOLD_BYTES, EnvFrame,
-    EnvFrameId, EnvStack, GcHeader, GcMark, GcPolicy, HeapObject, HeapStats, HostFunction,
-    HostFunctionKind, Instr, JsAttachment, JsCompileError, JsHeap, JsObject, JsOutputChunk,
-    JsOutputReceiver, JsOutputSender, JsPoolMsg, JsPoolReply, JsProperty, JsRuntimeConfig,
-    JsRuntimeId, JsRuntimeInstance, JsRuntimePoolActor, JsRuntimePoolConfig, JsSpan, JsStreamKind,
-    JsValue, ObjectId, ObjectKind, PropertyKey, Symbol, SymbolTable, Vm,
+    AttachmentHostCtx, AttachmentInstallCtx, Binding, BindingCellId, BindingKind, BytecodeProgram,
+    ChannelByteSink, ConsoleAttachment, ConstId, Constant, ConstantPool,
+    DEFAULT_GC_THRESHOLD_BYTES, EnvFrame, EnvFrameId, EnvStack, GcHeader, GcMark, GcPolicy,
+    HeapObject, HeapStats, HostFunction, HostFunctionKind, Instr, InstructionBudget, JsAttachment,
+    JsCompileError, JsHeap, JsHostBindings, JsObject, JsOutputChunk, JsOutputReceiver,
+    JsOutputSender, JsPoolMsg, JsPoolReply, JsProperty, JsRuntimeConfig, JsRuntimeId,
+    JsRuntimeInstance, JsRuntimePoolActor, JsRuntimePoolConfig, JsSpan, JsStreamKind, JsValue,
+    ObjectId, ObjectKind, PropertyKey, RunResult, Symbol, SymbolTable, Vm,
     compile_source_to_bytecode,
 };
 pub use runtime::{

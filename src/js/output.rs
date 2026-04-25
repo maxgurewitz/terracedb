@@ -4,7 +4,9 @@ use crate::Error;
 
 use super::JsRuntimeId;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum JsStreamKind {
     Stdout,
     Stderr,

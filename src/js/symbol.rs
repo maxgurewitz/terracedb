@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Symbol(pub u32);
 
+#[derive(Deserialize, Serialize)]
 pub struct SymbolTable {
     names: Vec<String>,
     by_name: HashMap<String, Symbol>,

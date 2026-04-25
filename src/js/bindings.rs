@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::Error;
 
 use super::{JsHeap, JsValue, Symbol, SymbolTable};
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct EnvStack {
     root: EnvFrameId,
     current: EnvFrameId,
@@ -12,7 +14,7 @@ pub struct EnvStack {
     cells: Vec<Option<Binding>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct EnvFrame {
     parent: Option<EnvFrameId>,
     bindings: HashMap<Symbol, BindingCellId>,
@@ -21,20 +23,20 @@ pub struct EnvFrame {
     capture_count: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Binding {
     kind: BindingKind,
     value: JsValue,
     initialized: bool,
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct BindingCellId(pub u32);
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct EnvFrameId(pub u32);
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BindingKind {
     Let,
     Const,

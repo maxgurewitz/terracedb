@@ -23,6 +23,8 @@ pub enum Error {
     JsInvalidFunction { id: u32 },
     JsInvalidOperand,
     JsNotCallable,
+    JsRuntimeAlreadyExists(JsRuntimeId),
+    JsSnapshot(String),
     JsHeapLeak { objects: usize, bytes: usize },
     JsObjectNotFound { object: u64 },
     JsRefCountUnderflow { object: u64 },

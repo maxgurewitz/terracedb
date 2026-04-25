@@ -1,25 +1,23 @@
 use std::{collections::HashMap, mem};
 
-use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-use super::{
-    BytecodeProgram, EnvFrameId, JsOutputChunk, JsOutputSender, JsRuntimeId, JsStreamKind, JsValue,
-    Symbol, SymbolTable,
-};
+use super::attachment::JsHostBindings;
+use super::{BytecodeProgram, EnvFrameId, JsStreamKind, JsValue, Symbol, SymbolTable};
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ObjectId(pub u64);
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum PropertyKey {
     Symbol(Symbol),
 }
 
 pub const DEFAULT_GC_THRESHOLD_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum GcPolicy {
     ManualOnly,
     Automatic { threshold_bytes: usize },
@@ -33,7 +31,7 @@ impl Default for GcPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsHeap {
     next_object_id: u64,
     objects: HashMap<ObjectId, HeapObject>,
@@ -51,33 +49,33 @@ pub struct JsHeap {
     gc_phase: GcPhase,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HeapObject {
     header: GcHeader,
     object: JsObject,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GcHeader {
     pub ref_count: u32,
     pub mark: GcMark,
     pub bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum GcMark {
     None,
     Tmp,
     Live,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 enum GcPhase {
     None,
     RemoveCycles,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HeapStats {
     pub allocated_objects: usize,
     pub allocated_bytes: usize,
@@ -498,7 +496,7 @@ impl Default for JsHeap {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsObject {
     kind: ObjectKind,
     properties: HashMap<PropertyKey, JsProperty>,
@@ -567,7 +565,7 @@ impl JsObject {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum ObjectKind {
     Ordinary,
     HostFunction(HostFunction),
@@ -611,7 +609,7 @@ impl ObjectKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsProperty {
     value: JsValue,
 }
@@ -626,32 +624,27 @@ impl JsProperty {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HostFunction {
     pub name: Symbol,
     pub kind: HostFunctionKind,
 }
 
 impl HostFunction {
-    pub fn call(
+    pub(crate) fn call(
         &self,
         args: &[JsValue],
+        host: &JsHostBindings,
         _heap: &mut JsHeap,
         _symbols: &SymbolTable,
     ) -> Result<JsValue, Error> {
         match &self.kind {
-            HostFunctionKind::ConsoleLog {
-                runtime_id,
-                output_tx,
-            } => {
-                emit_console(*runtime_id, JsStreamKind::Stdout, output_tx, args)?;
+            HostFunctionKind::ConsoleLog => {
+                host.emit_console(JsStreamKind::Stdout, args)?;
                 Ok(JsValue::Undefined)
             }
-            HostFunctionKind::ConsoleError {
-                runtime_id,
-                output_tx,
-            } => {
-                emit_console(*runtime_id, JsStreamKind::Stderr, output_tx, args)?;
+            HostFunctionKind::ConsoleError => {
+                host.emit_console(JsStreamKind::Stderr, args)?;
                 Ok(JsValue::Undefined)
             }
         }
@@ -679,19 +672,13 @@ impl HostFunction {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum HostFunctionKind {
-    ConsoleLog {
-        runtime_id: JsRuntimeId,
-        output_tx: JsOutputSender,
-    },
-    ConsoleError {
-        runtime_id: JsRuntimeId,
-        output_tx: JsOutputSender,
-    },
+    ConsoleLog,
+    ConsoleError,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsFunction {
     pub name: Option<Symbol>,
     pub params: Vec<Symbol>,
@@ -723,28 +710,6 @@ impl JsFunction {
 pub(crate) struct RuntimeEdges {
     pub(crate) objects: Vec<ObjectId>,
     pub(crate) frames: Vec<EnvFrameId>,
-}
-
-fn emit_console(
-    runtime_id: JsRuntimeId,
-    stream: JsStreamKind,
-    output_tx: &JsOutputSender,
-    args: &[JsValue],
-) -> Result<(), Error> {
-    let mut line = args
-        .iter()
-        .map(JsValue::stringify)
-        .collect::<Vec<_>>()
-        .join(" ");
-    line.push('\n');
-
-    output_tx
-        .send(JsOutputChunk {
-            runtime_id,
-            stream,
-            bytes: Bytes::from(line),
-        })
-        .map_err(|_| Error::OutputReceiverDropped)
 }
 
 fn estimate_object_bytes(object: &JsObject) -> usize {

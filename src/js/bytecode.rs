@@ -2,7 +2,9 @@ use crate::Error;
 
 use super::{JsValue, PropertyKey, Symbol};
 
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub enum Constant {
     Number(f64),
     Bool(bool),
@@ -23,13 +25,13 @@ impl Constant {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ConstId(pub u32);
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct FunctionId(pub u32);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct ConstantPool {
     values: Vec<Constant>,
 }
@@ -58,14 +60,14 @@ impl Default for ConstantPool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct BytecodeProgram {
     pub constants: ConstantPool,
     pub functions: Vec<CompiledFunction>,
     pub instructions: Vec<Instr>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct CompiledFunction {
     pub name: Option<Symbol>,
     pub params: Vec<Symbol>,
@@ -100,7 +102,7 @@ impl Default for BytecodeProgram {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub enum Instr {
     LoadConst(ConstId),
     PushScope,

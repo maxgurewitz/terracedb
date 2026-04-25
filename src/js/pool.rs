@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use crate::{Actor, Env, Error, WorkerShardCtx};
 
 use super::{
-    GcPolicy, HeapStats, JsAttachment, JsRuntimeConfig, JsRuntimeId, JsRuntimeInstance, JsValue,
+    GcPolicy, HeapStats, InstructionBudget, JsAttachment, JsRuntimeConfig, JsRuntimeId,
+    JsRuntimeInstance, JsValue, RunResult,
 };
 
 pub struct JsRuntimePoolConfig {
@@ -34,6 +35,26 @@ pub enum JsPoolMsg {
         runtime_id: JsRuntimeId,
         source: String,
     },
+    EvalStart {
+        runtime_id: JsRuntimeId,
+        source: String,
+    },
+    RunForBudget {
+        runtime_id: JsRuntimeId,
+        budget: InstructionBudget,
+    },
+    RunUntilComplete {
+        runtime_id: JsRuntimeId,
+    },
+    SerializeRuntime {
+        runtime_id: JsRuntimeId,
+    },
+    DropRuntime {
+        runtime_id: JsRuntimeId,
+    },
+    DeserializeRuntime {
+        bytes: Vec<u8>,
+    },
     ForceGc {
         runtime_id: JsRuntimeId,
     },
@@ -50,6 +71,10 @@ pub enum JsPoolReply {
     RuntimeCreated(JsRuntimeId),
     EvalCompleted(JsValue),
     EvalFailed(Error),
+    RunResult(RunResult),
+    RuntimeSerialized { bytes: Vec<u8> },
+    RuntimeDropped,
+    RuntimeDeserialized { runtime_id: JsRuntimeId },
     GcCompleted { freed: usize },
     HeapStats(HeapStats),
     RuntimeDestroyed,
@@ -94,6 +119,73 @@ impl JsRuntimePoolActor {
             Ok(value) => Ok(JsPoolReply::EvalCompleted(value)),
             Err(err) => Ok(JsPoolReply::EvalFailed(err)),
         }
+    }
+
+    fn eval_start(&mut self, runtime_id: JsRuntimeId, source: &str) -> Result<JsPoolReply, Error> {
+        let runtime = self
+            .runtimes
+            .get_mut(&runtime_id)
+            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+
+        Ok(JsPoolReply::RunResult(runtime.eval_start(source)))
+    }
+
+    fn run_for_budget(
+        &mut self,
+        runtime_id: JsRuntimeId,
+        budget: InstructionBudget,
+    ) -> Result<JsPoolReply, Error> {
+        let runtime = self
+            .runtimes
+            .get_mut(&runtime_id)
+            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+
+        Ok(JsPoolReply::RunResult(runtime.run_for_budget(budget)))
+    }
+
+    fn run_until_complete(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
+        let runtime = self
+            .runtimes
+            .get_mut(&runtime_id)
+            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+
+        Ok(JsPoolReply::RunResult(runtime.run_until_complete()))
+    }
+
+    fn serialize_runtime(&self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
+        let runtime = self
+            .runtimes
+            .get(&runtime_id)
+            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+
+        Ok(JsPoolReply::RuntimeSerialized {
+            bytes: runtime.serialize()?,
+        })
+    }
+
+    fn drop_runtime(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
+        let runtime = self
+            .runtimes
+            .remove(&runtime_id)
+            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+
+        runtime.destroy()?;
+
+        Ok(JsPoolReply::RuntimeDropped)
+    }
+
+    fn deserialize_runtime(&mut self, bytes: &[u8]) -> Result<JsPoolReply, Error> {
+        let runtime = JsRuntimeInstance::deserialize(bytes, &self.attachments)?;
+        let runtime_id = runtime.id();
+
+        if self.runtimes.contains_key(&runtime_id) {
+            return Err(Error::JsRuntimeAlreadyExists(runtime_id));
+        }
+
+        self.next_runtime_id = self.next_runtime_id.max(runtime_id.0 + 1);
+        self.runtimes.insert(runtime_id, runtime);
+
+        Ok(JsPoolReply::RuntimeDeserialized { runtime_id })
     }
 
     fn force_gc(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
@@ -141,6 +233,14 @@ impl Actor<WorkerShardCtx> for JsRuntimePoolActor {
         match msg {
             JsPoolMsg::CreateRuntime => self.create_runtime(),
             JsPoolMsg::Eval { runtime_id, source } => self.eval(runtime_id, &source),
+            JsPoolMsg::EvalStart { runtime_id, source } => self.eval_start(runtime_id, &source),
+            JsPoolMsg::RunForBudget { runtime_id, budget } => {
+                self.run_for_budget(runtime_id, budget)
+            }
+            JsPoolMsg::RunUntilComplete { runtime_id } => self.run_until_complete(runtime_id),
+            JsPoolMsg::SerializeRuntime { runtime_id } => self.serialize_runtime(runtime_id),
+            JsPoolMsg::DropRuntime { runtime_id } => self.drop_runtime(runtime_id),
+            JsPoolMsg::DeserializeRuntime { bytes } => self.deserialize_runtime(&bytes),
             JsPoolMsg::ForceGc { runtime_id } => self.force_gc(runtime_id),
             JsPoolMsg::HeapStats { runtime_id } => self.heap_stats(runtime_id),
             JsPoolMsg::DestroyRuntime { runtime_id } => self.destroy_runtime(runtime_id),
@@ -391,6 +491,22 @@ mod tests {
         assert_eq!(stderr_by_runtime.get(&runtime_id).map(Vec::as_slice), None);
 
         Ok(())
+    }
+
+    fn pool_call(
+        sim: &mut SimRuntime,
+        worker: &WorkerHandle,
+        pool: &ActorRef<JsRuntimePoolActor>,
+        msg: JsPoolMsg,
+    ) -> Result<JsPoolReply, Error> {
+        let call = sim.call(worker, pool.id, Box::new(msg))?;
+
+        sim.run_until_idle()?;
+
+        call.wait()?
+            .downcast::<JsPoolReply>()
+            .map(|reply| *reply)
+            .map_err(|_| Error::ActorReplyTypeMismatch)
     }
 
     #[test]
@@ -1835,6 +1951,199 @@ mod tests {
         assert_eq!(released.allocated_objects, baseline.allocated_objects);
         assert_eq!(released.allocated_bytes, baseline.allocated_bytes);
         assert_eq!(collect_stdout(&output_rx, runtime_id), b"[object Object]\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_runtime_serializes_mid_program_and_resumes_through_pool() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) =
+            create_pool_runtime_with_policy(&mut sim, GcPolicy::ManualOnly)?;
+
+        let start = pool_call(
+            &mut sim,
+            &worker,
+            &pool,
+            JsPoolMsg::EvalStart {
+                runtime_id,
+                source: r#"
+                    function add(a, b) {
+                        let c = a + b;
+                        return c;
+                    }
+
+                    let x = add(1, 2);
+                    console.log(x);
+                "#
+                .to_owned(),
+            },
+        )?;
+
+        assert_eq!(start, JsPoolReply::RunResult(RunResult::Suspended));
+
+        let run = pool_call(
+            &mut sim,
+            &worker,
+            &pool,
+            JsPoolMsg::RunForBudget {
+                runtime_id,
+                budget: InstructionBudget { instructions: 3 },
+            },
+        )?;
+
+        assert_eq!(run, JsPoolReply::RunResult(RunResult::Suspended));
+        assert!(output_rx.try_recv().is_err());
+
+        let bytes = match pool_call(
+            &mut sim,
+            &worker,
+            &pool,
+            JsPoolMsg::SerializeRuntime { runtime_id },
+        )? {
+            JsPoolReply::RuntimeSerialized { bytes } => bytes,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        assert!(!bytes.is_empty());
+
+        let dropped = pool_call(
+            &mut sim,
+            &worker,
+            &pool,
+            JsPoolMsg::DropRuntime { runtime_id },
+        )?;
+
+        assert_eq!(dropped, JsPoolReply::RuntimeDropped);
+
+        let restored_id = match pool_call(
+            &mut sim,
+            &worker,
+            &pool,
+            JsPoolMsg::DeserializeRuntime { bytes },
+        )? {
+            JsPoolReply::RuntimeDeserialized { runtime_id } => runtime_id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        assert_eq!(restored_id, runtime_id);
+
+        let done = pool_call(
+            &mut sim,
+            &worker,
+            &pool,
+            JsPoolMsg::RunUntilComplete { runtime_id },
+        )?;
+
+        assert_eq!(
+            done,
+            JsPoolReply::RunResult(RunResult::Completed(JsValue::Undefined))
+        );
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_runtime_deserialize_rebinds_console_to_current_pool_attachment() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let worker = sim.workers()[0].clone();
+        let (output_tx_1, output_rx_1) = flume::unbounded::<JsOutputChunk>();
+        let pool_1 = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(JsRuntimePoolConfig {
+                attachments: vec![Box::new(ConsoleAttachment {
+                    output_tx: output_tx_1,
+                })],
+                gc_policy: GcPolicy::ManualOnly,
+            }),
+        )?;
+
+        let runtime_id = match pool_call(&mut sim, &worker, &pool_1, JsPoolMsg::CreateRuntime)? {
+            JsPoolReply::RuntimeCreated(runtime_id) => runtime_id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        assert_eq!(
+            pool_call(
+                &mut sim,
+                &worker,
+                &pool_1,
+                JsPoolMsg::EvalStart {
+                    runtime_id,
+                    source: "console.log(3);".to_owned(),
+                },
+            )?,
+            JsPoolReply::RunResult(RunResult::Suspended)
+        );
+        assert_eq!(
+            pool_call(
+                &mut sim,
+                &worker,
+                &pool_1,
+                JsPoolMsg::RunForBudget {
+                    runtime_id,
+                    budget: InstructionBudget { instructions: 1 },
+                },
+            )?,
+            JsPoolReply::RunResult(RunResult::Suspended)
+        );
+
+        let bytes = match pool_call(
+            &mut sim,
+            &worker,
+            &pool_1,
+            JsPoolMsg::SerializeRuntime { runtime_id },
+        )? {
+            JsPoolReply::RuntimeSerialized { bytes } => bytes,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        assert_eq!(
+            pool_call(
+                &mut sim,
+                &worker,
+                &pool_1,
+                JsPoolMsg::DropRuntime { runtime_id },
+            )?,
+            JsPoolReply::RuntimeDropped
+        );
+
+        let (output_tx_2, output_rx_2) = flume::unbounded::<JsOutputChunk>();
+        let pool_2 = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(JsRuntimePoolConfig {
+                attachments: vec![Box::new(ConsoleAttachment {
+                    output_tx: output_tx_2,
+                })],
+                gc_policy: GcPolicy::ManualOnly,
+            }),
+        )?;
+
+        let restored_id = match pool_call(
+            &mut sim,
+            &worker,
+            &pool_2,
+            JsPoolMsg::DeserializeRuntime { bytes },
+        )? {
+            JsPoolReply::RuntimeDeserialized { runtime_id } => runtime_id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        assert_eq!(restored_id, runtime_id);
+
+        assert_eq!(
+            pool_call(
+                &mut sim,
+                &worker,
+                &pool_2,
+                JsPoolMsg::RunUntilComplete { runtime_id },
+            )?,
+            JsPoolReply::RunResult(RunResult::Completed(JsValue::Undefined))
+        );
+
+        assert!(output_rx_1.try_recv().is_err());
+        assert_eq!(collect_stdout(&output_rx_2, runtime_id), b"3\n");
 
         Ok(())
     }

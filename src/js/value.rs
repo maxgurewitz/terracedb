@@ -1,6 +1,8 @@
 use super::ObjectId;
 
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub enum JsValue {
     Number(f64),
     Bool(bool),

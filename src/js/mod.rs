@@ -11,7 +11,9 @@ mod symbol;
 mod value;
 mod vm;
 
-pub use attachment::{AttachmentInstallCtx, ConsoleAttachment, JsAttachment};
+pub use attachment::{
+    AttachmentHostCtx, AttachmentInstallCtx, ConsoleAttachment, JsAttachment, JsHostBindings,
+};
 pub use bindings::{Binding, BindingCellId, BindingKind, EnvFrame, EnvFrameId, EnvStack};
 pub use bytecode::{
     BytecodeProgram, CompiledFunction, ConstId, Constant, ConstantPool, FunctionId, Instr,
@@ -27,4 +29,4 @@ pub use pool::{JsPoolMsg, JsPoolReply, JsRuntimePoolActor, JsRuntimePoolConfig};
 pub use runtime::{JsRuntimeConfig, JsRuntimeInstance};
 pub use symbol::{Symbol, SymbolTable};
 pub use value::JsValue;
-pub use vm::Vm;
+pub use vm::{InstructionBudget, RunResult, Vm};
