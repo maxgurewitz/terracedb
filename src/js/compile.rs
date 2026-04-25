@@ -6,7 +6,11 @@ use boa_ast::{
         literal::LiteralKind,
         operator::{
             assign::{AssignOp, AssignTarget},
-            binary::{ArithmeticOp, BinaryOp},
+            binary::{
+                ArithmeticOp as BoaArithmeticOp, BinaryOp as BoaBinaryOp,
+                LogicalOp as BoaLogicalOp, RelationalOp as BoaRelationalOp,
+            },
+            unary::UnaryOp as BoaUnaryOp,
         },
     },
     scope::Scope,
@@ -16,7 +20,9 @@ use boa_parser::{Parser, Source};
 
 use crate::Error;
 
-use super::{BindingKind, MiniExpr, MiniProgram, MiniStmt, Symbol, SymbolTable};
+use super::{
+    BinaryOp, BindingKind, LogicalOp, MiniExpr, MiniProgram, MiniStmt, Symbol, SymbolTable, UnaryOp,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JsSpan {
@@ -190,7 +196,7 @@ fn lower_expression_statement(
         });
     }
 
-    unsupported("expression statement", span_of(expr))
+    Ok(MiniStmt::Expr(lower_expr(expr, interner, symbols)?))
 }
 
 fn lower_expr(
@@ -204,25 +210,98 @@ fn lower_expr(
         Expression::Literal(literal) => match literal.kind() {
             LiteralKind::Num(value) => Ok(MiniExpr::Number(*value)),
             LiteralKind::Int(value) => Ok(MiniExpr::Number(f64::from(*value))),
+            LiteralKind::Bool(value) => Ok(MiniExpr::Bool(*value)),
+            LiteralKind::Null => Ok(MiniExpr::Null),
+            LiteralKind::Undefined => Ok(MiniExpr::Undefined),
+            LiteralKind::String(symbol) => Ok(MiniExpr::String(
+                interner.resolve_expect(*symbol).to_string(),
+            )),
             _ => unsupported("literal", span_of(expr)),
         },
-        Expression::Identifier(identifier) => Ok(MiniExpr::Ident(lower_identifier(
-            *identifier,
-            interner,
-            symbols,
-        ))),
-        Expression::Binary(binary) => {
-            if binary.op() != BinaryOp::Arithmetic(ArithmeticOp::Add) {
-                return unsupported("binary operator", span_of(expr));
+        Expression::Identifier(identifier) => {
+            if identifier.to_interned_string(interner) == "undefined" {
+                Ok(MiniExpr::Undefined)
+            } else {
+                Ok(MiniExpr::Ident(lower_identifier(
+                    *identifier,
+                    interner,
+                    symbols,
+                )))
+            }
+        }
+        Expression::Assign(assign) => {
+            if assign.op() != AssignOp::Assign {
+                return unsupported("compound assignment", span_of(expr));
             }
 
-            Ok(MiniExpr::Add(
-                Box::new(lower_expr(binary.lhs(), interner, symbols)?),
-                Box::new(lower_expr(binary.rhs(), interner, symbols)?),
-            ))
+            let AssignTarget::Identifier(identifier) = assign.lhs() else {
+                return unsupported("assignment target", span_of(expr));
+            };
+
+            Ok(MiniExpr::Assign {
+                name: lower_identifier(*identifier, interner, symbols),
+                expr: Box::new(lower_expr(assign.rhs(), interner, symbols)?),
+            })
+        }
+        Expression::Unary(unary) => {
+            if unary.op() != BoaUnaryOp::Not {
+                return unsupported("unary operator", span_of(expr));
+            }
+
+            Ok(MiniExpr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(lower_expr(unary.target(), interner, symbols)?),
+            })
+        }
+        Expression::Binary(binary) => {
+            let left = Box::new(lower_expr(binary.lhs(), interner, symbols)?);
+            let right = Box::new(lower_expr(binary.rhs(), interner, symbols)?);
+
+            match lower_binary_op(binary.op())? {
+                LoweredBinaryOp::Binary(op) => Ok(MiniExpr::Binary { op, left, right }),
+                LoweredBinaryOp::Logical(op) => Ok(MiniExpr::Logical { op, left, right }),
+            }
         }
         _ => unsupported(expression_feature(expr), span_of(expr)),
     }
+}
+
+enum LoweredBinaryOp {
+    Binary(BinaryOp),
+    Logical(LogicalOp),
+}
+
+fn lower_binary_op(op: BoaBinaryOp) -> Result<LoweredBinaryOp, Error> {
+    let op = match op {
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Add) => LoweredBinaryOp::Binary(BinaryOp::Add),
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Sub) => LoweredBinaryOp::Binary(BinaryOp::Sub),
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Mul) => LoweredBinaryOp::Binary(BinaryOp::Mul),
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Div) => LoweredBinaryOp::Binary(BinaryOp::Div),
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Mod) => LoweredBinaryOp::Binary(BinaryOp::Mod),
+        BoaBinaryOp::Relational(BoaRelationalOp::LessThan) => {
+            LoweredBinaryOp::Binary(BinaryOp::LessThan)
+        }
+        BoaBinaryOp::Relational(BoaRelationalOp::LessThanOrEqual) => {
+            LoweredBinaryOp::Binary(BinaryOp::LessThanOrEqual)
+        }
+        BoaBinaryOp::Relational(BoaRelationalOp::GreaterThan) => {
+            LoweredBinaryOp::Binary(BinaryOp::GreaterThan)
+        }
+        BoaBinaryOp::Relational(BoaRelationalOp::GreaterThanOrEqual) => {
+            LoweredBinaryOp::Binary(BinaryOp::GreaterThanOrEqual)
+        }
+        BoaBinaryOp::Relational(BoaRelationalOp::StrictEqual) => {
+            LoweredBinaryOp::Binary(BinaryOp::StrictEqual)
+        }
+        BoaBinaryOp::Relational(BoaRelationalOp::StrictNotEqual) => {
+            LoweredBinaryOp::Binary(BinaryOp::StrictNotEqual)
+        }
+        BoaBinaryOp::Logical(BoaLogicalOp::And) => LoweredBinaryOp::Logical(LogicalOp::And),
+        BoaBinaryOp::Logical(BoaLogicalOp::Or) => LoweredBinaryOp::Logical(LogicalOp::Or),
+        _ => return unsupported("binary operator", JsSpan::unknown()),
+    };
+
+    Ok(op)
 }
 
 fn lower_identifier(

@@ -14,7 +14,7 @@ pub use bindings::{Binding, BindingKind, EnvStack, LexicalEnv};
 pub(crate) use compile::parse_and_lower_minijs;
 pub use compile::{JsCompileError, JsSpan};
 pub use ids::JsRuntimeId;
-pub(crate) use ir::{MiniExpr, MiniProgram, MiniStmt};
+pub(crate) use ir::{BinaryOp, LogicalOp, MiniExpr, MiniProgram, MiniStmt, UnaryOp};
 pub use output::{ChannelByteSink, JsOutputChunk, JsOutputReceiver, JsOutputSender, JsStreamKind};
 pub use pool::{JsPoolMsg, JsPoolReply, JsRuntimePoolActor, JsRuntimePoolConfig};
 pub use runtime::JsRuntimeInstance;

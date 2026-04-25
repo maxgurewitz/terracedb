@@ -17,6 +17,7 @@ pub enum Error {
     JsIdentifierNotFound { name: String },
     JsInvalidConsoleCall,
     JsInvalidOperand,
+    JsTypeError { message: String },
     MissingConsole,
     MissingSimulationSeed,
     MissingSimulationWorkerCount,

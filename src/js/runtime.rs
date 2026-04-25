@@ -8,8 +8,8 @@ use bytes::Bytes;
 use crate::Error;
 
 use super::{
-    BindingKind, EnvStack, JsRuntimeAttachment, JsRuntimeId, JsValue, MiniExpr, MiniProgram,
-    MiniStmt, RuntimeConsole, SymbolTable, parse_and_lower_minijs,
+    BinaryOp, BindingKind, EnvStack, JsRuntimeAttachment, JsRuntimeId, JsValue, LogicalOp,
+    MiniExpr, MiniProgram, MiniStmt, RuntimeConsole, SymbolTable, UnaryOp, parse_and_lower_minijs,
 };
 
 pub struct JsRuntimeInstance {
@@ -96,6 +96,11 @@ impl JsRuntimeInstance {
                 let value = self.eval_expr(expr)?;
                 self.env_stack.assign(*name, value, &self.symbols)
             }
+            MiniStmt::Expr(expr) => {
+                let _ = self.eval_expr(expr)?;
+
+                Ok(())
+            }
             MiniStmt::ConsoleLog { expr } => {
                 let value = self.eval_expr(expr)?;
                 let console = self
@@ -122,19 +127,97 @@ impl JsRuntimeInstance {
         }
     }
 
-    fn eval_expr(&self, expr: &MiniExpr) -> Result<JsValue, Error> {
+    fn eval_expr(&mut self, expr: &MiniExpr) -> Result<JsValue, Error> {
         match expr {
             MiniExpr::Number(value) => Ok(JsValue::Number(*value)),
+            MiniExpr::Bool(value) => Ok(JsValue::Bool(*value)),
+            MiniExpr::String(value) => Ok(JsValue::String(value.clone())),
+            MiniExpr::Null => Ok(JsValue::Null),
+            MiniExpr::Undefined => Ok(JsValue::Undefined),
             MiniExpr::Ident(name) => self.env_stack.lookup(*name, &self.symbols),
-            MiniExpr::Add(lhs, rhs) => {
-                let lhs = self.eval_expr(lhs)?;
-                let rhs = self.eval_expr(rhs)?;
+            MiniExpr::Assign { name, expr } => {
+                let value = self.eval_expr(expr)?;
+                self.env_stack.assign(*name, value.clone(), &self.symbols)?;
 
-                match (lhs, rhs) {
-                    (JsValue::Number(lhs), JsValue::Number(rhs)) => Ok(JsValue::Number(lhs + rhs)),
-                    _ => Err(Error::JsInvalidOperand),
-                }
+                Ok(value)
             }
+            MiniExpr::Unary { op, expr } => match op {
+                UnaryOp::Not => Ok(JsValue::Bool(!expect_bool(self.eval_expr(expr)?)?)),
+            },
+            MiniExpr::Binary { op, left, right } => {
+                let left = self.eval_expr(left)?;
+                let right = self.eval_expr(right)?;
+
+                eval_binary(op, left, right)
+            }
+            MiniExpr::Logical { op, left, right } => match op {
+                LogicalOp::And => {
+                    let left = expect_bool(self.eval_expr(left)?)?;
+
+                    if !left {
+                        return Ok(JsValue::Bool(false));
+                    }
+
+                    Ok(JsValue::Bool(expect_bool(self.eval_expr(right)?)?))
+                }
+                LogicalOp::Or => {
+                    let left = expect_bool(self.eval_expr(left)?)?;
+
+                    if left {
+                        return Ok(JsValue::Bool(true));
+                    }
+
+                    Ok(JsValue::Bool(expect_bool(self.eval_expr(right)?)?))
+                }
+            },
         }
+    }
+}
+
+fn eval_binary(op: &BinaryOp, left: JsValue, right: JsValue) -> Result<JsValue, Error> {
+    match op {
+        BinaryOp::Add => Ok(JsValue::Number(
+            expect_number(left)? + expect_number(right)?,
+        )),
+        BinaryOp::Sub => Ok(JsValue::Number(
+            expect_number(left)? - expect_number(right)?,
+        )),
+        BinaryOp::Mul => Ok(JsValue::Number(
+            expect_number(left)? * expect_number(right)?,
+        )),
+        BinaryOp::Div => Ok(JsValue::Number(
+            expect_number(left)? / expect_number(right)?,
+        )),
+        BinaryOp::Mod => Ok(JsValue::Number(
+            expect_number(left)? % expect_number(right)?,
+        )),
+        BinaryOp::LessThan => Ok(JsValue::Bool(expect_number(left)? < expect_number(right)?)),
+        BinaryOp::LessThanOrEqual => {
+            Ok(JsValue::Bool(expect_number(left)? <= expect_number(right)?))
+        }
+        BinaryOp::GreaterThan => Ok(JsValue::Bool(expect_number(left)? > expect_number(right)?)),
+        BinaryOp::GreaterThanOrEqual => {
+            Ok(JsValue::Bool(expect_number(left)? >= expect_number(right)?))
+        }
+        BinaryOp::StrictEqual => Ok(JsValue::Bool(left == right)),
+        BinaryOp::StrictNotEqual => Ok(JsValue::Bool(left != right)),
+    }
+}
+
+fn expect_number(value: JsValue) -> Result<f64, Error> {
+    match value {
+        JsValue::Number(value) => Ok(value),
+        _ => Err(Error::JsTypeError {
+            message: "operator expected numbers".to_owned(),
+        }),
+    }
+}
+
+fn expect_bool(value: JsValue) -> Result<bool, Error> {
+    match value {
+        JsValue::Bool(value) => Ok(value),
+        _ => Err(Error::JsTypeError {
+            message: "operator expected booleans".to_owned(),
+        }),
     }
 }

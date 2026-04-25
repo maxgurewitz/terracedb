@@ -88,10 +88,82 @@ impl Actor<WorkerShardCtx> for JsRuntimePoolActor {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::{Error, SimRuntime};
+    use crate::{ActorRef, Error, SimRuntime, WorkerHandle};
 
     use super::*;
-    use crate::{ConsoleAttachment, JsOutputChunk, JsStreamKind};
+    use crate::{ConsoleAttachment, JsOutputChunk, JsOutputReceiver, JsStreamKind};
+
+    fn create_pool_runtime(
+        sim: &mut SimRuntime,
+    ) -> Result<
+        (
+            WorkerHandle,
+            ActorRef<JsRuntimePoolActor>,
+            JsRuntimeId,
+            JsOutputReceiver,
+        ),
+        Error,
+    > {
+        let worker = sim.workers()[0].clone();
+        let (output_tx, output_rx) = flume::unbounded::<JsOutputChunk>();
+        let console = ConsoleAttachment { output_tx };
+        let pool = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(JsRuntimePoolConfig {
+                attachments: vec![Box::new(console)],
+            }),
+        )?;
+
+        let create = sim.call(&worker, pool.id, Box::new(JsPoolMsg::CreateRuntime))?;
+        sim.run_until_idle()?;
+
+        let runtime_id = match *create
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::RuntimeCreated(id) => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        Ok((worker, pool, runtime_id, output_rx))
+    }
+
+    fn eval_source(
+        sim: &mut SimRuntime,
+        worker: &WorkerHandle,
+        pool: &ActorRef<JsRuntimePoolActor>,
+        runtime_id: JsRuntimeId,
+        source: &str,
+    ) -> Result<JsPoolReply, Error> {
+        let eval = sim.call(
+            worker,
+            pool.id,
+            Box::new(JsPoolMsg::Eval {
+                runtime_id,
+                source: source.to_owned(),
+            }),
+        )?;
+
+        sim.run_until_idle()?;
+
+        eval.wait()?
+            .downcast::<JsPoolReply>()
+            .map(|reply| *reply)
+            .map_err(|_| Error::ActorReplyTypeMismatch)
+    }
+
+    fn collect_stdout(output_rx: &JsOutputReceiver, runtime_id: JsRuntimeId) -> Vec<u8> {
+        let mut stdout = Vec::new();
+
+        while let Ok(chunk) = output_rx.try_recv() {
+            if chunk.runtime_id == runtime_id && chunk.stream == JsStreamKind::Stdout {
+                stdout.extend_from_slice(&chunk.bytes);
+            }
+        }
+
+        stdout
+    }
 
     #[test]
     fn minimal_js_console_log_adds_numbers() -> Result<(), Error> {
@@ -592,6 +664,138 @@ mod tests {
         }
 
         assert_eq!(stdout, b"2\n4\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_basic_arithmetic_ops() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                console.log(1 + 2 * 3);
+                console.log((1 + 2) * 3);
+                console.log(10 - 3);
+                console.log(10 / 2);
+                console.log(10 % 3);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"7\n9\n7\n5\n1\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_comparison_and_equality_ops() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                console.log(3 > 2);
+                console.log(3 >= 3);
+                console.log(2 < 1);
+                console.log(2 <= 2);
+                console.log(1 === 1);
+                console.log(1 !== 2);
+                console.log(true === false);
+                console.log(null === null);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(
+            collect_stdout(&output_rx, runtime_id),
+            b"true\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\ntrue\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_boolean_ops_short_circuit() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let x = 1;
+                false && (x = 2);
+                console.log(x);
+
+                let y = 1;
+                true || (y = 2);
+                console.log(y);
+
+                console.log(true && false);
+                console.log(true || false);
+                console.log(!false);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(
+            collect_stdout(&output_rx, runtime_id),
+            b"1\n1\nfalse\ntrue\ntrue\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_arithmetic_type_error() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, _output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(&mut sim, &worker, &pool, runtime_id, "true + 1;")?;
+
+        assert!(matches!(
+            reply,
+            JsPoolReply::EvalFailed(Error::JsTypeError { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_js_logical_type_error() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, _output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(&mut sim, &worker, &pool, runtime_id, "1 && true;")?;
+
+        assert!(matches!(
+            reply,
+            JsPoolReply::EvalFailed(Error::JsTypeError { .. })
+        ));
 
         Ok(())
     }
