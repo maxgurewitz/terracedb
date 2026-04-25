@@ -15,6 +15,7 @@ pub struct ConsoleAttachment {
     pub output_tx: JsOutputSender,
 }
 
+#[derive(Clone)]
 pub struct RuntimeConsole {
     pub stdout: ChannelByteSink,
     pub stderr: ChannelByteSink,

@@ -15,6 +15,7 @@ pub struct LexicalEnv {
 pub struct Binding {
     kind: BindingKind,
     value: JsValue,
+    initialized: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -34,7 +35,6 @@ impl LexicalEnv {
         &mut self,
         name: Symbol,
         kind: BindingKind,
-        value: JsValue,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
         if self.bindings.contains_key(&name) {
@@ -43,7 +43,14 @@ impl LexicalEnv {
             });
         }
 
-        self.bindings.insert(name, Binding { kind, value });
+        self.bindings.insert(
+            name,
+            Binding {
+                kind,
+                value: JsValue::Undefined,
+                initialized: false,
+            },
+        );
 
         Ok(())
     }
@@ -80,17 +87,26 @@ impl EnvStack {
         Ok(())
     }
 
+    pub(crate) fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    pub(crate) fn truncate_to_depth(&mut self, depth: usize) {
+        while self.scopes.len() > depth && self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+
     pub(crate) fn declare_current(
         &mut self,
         name: Symbol,
         kind: BindingKind,
-        value: JsValue,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
         self.scopes
             .last_mut()
             .expect("env stack always has a root scope")
-            .declare(name, kind, value, symbols)
+            .declare(name, kind, symbols)
     }
 
     pub(crate) fn lookup(&self, name: Symbol, symbols: &SymbolTable) -> Result<JsValue, Error> {
@@ -103,7 +119,7 @@ impl EnvStack {
             })
     }
 
-    pub(crate) fn assign(
+    pub(crate) fn store(
         &mut self,
         name: Symbol,
         value: JsValue,
@@ -114,13 +130,14 @@ impl EnvStack {
                 continue;
             };
 
-            if binding.kind == BindingKind::Const {
+            if binding.kind == BindingKind::Const && binding.initialized {
                 return Err(Error::JsAssignToConst {
                     name: symbols.resolve_expect(name).to_owned(),
                 });
             }
 
             binding.value = value;
+            binding.initialized = true;
 
             return Ok(());
         }

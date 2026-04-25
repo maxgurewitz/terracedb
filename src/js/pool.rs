@@ -799,4 +799,44 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn minimal_js_bytecode_vm_preserves_existing_behavior() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let reply = eval_source(
+            &mut sim,
+            &worker,
+            &pool,
+            runtime_id,
+            r#"
+                let x = 1;
+                const y = 2;
+
+                {
+                    let x = 10;
+                    console.log(x);
+                }
+
+                x = x + y;
+                console.log(x);
+                console.log(1 + 2 * 3);
+                console.log(true || (x = 100));
+                console.log(x);
+            "#,
+        )?;
+
+        match reply {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(
+            collect_stdout(&output_rx, runtime_id),
+            b"10\n3\n7\ntrue\n3\n"
+        );
+
+        Ok(())
+    }
 }

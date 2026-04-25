@@ -1,22 +1,24 @@
 mod attachment;
 mod bindings;
+mod bytecode;
 mod compile;
 mod ids;
-mod ir;
 mod output;
 mod pool;
 mod runtime;
 mod symbol;
 mod value;
+mod vm;
 
 pub use attachment::{ConsoleAttachment, JsAttachment, JsRuntimeAttachment, RuntimeConsole};
 pub use bindings::{Binding, BindingKind, EnvStack, LexicalEnv};
-pub(crate) use compile::parse_and_lower_minijs;
-pub use compile::{JsCompileError, JsSpan};
+pub use bytecode::{BytecodeProgram, ConstId, Constant, ConstantPool, Instr};
+pub use compile::{JsCompileError, JsSpan, compile_source_to_bytecode};
 pub use ids::JsRuntimeId;
-pub(crate) use ir::{BinaryOp, LogicalOp, MiniExpr, MiniProgram, MiniStmt, UnaryOp};
 pub use output::{ChannelByteSink, JsOutputChunk, JsOutputReceiver, JsOutputSender, JsStreamKind};
 pub use pool::{JsPoolMsg, JsPoolReply, JsRuntimePoolActor, JsRuntimePoolConfig};
 pub use runtime::JsRuntimeInstance;
 pub use symbol::{Symbol, SymbolTable};
 pub use value::JsValue;
+pub(crate) use vm::JsHostIo;
+pub use vm::Vm;

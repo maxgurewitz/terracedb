@@ -20,9 +20,7 @@ use boa_parser::{Parser, Source};
 
 use crate::Error;
 
-use super::{
-    BinaryOp, BindingKind, LogicalOp, MiniExpr, MiniProgram, MiniStmt, Symbol, SymbolTable, UnaryOp,
-};
+use super::{BindingKind, BytecodeProgram, ConstId, Constant, Instr, Symbol, SymbolTable};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JsSpan {
@@ -49,10 +47,10 @@ pub enum JsCompileError {
     UnsupportedSyntax { feature: &'static str, span: JsSpan },
 }
 
-pub(crate) fn parse_and_lower_minijs(
+pub fn compile_source_to_bytecode(
     source: &str,
     symbols: &mut SymbolTable,
-) -> Result<MiniProgram, Error> {
+) -> Result<BytecodeProgram, Error> {
     let mut interner = Interner::default();
     let scope = Scope::default();
     let mut parser = Parser::new(Source::from_bytes(source));
@@ -62,246 +60,368 @@ pub(crate) fn parse_and_lower_minijs(
         })
     })?;
 
-    let mut program = Vec::new();
+    let mut compiler = Compiler::new();
 
     for item in script.statements().statements() {
-        lower_statement_list_item(item, &interner, symbols, &mut program)?;
+        compiler.compile_statement_list_item(item, &interner, symbols)?;
     }
 
-    Ok(program)
+    compiler.emit(Instr::Halt);
+
+    Ok(compiler.finish())
 }
 
-fn lower_statement_list_item(
-    item: &StatementListItem,
-    interner: &Interner,
-    symbols: &mut SymbolTable,
-    program: &mut MiniProgram,
-) -> Result<(), Error> {
-    match item {
-        StatementListItem::Declaration(declaration) => {
-            lower_declaration(declaration, interner, symbols, program)
-        }
-        StatementListItem::Statement(statement) => {
-            lower_statement(statement, interner, symbols, program)
+struct Compiler {
+    program: BytecodeProgram,
+}
+
+impl Compiler {
+    fn new() -> Self {
+        Self {
+            program: BytecodeProgram::new(),
         }
     }
-}
 
-fn lower_declaration(
-    declaration: &Declaration,
-    interner: &Interner,
-    symbols: &mut SymbolTable,
-    program: &mut MiniProgram,
-) -> Result<(), Error> {
-    match declaration {
-        Declaration::Lexical(LexicalDeclaration::Let(list)) => {
-            lower_lexical_declaration(list, BindingKind::Let, interner, symbols, program)
-        }
-        Declaration::Lexical(LexicalDeclaration::Const(list)) => {
-            lower_lexical_declaration(list, BindingKind::Const, interner, symbols, program)
-        }
-        _ => unsupported("declaration", JsSpan::unknown()),
+    fn finish(self) -> BytecodeProgram {
+        self.program
     }
-}
 
-fn lower_lexical_declaration(
-    list: &VariableList,
-    kind: BindingKind,
-    interner: &Interner,
-    symbols: &mut SymbolTable,
-    program: &mut MiniProgram,
-) -> Result<(), Error> {
-    for variable in list.as_ref() {
-        let name = match variable.binding() {
-            Binding::Identifier(identifier) => lower_identifier(*identifier, interner, symbols),
-            Binding::Pattern(_) => {
-                return unsupported("destructuring binding", JsSpan::unknown());
+    fn emit(&mut self, instr: Instr) -> usize {
+        let at = self.current_ip();
+        self.program.instructions.push(instr);
+        at
+    }
+
+    fn emit_const(&mut self, constant: Constant) -> ConstId {
+        self.program.constants.push(constant)
+    }
+
+    fn emit_load_const(&mut self, constant: Constant) {
+        let id = self.emit_const(constant);
+        self.emit(Instr::LoadConst(id));
+    }
+
+    fn emit_load_bool(&mut self, value: bool) {
+        self.emit_load_const(Constant::Bool(value));
+    }
+
+    fn current_ip(&self) -> usize {
+        self.program.instructions.len()
+    }
+
+    fn patch_jump(&mut self, at: usize, target: usize) {
+        match self
+            .program
+            .instructions
+            .get_mut(at)
+            .expect("invalid jump patch")
+        {
+            Instr::Jump(slot) | Instr::JumpIfFalse(slot) | Instr::JumpIfTrue(slot) => {
+                *slot = target;
             }
-        };
-
-        let Some(expr) = variable.init() else {
-            return unsupported("lexical declaration without initializer", JsSpan::unknown());
-        };
-
-        let expr = lower_expr(expr, interner, symbols)?;
-
-        program.push(match kind {
-            BindingKind::Let => MiniStmt::Let { name, expr },
-            BindingKind::Const => MiniStmt::Const { name, expr },
-        });
+            _ => panic!("cannot patch non-jump instruction"),
+        }
     }
 
-    Ok(())
-}
+    fn compile_statement_list_item(
+        &mut self,
+        item: &StatementListItem,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        match item {
+            StatementListItem::Declaration(declaration) => {
+                self.compile_declaration(declaration, interner, symbols)
+            }
+            StatementListItem::Statement(statement) => {
+                self.compile_statement(statement, interner, symbols)
+            }
+        }
+    }
 
-fn lower_statement(
-    statement: &Statement,
-    interner: &Interner,
-    symbols: &mut SymbolTable,
-    program: &mut MiniProgram,
-) -> Result<(), Error> {
-    match statement {
-        Statement::Block(block) => {
-            let mut body = Vec::new();
+    fn compile_declaration(
+        &mut self,
+        declaration: &Declaration,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        match declaration {
+            Declaration::Lexical(LexicalDeclaration::Let(list)) => {
+                self.compile_lexical_declaration(list, BindingKind::Let, interner, symbols)
+            }
+            Declaration::Lexical(LexicalDeclaration::Const(list)) => {
+                self.compile_lexical_declaration(list, BindingKind::Const, interner, symbols)
+            }
+            _ => unsupported("declaration", JsSpan::unknown()),
+        }
+    }
 
-            for item in block.statement_list().statements() {
-                lower_statement_list_item(item, interner, symbols, &mut body)?;
+    fn compile_lexical_declaration(
+        &mut self,
+        list: &VariableList,
+        kind: BindingKind,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        for variable in list.as_ref() {
+            let name = match variable.binding() {
+                Binding::Identifier(identifier) => lower_identifier(*identifier, interner, symbols),
+                Binding::Pattern(_) => {
+                    return unsupported("destructuring binding", JsSpan::unknown());
+                }
+            };
+
+            let Some(expr) = variable.init() else {
+                return unsupported("lexical declaration without initializer", JsSpan::unknown());
+            };
+
+            self.compile_expr(expr, interner, symbols)?;
+
+            match kind {
+                BindingKind::Let => self.emit(Instr::DeclareLet(name)),
+                BindingKind::Const => self.emit(Instr::DeclareConst(name)),
+            };
+
+            self.emit(Instr::StoreBinding(name));
+        }
+
+        Ok(())
+    }
+
+    fn compile_statement(
+        &mut self,
+        statement: &Statement,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        match statement {
+            Statement::Block(block) => {
+                self.emit(Instr::PushScope);
+
+                for item in block.statement_list().statements() {
+                    self.compile_statement_list_item(item, interner, symbols)?;
+                }
+
+                self.emit(Instr::PopScope);
+
+                Ok(())
+            }
+            Statement::Expression(expr) => {
+                self.compile_expression_statement(expr, interner, symbols)
+            }
+            Statement::Empty => Ok(()),
+            _ => unsupported("statement", JsSpan::unknown()),
+        }
+    }
+
+    fn compile_expression_statement(
+        &mut self,
+        expr: &Expression,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        let expr = expr.flatten();
+
+        if let Expression::Assign(assign) = expr {
+            self.compile_assignment(assign, interner, symbols, false)?;
+            return Ok(());
+        }
+
+        if let Expression::Call(call) = expr {
+            if !is_console_method(call.function(), "log", interner) {
+                return unsupported("expression statement", span_of(expr));
             }
 
-            program.push(MiniStmt::Block(body));
-            Ok(())
+            let [arg] = call.args() else {
+                return unsupported("console.log arity", span_of(expr));
+            };
+
+            self.compile_expr(arg, interner, symbols)?;
+            self.emit(Instr::ConsoleLog);
+
+            return Ok(());
         }
-        Statement::Expression(expr) => {
-            program.push(lower_expression_statement(expr, interner, symbols)?);
-            Ok(())
-        }
-        Statement::Empty => Ok(()),
-        _ => unsupported("statement", JsSpan::unknown()),
+
+        self.compile_expr(expr, interner, symbols)
     }
-}
 
-fn lower_expression_statement(
-    expr: &Expression,
-    interner: &Interner,
-    symbols: &mut SymbolTable,
-) -> Result<MiniStmt, Error> {
-    let expr = expr.flatten();
+    fn compile_expr(
+        &mut self,
+        expr: &Expression,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        let expr = expr.flatten();
 
-    if let Expression::Assign(assign) = expr {
+        match expr {
+            Expression::Literal(literal) => match literal.kind() {
+                LiteralKind::Num(value) => self.emit_load_const(Constant::Number(*value)),
+                LiteralKind::Int(value) => {
+                    self.emit_load_const(Constant::Number(f64::from(*value)));
+                }
+                LiteralKind::Bool(value) => self.emit_load_const(Constant::Bool(*value)),
+                LiteralKind::Null => self.emit_load_const(Constant::Null),
+                LiteralKind::Undefined => self.emit_load_const(Constant::Undefined),
+                LiteralKind::String(symbol) => {
+                    self.emit_load_const(Constant::String(
+                        interner.resolve_expect(*symbol).to_string(),
+                    ));
+                }
+                _ => return unsupported("literal", span_of(expr)),
+            },
+            Expression::Identifier(identifier) => {
+                if identifier.to_interned_string(interner) == "undefined" {
+                    self.emit_load_const(Constant::Undefined);
+                } else {
+                    self.emit(Instr::LoadBinding(lower_identifier(
+                        *identifier,
+                        interner,
+                        symbols,
+                    )));
+                }
+            }
+            Expression::Assign(assign) => {
+                self.compile_assignment(assign, interner, symbols, true)?;
+            }
+            Expression::Unary(unary) => {
+                if unary.op() != BoaUnaryOp::Not {
+                    return unsupported("unary operator", span_of(expr));
+                }
+
+                self.compile_expr(unary.target(), interner, symbols)?;
+                self.emit(Instr::LogicalNot);
+            }
+            Expression::Binary(binary) => {
+                self.compile_binary(binary.op(), binary.lhs(), binary.rhs(), interner, symbols)?;
+            }
+            _ => return unsupported(expression_feature(expr), span_of(expr)),
+        }
+
+        Ok(())
+    }
+
+    fn compile_assignment(
+        &mut self,
+        assign: &boa_ast::expression::operator::Assign,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+        leave_value: bool,
+    ) -> Result<(), Error> {
         if assign.op() != AssignOp::Assign {
-            return unsupported("compound assignment", span_of(expr));
+            return unsupported("compound assignment", span_of(assign));
         }
 
         let AssignTarget::Identifier(identifier) = assign.lhs() else {
-            return unsupported("assignment target", span_of(expr));
+            return unsupported("assignment target", span_of(assign));
         };
+        let name = lower_identifier(*identifier, interner, symbols);
 
-        return Ok(MiniStmt::Assign {
-            name: lower_identifier(*identifier, interner, symbols),
-            expr: lower_expr(assign.rhs(), interner, symbols)?,
-        });
+        self.compile_expr(assign.rhs(), interner, symbols)?;
+        self.emit(Instr::StoreBinding(name));
+
+        if leave_value {
+            self.emit(Instr::LoadBinding(name));
+        }
+
+        Ok(())
     }
 
-    if let Expression::Call(call) = expr {
-        if !is_console_method(call.function(), "log", interner) {
-            return unsupported("expression statement", span_of(expr));
+    fn compile_binary(
+        &mut self,
+        op: BoaBinaryOp,
+        lhs: &Expression,
+        rhs: &Expression,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        match op {
+            BoaBinaryOp::Logical(BoaLogicalOp::And) => {
+                self.compile_logical_and(lhs, rhs, interner, symbols)
+            }
+            BoaBinaryOp::Logical(BoaLogicalOp::Or) => {
+                self.compile_logical_or(lhs, rhs, interner, symbols)
+            }
+            _ => {
+                self.compile_expr(lhs, interner, symbols)?;
+                self.compile_expr(rhs, interner, symbols)?;
+                self.emit(lower_binary_instr(op)?);
+                Ok(())
+            }
         }
-
-        let [arg] = call.args() else {
-            return unsupported("console.log arity", span_of(expr));
-        };
-
-        return Ok(MiniStmt::ConsoleLog {
-            expr: lower_expr(arg, interner, symbols)?,
-        });
     }
 
-    Ok(MiniStmt::Expr(lower_expr(expr, interner, symbols)?))
-}
+    fn compile_logical_and(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        self.compile_expr(lhs, interner, symbols)?;
+        let left_false = self.emit(Instr::JumpIfFalse(usize::MAX));
 
-fn lower_expr(
-    expr: &Expression,
-    interner: &Interner,
-    symbols: &mut SymbolTable,
-) -> Result<MiniExpr, Error> {
-    let expr = expr.flatten();
+        self.compile_expr(rhs, interner, symbols)?;
+        let right_false = self.emit(Instr::JumpIfFalse(usize::MAX));
 
-    match expr {
-        Expression::Literal(literal) => match literal.kind() {
-            LiteralKind::Num(value) => Ok(MiniExpr::Number(*value)),
-            LiteralKind::Int(value) => Ok(MiniExpr::Number(f64::from(*value))),
-            LiteralKind::Bool(value) => Ok(MiniExpr::Bool(*value)),
-            LiteralKind::Null => Ok(MiniExpr::Null),
-            LiteralKind::Undefined => Ok(MiniExpr::Undefined),
-            LiteralKind::String(symbol) => Ok(MiniExpr::String(
-                interner.resolve_expect(*symbol).to_string(),
-            )),
-            _ => unsupported("literal", span_of(expr)),
-        },
-        Expression::Identifier(identifier) => {
-            if identifier.to_interned_string(interner) == "undefined" {
-                Ok(MiniExpr::Undefined)
-            } else {
-                Ok(MiniExpr::Ident(lower_identifier(
-                    *identifier,
-                    interner,
-                    symbols,
-                )))
-            }
-        }
-        Expression::Assign(assign) => {
-            if assign.op() != AssignOp::Assign {
-                return unsupported("compound assignment", span_of(expr));
-            }
+        self.emit_load_bool(true);
+        let end_jump = self.emit(Instr::Jump(usize::MAX));
 
-            let AssignTarget::Identifier(identifier) = assign.lhs() else {
-                return unsupported("assignment target", span_of(expr));
-            };
+        let false_label = self.current_ip();
+        self.patch_jump(left_false, false_label);
+        self.patch_jump(right_false, false_label);
+        self.emit_load_bool(false);
 
-            Ok(MiniExpr::Assign {
-                name: lower_identifier(*identifier, interner, symbols),
-                expr: Box::new(lower_expr(assign.rhs(), interner, symbols)?),
-            })
-        }
-        Expression::Unary(unary) => {
-            if unary.op() != BoaUnaryOp::Not {
-                return unsupported("unary operator", span_of(expr));
-            }
+        let end_label = self.current_ip();
+        self.patch_jump(end_jump, end_label);
 
-            Ok(MiniExpr::Unary {
-                op: UnaryOp::Not,
-                expr: Box::new(lower_expr(unary.target(), interner, symbols)?),
-            })
-        }
-        Expression::Binary(binary) => {
-            let left = Box::new(lower_expr(binary.lhs(), interner, symbols)?);
-            let right = Box::new(lower_expr(binary.rhs(), interner, symbols)?);
+        Ok(())
+    }
 
-            match lower_binary_op(binary.op())? {
-                LoweredBinaryOp::Binary(op) => Ok(MiniExpr::Binary { op, left, right }),
-                LoweredBinaryOp::Logical(op) => Ok(MiniExpr::Logical { op, left, right }),
-            }
-        }
-        _ => unsupported(expression_feature(expr), span_of(expr)),
+    fn compile_logical_or(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<(), Error> {
+        self.compile_expr(lhs, interner, symbols)?;
+        let left_true = self.emit(Instr::JumpIfTrue(usize::MAX));
+
+        self.compile_expr(rhs, interner, symbols)?;
+        let right_true = self.emit(Instr::JumpIfTrue(usize::MAX));
+
+        self.emit_load_bool(false);
+        let end_jump = self.emit(Instr::Jump(usize::MAX));
+
+        let true_label = self.current_ip();
+        self.patch_jump(left_true, true_label);
+        self.patch_jump(right_true, true_label);
+        self.emit_load_bool(true);
+
+        let end_label = self.current_ip();
+        self.patch_jump(end_jump, end_label);
+
+        Ok(())
     }
 }
 
-enum LoweredBinaryOp {
-    Binary(BinaryOp),
-    Logical(LogicalOp),
-}
-
-fn lower_binary_op(op: BoaBinaryOp) -> Result<LoweredBinaryOp, Error> {
-    let op = match op {
-        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Add) => LoweredBinaryOp::Binary(BinaryOp::Add),
-        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Sub) => LoweredBinaryOp::Binary(BinaryOp::Sub),
-        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Mul) => LoweredBinaryOp::Binary(BinaryOp::Mul),
-        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Div) => LoweredBinaryOp::Binary(BinaryOp::Div),
-        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Mod) => LoweredBinaryOp::Binary(BinaryOp::Mod),
-        BoaBinaryOp::Relational(BoaRelationalOp::LessThan) => {
-            LoweredBinaryOp::Binary(BinaryOp::LessThan)
-        }
-        BoaBinaryOp::Relational(BoaRelationalOp::LessThanOrEqual) => {
-            LoweredBinaryOp::Binary(BinaryOp::LessThanOrEqual)
-        }
-        BoaBinaryOp::Relational(BoaRelationalOp::GreaterThan) => {
-            LoweredBinaryOp::Binary(BinaryOp::GreaterThan)
-        }
-        BoaBinaryOp::Relational(BoaRelationalOp::GreaterThanOrEqual) => {
-            LoweredBinaryOp::Binary(BinaryOp::GreaterThanOrEqual)
-        }
-        BoaBinaryOp::Relational(BoaRelationalOp::StrictEqual) => {
-            LoweredBinaryOp::Binary(BinaryOp::StrictEqual)
-        }
-        BoaBinaryOp::Relational(BoaRelationalOp::StrictNotEqual) => {
-            LoweredBinaryOp::Binary(BinaryOp::StrictNotEqual)
-        }
-        BoaBinaryOp::Logical(BoaLogicalOp::And) => LoweredBinaryOp::Logical(LogicalOp::And),
-        BoaBinaryOp::Logical(BoaLogicalOp::Or) => LoweredBinaryOp::Logical(LogicalOp::Or),
+fn lower_binary_instr(op: BoaBinaryOp) -> Result<Instr, Error> {
+    let instr = match op {
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Add) => Instr::Add,
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Sub) => Instr::Sub,
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Mul) => Instr::Mul,
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Div) => Instr::Div,
+        BoaBinaryOp::Arithmetic(BoaArithmeticOp::Mod) => Instr::Mod,
+        BoaBinaryOp::Relational(BoaRelationalOp::LessThan) => Instr::LessThan,
+        BoaBinaryOp::Relational(BoaRelationalOp::LessThanOrEqual) => Instr::LessThanOrEqual,
+        BoaBinaryOp::Relational(BoaRelationalOp::GreaterThan) => Instr::GreaterThan,
+        BoaBinaryOp::Relational(BoaRelationalOp::GreaterThanOrEqual) => Instr::GreaterThanOrEqual,
+        BoaBinaryOp::Relational(BoaRelationalOp::StrictEqual) => Instr::StrictEqual,
+        BoaBinaryOp::Relational(BoaRelationalOp::StrictNotEqual) => Instr::StrictNotEqual,
         _ => return unsupported("binary operator", JsSpan::unknown()),
     };
 
-    Ok(op)
+    Ok(instr)
 }
 
 fn lower_identifier(
@@ -391,5 +511,38 @@ fn from_boa_span(span: Span) -> JsSpan {
         start_column: span.start().column_number(),
         end_line: span.end().line_number(),
         end_column: span.end().column_number(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_source_to_bytecode;
+    use crate::{Instr, SymbolTable};
+
+    #[test]
+    fn compiler_emits_bytecode_for_let_and_console_log() {
+        let mut symbols = SymbolTable::new();
+        let program = compile_source_to_bytecode(
+            r#"
+                let x = 1;
+                console.log(x);
+            "#,
+            &mut symbols,
+        )
+        .unwrap();
+
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instr| matches!(instr, Instr::DeclareLet(_)))
+        );
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instr| matches!(instr, Instr::ConsoleLog))
+        );
+        assert!(matches!(program.instructions.last(), Some(Instr::Halt)));
     }
 }
