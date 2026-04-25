@@ -1,4 +1,4 @@
-use crate::{ActorId, WorkerId};
+use crate::{ActorId, JsCompileError, JsRuntimeId, WorkerId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -9,12 +9,19 @@ pub enum Error {
     CompioRuntimeInit { worker: WorkerId, source: String },
     HostReplyClosed,
     InvalidWorkerIndex { worker: usize },
+    JsCompile(JsCompileError),
+    JsIdentifierNotFound { name: String },
+    JsInvalidConsoleCall,
+    JsInvalidOperand,
+    MissingConsole,
     MissingSimulationSeed,
     MissingSimulationWorkerCount,
     NoCores,
     NoWorkers,
+    OutputReceiverDropped,
     PinFailed { worker: WorkerId },
     ReentrantActorCall { actor: ActorId },
+    RuntimeNotFound(JsRuntimeId),
     ThreadPanicked,
     ThreadSpawn { worker: WorkerId, source: String },
     WorkerInboxClosed,

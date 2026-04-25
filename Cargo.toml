@@ -7,6 +7,10 @@ edition = "2024"
 observability = []
 
 [dependencies]
+boa_ast = "0.21.1"
+boa_interner = "0.21.1"
+boa_parser = "0.21.1"
+bytes = "1.10.1"
 compio = "0.18.0"
 core_affinity = "0.8.3"
 flume = "0.12.0"

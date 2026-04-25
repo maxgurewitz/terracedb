@@ -1,6 +1,7 @@
 pub mod actor;
 pub mod env;
 mod error;
+pub mod js;
 pub mod runtime;
 pub mod worker;
 
@@ -18,6 +19,12 @@ pub use env::{
     TimerCompletion, TimerId, Timers, TraceId, UploadedPart, WorkerId,
 };
 pub use error::Error;
+pub use js::{
+    ChannelByteSink, ConsoleAttachment, JsAttachment, JsCompileError, JsOutputChunk,
+    JsOutputReceiver, JsOutputSender, JsPoolMsg, JsPoolReply, JsRuntimeAttachment, JsRuntimeId,
+    JsRuntimeInstance, JsRuntimePoolActor, JsRuntimePoolConfig, JsSpan, JsStreamKind, JsValue,
+    RuntimeConsole,
+};
 pub use runtime::{
     CallHandle, Runtime, RuntimeApi, RuntimeBuilder, Shutdown, SimRuntime, SimRuntimeBuilder,
 };
