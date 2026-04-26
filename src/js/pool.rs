@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use crate::{Actor, Env, Error, WorkerShardCtx};
 
 use super::{
-    GcPolicy, HeapStats, InstructionBudget, JsAttachment, JsRuntimeConfig, JsRuntimeId,
-    JsRuntimeInstance, JsValue, ModuleId, ModuleKey, RunResult,
+    GcPolicy, HeapStats, InstructionBudget, JsAttachment, JsAttachmentBundle, JsRuntimeConfig,
+    JsRuntimeId, JsRuntimeInstance, JsValue, ModuleId, ModuleKey, RunResult,
 };
 
 pub struct JsRuntimePoolConfig {
@@ -12,12 +12,49 @@ pub struct JsRuntimePoolConfig {
     pub gc_policy: GcPolicy,
 }
 
-impl Default for JsRuntimePoolConfig {
-    fn default() -> Self {
+impl JsRuntimePoolConfig {
+    pub fn new() -> Self {
         Self {
             attachments: Vec::new(),
             gc_policy: GcPolicy::default(),
         }
+    }
+
+    pub fn with_attachment<A>(mut self, attachment: A) -> Self
+    where
+        A: JsAttachment + Send + 'static,
+    {
+        self.attachments.push(Box::new(attachment));
+        self
+    }
+
+    pub fn with_boxed_attachment(mut self, attachment: Box<dyn JsAttachment + Send>) -> Self {
+        self.attachments.push(attachment);
+        self
+    }
+
+    pub fn with_bundle<B>(mut self, bundle: B) -> Self
+    where
+        B: JsAttachmentBundle + Send + 'static,
+    {
+        Box::new(bundle).append_attachments(&mut self.attachments);
+        self
+    }
+
+    pub fn with_boxed_bundle(mut self, bundle: Box<dyn JsAttachmentBundle + Send>) -> Self {
+        bundle.append_attachments(&mut self.attachments);
+        self
+    }
+
+    pub fn with_gc_policy(mut self, gc_policy: GcPolicy) -> Self {
+        self.gc_policy = gc_policy;
+        self
+    }
+}
+
+impl Default for JsRuntimePoolConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -328,8 +365,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        AttachmentInstallCtx, ConsoleAttachment, HostModuleInstallCtx, JsAttachment, JsOutputChunk,
-        JsOutputReceiver, JsStreamKind, ModuleKey,
+        AttachmentInstallCtx, ConsoleAttachment, CoreHostAttachments, CoreHostConfig,
+        HostModuleInstallCtx, JsAttachment, JsOutputChunk, JsOutputReceiver, JsStreamKind,
+        ModuleKey,
     };
 
     struct HostNumbersAttachment;
@@ -609,6 +647,77 @@ mod tests {
             .downcast::<JsPoolReply>()
             .map(|reply| *reply)
             .map_err(|_| Error::ActorReplyTypeMismatch)
+    }
+
+    #[test]
+    fn core_host_bundle_installs_console() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let worker = sim.workers()[0].clone();
+        let (output_tx, output_rx) = flume::unbounded::<JsOutputChunk>();
+        let pool = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(
+                JsRuntimePoolConfig::new()
+                    .with_bundle(CoreHostAttachments::new(CoreHostConfig { output_tx })),
+            ),
+        )?;
+
+        let runtime_id = match pool_call(&mut sim, &worker, &pool, JsPoolMsg::CreateRuntime)? {
+            JsPoolReply::RuntimeCreated(id) => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        match pool_call(
+            &mut sim,
+            &worker,
+            &pool,
+            JsPoolMsg::Eval {
+                runtime_id,
+                source: "console.log(1 + 2);".to_owned(),
+            },
+        )? {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn direct_attachment_builder_installs_console() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let worker = sim.workers()[0].clone();
+        let (output_tx, output_rx) = flume::unbounded::<JsOutputChunk>();
+        let pool = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(
+                JsRuntimePoolConfig::new().with_attachment(ConsoleAttachment { output_tx }),
+            ),
+        )?;
+
+        let runtime_id = match pool_call(&mut sim, &worker, &pool, JsPoolMsg::CreateRuntime)? {
+            JsPoolReply::RuntimeCreated(id) => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        match pool_call(
+            &mut sim,
+            &worker,
+            &pool,
+            JsPoolMsg::Eval {
+                runtime_id,
+                source: "console.log(1 + 2);".to_owned(),
+            },
+        )? {
+            JsPoolReply::EvalCompleted(JsValue::Undefined) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
     }
 
     fn define_module(

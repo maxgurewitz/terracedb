@@ -26,6 +26,10 @@ pub trait JsAttachment: Send {
     }
 }
 
+pub trait JsAttachmentBundle: Send {
+    fn append_attachments(self: Box<Self>, attachments: &mut Vec<Box<dyn JsAttachment + Send>>);
+}
+
 pub struct AttachmentInstallCtx<'a> {
     pub runtime_id: JsRuntimeId,
     pub symbols: &'a mut SymbolTable,
@@ -133,6 +137,28 @@ impl JsHostBindings {
 #[derive(Clone)]
 pub struct ConsoleAttachment {
     pub output_tx: JsOutputSender,
+}
+
+pub struct CoreHostConfig {
+    pub output_tx: JsOutputSender,
+}
+
+pub struct CoreHostAttachments {
+    config: CoreHostConfig,
+}
+
+impl CoreHostAttachments {
+    pub fn new(config: CoreHostConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl JsAttachmentBundle for CoreHostAttachments {
+    fn append_attachments(self: Box<Self>, attachments: &mut Vec<Box<dyn JsAttachment + Send>>) {
+        attachments.push(Box::new(ConsoleAttachment {
+            output_tx: self.config.output_tx,
+        }));
+    }
 }
 
 impl JsAttachment for ConsoleAttachment {

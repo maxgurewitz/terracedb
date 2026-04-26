@@ -13,8 +13,8 @@ mod value;
 mod vm;
 
 pub use attachment::{
-    AttachmentHostCtx, AttachmentInstallCtx, ConsoleAttachment, HostModuleInstallCtx, JsAttachment,
-    JsHostBindings,
+    AttachmentHostCtx, AttachmentInstallCtx, ConsoleAttachment, CoreHostAttachments,
+    CoreHostConfig, HostModuleInstallCtx, JsAttachment, JsAttachmentBundle, JsHostBindings,
 };
 pub use bindings::{Binding, BindingCellId, BindingKind, EnvFrame, EnvFrameId, EnvStack};
 pub use bytecode::{
