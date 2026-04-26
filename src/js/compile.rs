@@ -1,6 +1,9 @@
 use boa_ast::{
-    Declaration, Expression, Span, Spanned, Statement, StatementListItem,
-    declaration::{Binding, LexicalDeclaration, VariableList},
+    Declaration, Expression, ModuleItem, Span, Spanned, Statement, StatementListItem,
+    declaration::{
+        Binding, ExportDeclaration, ImportDeclaration, ImportKind, LexicalDeclaration,
+        ReExportKind, VariableList,
+    },
     expression::{
         access::{PropertyAccess, PropertyAccessField},
         literal::{LiteralKind, ObjectLiteral, PropertyDefinition},
@@ -17,7 +20,7 @@ use boa_ast::{
     property::PropertyName,
     scope::Scope,
 };
-use boa_interner::{Interner, ToInternedString};
+use boa_interner::{Interner, Sym, ToInternedString};
 use boa_parser::{Parser, Source};
 
 use crate::Error;
@@ -25,6 +28,10 @@ use crate::Error;
 use super::{
     BindingKind, BytecodeProgram, CompiledFunction, ConstId, Constant, Instr, PropertyKey, Symbol,
     SymbolTable,
+    modules::{
+        CompiledModule, ExportName, ImportEntry, ImportName, IndirectExportEntry,
+        LocalBindingEntry, LocalExportEntry, ModuleKey, StarExportEntry,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +81,69 @@ pub fn compile_source_to_bytecode(
     compiler.emit(Instr::Halt);
 
     Ok(compiler.finish())
+}
+
+pub fn compile_module_source(
+    source: &str,
+    symbols: &mut SymbolTable,
+) -> Result<CompiledModule, Error> {
+    let mut interner = Interner::default();
+    let scope = Scope::default();
+    let mut parser = Parser::new(Source::from_bytes(source));
+    let module = parser.parse_module(&scope, &mut interner).map_err(|err| {
+        Error::JsCompile(JsCompileError::Parse {
+            message: err.to_string(),
+        })
+    })?;
+
+    let mut compiler = Compiler::new();
+    let mut requested_modules = Vec::new();
+    let mut import_entries = Vec::new();
+    let mut local_export_entries = Vec::new();
+    let mut indirect_export_entries = Vec::new();
+    let mut star_export_entries = Vec::new();
+    let mut local_bindings = Vec::new();
+
+    for item in module.items().items() {
+        match item {
+            ModuleItem::ImportDeclaration(import) => {
+                compile_import_declaration(
+                    import,
+                    &interner,
+                    symbols,
+                    &mut requested_modules,
+                    &mut import_entries,
+                );
+            }
+            ModuleItem::ExportDeclaration(export) => {
+                compiler.compile_export_declaration(
+                    export,
+                    &interner,
+                    symbols,
+                    &mut requested_modules,
+                    &mut local_export_entries,
+                    &mut indirect_export_entries,
+                    &mut star_export_entries,
+                    &mut local_bindings,
+                )?;
+            }
+            ModuleItem::StatementListItem(item) => {
+                compiler.compile_statement_list_item(item, &interner, symbols)?;
+            }
+        }
+    }
+
+    compiler.emit(Instr::Halt);
+
+    Ok(CompiledModule {
+        requested_modules,
+        import_entries,
+        local_export_entries,
+        indirect_export_entries,
+        star_export_entries,
+        local_bindings,
+        program: compiler.finish(),
+    })
 }
 
 struct Compiler {
@@ -196,6 +266,34 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_lexical_initializers(
+        &mut self,
+        list: &VariableList,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+    ) -> Result<Vec<Symbol>, Error> {
+        let mut names = Vec::new();
+
+        for variable in list.as_ref() {
+            let name = match variable.binding() {
+                Binding::Identifier(identifier) => lower_identifier(*identifier, interner, symbols),
+                Binding::Pattern(_) => {
+                    return unsupported("destructuring binding", JsSpan::unknown());
+                }
+            };
+
+            let Some(expr) = variable.init() else {
+                return unsupported("lexical declaration without initializer", JsSpan::unknown());
+            };
+
+            self.compile_expr(expr, interner, symbols)?;
+            self.emit(Instr::StoreBinding(name));
+            names.push(name);
+        }
+
+        Ok(names)
+    }
+
     fn compile_function_declaration(
         &mut self,
         function: &FunctionDeclaration,
@@ -252,6 +350,129 @@ impl Compiler {
             }
             Statement::Empty => Ok(()),
             _ => unsupported("statement", JsSpan::unknown()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_export_declaration(
+        &mut self,
+        export: &ExportDeclaration,
+        interner: &Interner,
+        symbols: &mut SymbolTable,
+        requested_modules: &mut Vec<ModuleKey>,
+        local_export_entries: &mut Vec<LocalExportEntry>,
+        indirect_export_entries: &mut Vec<IndirectExportEntry>,
+        star_export_entries: &mut Vec<StarExportEntry>,
+        local_bindings: &mut Vec<LocalBindingEntry>,
+    ) -> Result<(), Error> {
+        match export {
+            ExportDeclaration::Declaration(Declaration::Lexical(LexicalDeclaration::Const(
+                list,
+            ))) => {
+                let names = self.compile_lexical_initializers(list, interner, symbols)?;
+
+                for name in names {
+                    local_bindings.push(LocalBindingEntry {
+                        name,
+                        kind: BindingKind::Const,
+                    });
+                    local_export_entries.push(LocalExportEntry {
+                        export_name: ExportName::Named(name),
+                        local_name: name,
+                    });
+                }
+
+                Ok(())
+            }
+            ExportDeclaration::Declaration(Declaration::Lexical(LexicalDeclaration::Let(list))) => {
+                let names = self.compile_lexical_initializers(list, interner, symbols)?;
+
+                for name in names {
+                    local_bindings.push(LocalBindingEntry {
+                        name,
+                        kind: BindingKind::Let,
+                    });
+                    local_export_entries.push(LocalExportEntry {
+                        export_name: ExportName::Named(name),
+                        local_name: name,
+                    });
+                }
+
+                Ok(())
+            }
+            ExportDeclaration::DefaultAssignmentExpression(expr) => {
+                let default = symbols.intern("default");
+
+                self.compile_expr(expr, interner, symbols)?;
+                self.emit(Instr::StoreBinding(default));
+                local_bindings.push(LocalBindingEntry {
+                    name: default,
+                    kind: BindingKind::Const,
+                });
+                local_export_entries.push(LocalExportEntry {
+                    export_name: ExportName::Default,
+                    local_name: default,
+                });
+
+                Ok(())
+            }
+            ExportDeclaration::List(list) => {
+                for specifier in list.iter().copied() {
+                    if specifier.string_literal() {
+                        return unsupported("string literal export name", JsSpan::unknown());
+                    }
+
+                    let local_name = lower_sym(specifier.private_name(), interner, symbols);
+                    let export_name = lower_export_name(specifier.alias(), interner, symbols);
+
+                    local_export_entries.push(LocalExportEntry {
+                        export_name,
+                        local_name,
+                    });
+                }
+
+                Ok(())
+            }
+            ExportDeclaration::ReExport { kind, specifier } => {
+                let module_request = lower_module_key(specifier.sym(), interner);
+                push_requested(requested_modules, module_request.clone());
+
+                match kind {
+                    ReExportKind::Namespaced { name: None } => {
+                        star_export_entries.push(StarExportEntry { module_request });
+                    }
+                    ReExportKind::Namespaced { name: Some(_) } => {
+                        return unsupported("namespace re-export", JsSpan::unknown());
+                    }
+                    ReExportKind::Named { names } => {
+                        for specifier in names.iter().copied() {
+                            if specifier.string_literal() {
+                                return unsupported(
+                                    "string literal re-export name",
+                                    JsSpan::unknown(),
+                                );
+                            }
+
+                            indirect_export_entries.push(IndirectExportEntry {
+                                export_name: lower_export_name(
+                                    specifier.alias(),
+                                    interner,
+                                    symbols,
+                                ),
+                                module_request: module_request.clone(),
+                                import_name: lower_export_name(
+                                    specifier.private_name(),
+                                    interner,
+                                    symbols,
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+            _ => unsupported("export declaration", JsSpan::unknown()),
         }
     }
 
@@ -571,6 +792,78 @@ fn lower_identifier(
     let name = identifier.to_interned_string(interner);
 
     symbols.intern(&name)
+}
+
+fn lower_sym(sym: Sym, interner: &Interner, symbols: &mut SymbolTable) -> Symbol {
+    let name = interner.resolve_expect(sym).to_string();
+
+    symbols.intern(&name)
+}
+
+fn lower_module_key(sym: Sym, interner: &Interner) -> ModuleKey {
+    ModuleKey(interner.resolve_expect(sym).to_string())
+}
+
+fn lower_export_name(sym: Sym, interner: &Interner, symbols: &mut SymbolTable) -> ExportName {
+    let name = interner.resolve_expect(sym).to_string();
+
+    if name == "default" {
+        ExportName::Default
+    } else {
+        ExportName::Named(symbols.intern(&name))
+    }
+}
+
+fn push_requested(requested_modules: &mut Vec<ModuleKey>, module: ModuleKey) {
+    if !requested_modules.contains(&module) {
+        requested_modules.push(module);
+    }
+}
+
+fn compile_import_declaration(
+    import: &ImportDeclaration,
+    interner: &Interner,
+    symbols: &mut SymbolTable,
+    requested_modules: &mut Vec<ModuleKey>,
+    import_entries: &mut Vec<ImportEntry>,
+) {
+    let module_request = lower_module_key(import.specifier().sym(), interner);
+
+    push_requested(requested_modules, module_request.clone());
+
+    if let Some(default) = import.default() {
+        import_entries.push(ImportEntry {
+            module_request: module_request.clone(),
+            import_name: ImportName::Default,
+            local_name: lower_identifier(default, interner, symbols),
+        });
+    }
+
+    match import.kind() {
+        ImportKind::DefaultOrUnnamed => {}
+        ImportKind::Namespaced { binding } => {
+            import_entries.push(ImportEntry {
+                module_request,
+                import_name: ImportName::Namespace,
+                local_name: lower_identifier(*binding, interner, symbols),
+            });
+        }
+        ImportKind::Named { names } => {
+            for specifier in names.iter().copied() {
+                let import_name =
+                    match lower_export_name(specifier.export_name(), interner, symbols) {
+                        ExportName::Named(name) => ImportName::Named(name),
+                        ExportName::Default => ImportName::Default,
+                    };
+
+                import_entries.push(ImportEntry {
+                    module_request: module_request.clone(),
+                    import_name,
+                    local_name: lower_identifier(specifier.binding(), interner, symbols),
+                });
+            }
+        }
+    }
 }
 
 fn lower_property_name(

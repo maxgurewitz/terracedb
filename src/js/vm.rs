@@ -6,8 +6,8 @@ use crate::Error;
 
 use super::attachment::JsHostBindings;
 use super::{
-    BindingKind, BytecodeProgram, EnvFrameId, EnvStack, GcPolicy, Instr, JsFunction, JsHeap,
-    JsValue, ObjectId, ObjectKind, SymbolTable,
+    BindingCellId, BindingKind, BytecodeProgram, EnvFrameId, EnvStack, GcPolicy, Instr, JsFunction,
+    JsHeap, JsValue, ModuleNamespace, ObjectId, ObjectKind, PropertyKey, Symbol, SymbolTable,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -77,6 +77,65 @@ impl Vm {
         &mut self.host
     }
 
+    pub(crate) fn create_module_frame(&mut self) -> EnvFrameId {
+        self.env.create_module_frame()
+    }
+
+    pub(crate) fn declare_in_frame(
+        &mut self,
+        frame: EnvFrameId,
+        name: Symbol,
+        kind: BindingKind,
+        symbols: &SymbolTable,
+    ) -> Result<BindingCellId, Error> {
+        self.env.declare_in_frame(frame, name, kind, symbols)
+    }
+
+    pub(crate) fn alias_in_frame(
+        &mut self,
+        frame: EnvFrameId,
+        name: Symbol,
+        cell: BindingCellId,
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
+        self.env.alias_in_frame(frame, name, cell, symbols)
+    }
+
+    pub(crate) fn declare_in_frame_value(
+        &mut self,
+        frame: EnvFrameId,
+        name: Symbol,
+        kind: BindingKind,
+        value: JsValue,
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
+        self.env
+            .declare_in_frame_value(frame, name, kind, value, &mut self.heap, symbols)
+    }
+
+    pub(crate) fn cell_for_name_in_frame(
+        &self,
+        frame: EnvFrameId,
+        name: Symbol,
+        symbols: &SymbolTable,
+    ) -> Result<BindingCellId, Error> {
+        self.env.cell_for_name_in_frame(frame, name, symbols)
+    }
+
+    pub(crate) fn load_cell(
+        &mut self,
+        cell: BindingCellId,
+        name: Symbol,
+        symbols: &SymbolTable,
+    ) -> Result<JsValue, Error> {
+        self.env.load_cell(cell, name, &mut self.heap, symbols)
+    }
+
+    pub(crate) fn alloc_module_namespace(&mut self, namespace: ModuleNamespace) -> ObjectId {
+        self.heap
+            .alloc_object(ObjectKind::ModuleNamespace(namespace))
+    }
+
     pub(crate) fn run(
         &mut self,
         program: BytecodeProgram,
@@ -89,6 +148,20 @@ impl Vm {
             RunResult::Failed(err) => Err(err),
             RunResult::Suspended => unreachable!("unbounded run should not suspend"),
         }
+    }
+
+    pub(crate) fn run_in_frame(
+        &mut self,
+        program: BytecodeProgram,
+        frame: EnvFrameId,
+        symbols: &SymbolTable,
+    ) -> Result<JsValue, Error> {
+        let previous = self.env.set_current_frame(frame)?;
+        let result = self.run(program, symbols);
+        let restore = self.env.restore_current_frame(previous);
+
+        restore?;
+        result
     }
 
     pub(crate) fn start(&mut self, program: BytecodeProgram) -> Result<RunResult, Error> {
@@ -305,7 +378,7 @@ impl Vm {
             Instr::GetProperty(key) => {
                 let object_value = self.pop_value()?;
                 let result = expect_object(&object_value)
-                    .and_then(|object| self.heap.get_property(object, key));
+                    .and_then(|object| self.get_property(object, key, symbols));
                 self.heap.free_value(object_value)?;
                 self.push_owned(result?);
             }
@@ -313,7 +386,7 @@ impl Vm {
                 let value = self.pop_value()?;
                 let object_value = self.pop_value()?;
                 let result = expect_object(&object_value)
-                    .and_then(|object| self.heap.set_property(object, key, value.clone()));
+                    .and_then(|object| self.set_property(object, key, value.clone()));
                 self.heap.free_value(object_value)?;
                 match result {
                     Ok(()) => self.push_owned(value),
@@ -458,7 +531,42 @@ impl Vm {
                 self.enter_js_function(function, args, symbols)?;
                 Ok(None)
             }
+            ObjectKind::ModuleNamespace(_) => Err(Error::JsNotCallable),
             ObjectKind::Ordinary => Err(Error::JsNotCallable),
+        }
+    }
+
+    fn get_property(
+        &mut self,
+        object: ObjectId,
+        key: PropertyKey,
+        symbols: &SymbolTable,
+    ) -> Result<JsValue, Error> {
+        match self.heap.object_kind(object)? {
+            ObjectKind::ModuleNamespace(namespace) => match key {
+                PropertyKey::Symbol(symbol) => {
+                    let Some(cell) = namespace.exports.get(&symbol).copied() else {
+                        return Ok(JsValue::Undefined);
+                    };
+
+                    self.env.load_cell(cell, symbol, &mut self.heap, symbols)
+                }
+            },
+            _ => self.heap.get_property(object, key),
+        }
+    }
+
+    fn set_property(
+        &mut self,
+        object: ObjectId,
+        key: PropertyKey,
+        value: JsValue,
+    ) -> Result<(), Error> {
+        match self.heap.object_kind(object)? {
+            ObjectKind::ModuleNamespace(_) => Err(Error::JsTypeError {
+                message: "module namespace properties are read-only".to_owned(),
+            }),
+            _ => self.heap.set_property(object, key, value),
         }
     }
 

@@ -87,6 +87,16 @@ impl EnvStack {
         Ok(previous)
     }
 
+    pub(crate) fn create_module_frame(&mut self) -> EnvFrameId {
+        let depth = self.frame(self.root).expect("root frame must exist").depth + 1;
+        let id = EnvFrameId(self.frames.len() as u32);
+
+        self.frames
+            .push(Some(EnvFrame::new(Some(self.root), depth)));
+
+        id
+    }
+
     pub(crate) fn restore_current_frame(&mut self, frame: EnvFrameId) -> Result<(), Error> {
         self.frame(frame)?;
         self.current = frame;
@@ -146,7 +156,18 @@ impl EnvStack {
         kind: BindingKind,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
-        if self.frame(self.current)?.bindings.contains_key(&name) {
+        self.declare_in_frame(self.current, name, kind, symbols)
+            .map(|_| ())
+    }
+
+    pub(crate) fn declare_in_frame(
+        &mut self,
+        frame: EnvFrameId,
+        name: Symbol,
+        kind: BindingKind,
+        symbols: &SymbolTable,
+    ) -> Result<BindingCellId, Error> {
+        if self.frame(frame)?.bindings.contains_key(&name) {
             return Err(Error::JsDuplicateBinding {
                 name: symbols.resolve_expect(name).to_owned(),
             });
@@ -158,9 +179,9 @@ impl EnvStack {
             initialized: false,
         });
 
-        self.frame_mut(self.current)?.bindings.insert(name, cell);
+        self.frame_mut(frame)?.bindings.insert(name, cell);
 
-        Ok(())
+        Ok(cell)
     }
 
     pub fn declare_current_value(
@@ -171,8 +192,55 @@ impl EnvStack {
         heap: &mut JsHeap,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
-        self.declare_current(name, kind, symbols)?;
-        self.store(name, value, heap, symbols)
+        self.declare_in_frame_value(self.current, name, kind, value, heap, symbols)
+    }
+
+    pub(crate) fn declare_in_frame_value(
+        &mut self,
+        frame: EnvFrameId,
+        name: Symbol,
+        kind: BindingKind,
+        value: JsValue,
+        heap: &mut JsHeap,
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
+        let cell = self.declare_in_frame(frame, name, kind, symbols)?;
+        self.store_cell(cell, name, value, heap, symbols)
+    }
+
+    pub(crate) fn alias_in_frame(
+        &mut self,
+        frame: EnvFrameId,
+        name: Symbol,
+        cell: BindingCellId,
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
+        self.cell(cell)?;
+
+        if self.frame(frame)?.bindings.contains_key(&name) {
+            return Err(Error::JsDuplicateBinding {
+                name: symbols.resolve_expect(name).to_owned(),
+            });
+        }
+
+        self.frame_mut(frame)?.bindings.insert(name, cell);
+
+        Ok(())
+    }
+
+    pub(crate) fn cell_for_name_in_frame(
+        &self,
+        frame: EnvFrameId,
+        name: Symbol,
+        symbols: &SymbolTable,
+    ) -> Result<BindingCellId, Error> {
+        self.frame(frame)?
+            .bindings
+            .get(&name)
+            .copied()
+            .ok_or_else(|| Error::JsBindingNotFound {
+                name: symbols.resolve_expect(name).to_owned(),
+            })
     }
 
     pub(crate) fn lookup(
@@ -186,11 +254,8 @@ impl EnvStack {
             .ok_or_else(|| Error::JsBindingNotFound {
                 name: symbols.resolve_expect(name).to_owned(),
             })?;
-        let value = self.cell(cell)?.value.clone();
 
-        heap.dup_value(&value);
-
-        Ok(value)
+        self.load_cell(cell, name, heap, symbols)
     }
 
     pub(crate) fn store(
@@ -206,6 +271,39 @@ impl EnvStack {
                 name: symbols.resolve_expect(name).to_owned(),
             })?;
 
+        self.store_cell(cell, name, value, heap, symbols)
+    }
+
+    pub(crate) fn load_cell(
+        &self,
+        cell: BindingCellId,
+        name: Symbol,
+        heap: &mut JsHeap,
+        symbols: &SymbolTable,
+    ) -> Result<JsValue, Error> {
+        let binding = self.cell(cell)?;
+
+        if !binding.initialized {
+            return Err(Error::JsUninitializedBinding {
+                name: symbols.resolve_expect(name).to_owned(),
+            });
+        }
+
+        let value = binding.value.clone();
+
+        heap.dup_value(&value);
+
+        Ok(value)
+    }
+
+    pub(crate) fn store_cell(
+        &mut self,
+        cell: BindingCellId,
+        name: Symbol,
+        value: JsValue,
+        heap: &mut JsHeap,
+        symbols: &SymbolTable,
+    ) -> Result<(), Error> {
         {
             let binding = self.cell(cell)?;
 

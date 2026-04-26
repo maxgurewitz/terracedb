@@ -4,7 +4,7 @@ use crate::{Actor, Env, Error, WorkerShardCtx};
 
 use super::{
     GcPolicy, HeapStats, InstructionBudget, JsAttachment, JsRuntimeConfig, JsRuntimeId,
-    JsRuntimeInstance, JsValue, RunResult,
+    JsRuntimeInstance, JsValue, ModuleId, ModuleKey, RunResult,
 };
 
 pub struct JsRuntimePoolConfig {
@@ -25,6 +25,7 @@ pub struct JsRuntimePoolActor {
     next_runtime_id: u64,
     runtimes: HashMap<JsRuntimeId, JsRuntimeInstance>,
     attachments: Vec<Box<dyn JsAttachment + Send>>,
+    module_sources: HashMap<ModuleKey, String>,
     gc_policy: GcPolicy,
 }
 
@@ -34,6 +35,19 @@ pub enum JsPoolMsg {
     Eval {
         runtime_id: JsRuntimeId,
         source: String,
+    },
+    DefineModule {
+        specifier: String,
+        source: String,
+    },
+    EvaluateModule {
+        runtime_id: JsRuntimeId,
+        specifier: String,
+    },
+    GetModuleExport {
+        runtime_id: JsRuntimeId,
+        specifier: String,
+        export_name: String,
     },
     EvalStart {
         runtime_id: JsRuntimeId,
@@ -71,6 +85,9 @@ pub enum JsPoolReply {
     RuntimeCreated(JsRuntimeId),
     EvalCompleted(JsValue),
     EvalFailed(Error),
+    ModuleDefined,
+    ModuleEvaluated { module: ModuleId },
+    ModuleExport { value: JsValue },
     RunResult(RunResult),
     RuntimeSerialized { bytes: Vec<u8> },
     RuntimeDropped,
@@ -86,6 +103,7 @@ impl JsRuntimePoolActor {
             next_runtime_id: 0,
             runtimes: HashMap::new(),
             attachments: config.attachments,
+            module_sources: HashMap::new(),
             gc_policy: config.gc_policy,
         }
     }
@@ -117,6 +135,50 @@ impl JsRuntimePoolActor {
             .ok_or(Error::RuntimeNotFound(runtime_id))?;
         match runtime.eval(source) {
             Ok(value) => Ok(JsPoolReply::EvalCompleted(value)),
+            Err(err) => Ok(JsPoolReply::EvalFailed(err)),
+        }
+    }
+
+    fn define_module(&mut self, specifier: String, source: String) -> Result<JsPoolReply, Error> {
+        self.module_sources.insert(ModuleKey(specifier), source);
+
+        Ok(JsPoolReply::ModuleDefined)
+    }
+
+    fn evaluate_module(
+        &mut self,
+        runtime_id: JsRuntimeId,
+        specifier: String,
+    ) -> Result<JsPoolReply, Error> {
+        let runtime = self
+            .runtimes
+            .get_mut(&runtime_id)
+            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+
+        match runtime.evaluate_module(
+            ModuleKey(specifier),
+            &self.module_sources,
+            &self.attachments,
+        ) {
+            Ok(module) => Ok(JsPoolReply::ModuleEvaluated { module }),
+            Err(err) => Ok(JsPoolReply::EvalFailed(err)),
+        }
+    }
+
+    fn get_module_export(
+        &mut self,
+        runtime_id: JsRuntimeId,
+        specifier: String,
+        export_name: String,
+    ) -> Result<JsPoolReply, Error> {
+        let runtime = self
+            .runtimes
+            .get_mut(&runtime_id)
+            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let export_name = runtime.module_export_name(&export_name);
+
+        match runtime.get_module_export(&ModuleKey(specifier), export_name) {
+            Ok(value) => Ok(JsPoolReply::ModuleExport { value }),
             Err(err) => Ok(JsPoolReply::EvalFailed(err)),
         }
     }
@@ -233,6 +295,16 @@ impl Actor<WorkerShardCtx> for JsRuntimePoolActor {
         match msg {
             JsPoolMsg::CreateRuntime => self.create_runtime(),
             JsPoolMsg::Eval { runtime_id, source } => self.eval(runtime_id, &source),
+            JsPoolMsg::DefineModule { specifier, source } => self.define_module(specifier, source),
+            JsPoolMsg::EvaluateModule {
+                runtime_id,
+                specifier,
+            } => self.evaluate_module(runtime_id, specifier),
+            JsPoolMsg::GetModuleExport {
+                runtime_id,
+                specifier,
+                export_name,
+            } => self.get_module_export(runtime_id, specifier, export_name),
             JsPoolMsg::EvalStart { runtime_id, source } => self.eval_start(runtime_id, &source),
             JsPoolMsg::RunForBudget { runtime_id, budget } => {
                 self.run_for_budget(runtime_id, budget)
@@ -255,7 +327,37 @@ mod tests {
     use crate::{ActorRef, Error, SimRuntime, WorkerHandle};
 
     use super::*;
-    use crate::{ConsoleAttachment, JsOutputChunk, JsOutputReceiver, JsStreamKind};
+    use crate::{
+        AttachmentInstallCtx, ConsoleAttachment, HostModuleInstallCtx, JsAttachment, JsOutputChunk,
+        JsOutputReceiver, JsStreamKind, ModuleKey,
+    };
+
+    struct HostNumbersAttachment;
+
+    impl JsAttachment for HostNumbersAttachment {
+        fn install(&self, _ctx: &mut AttachmentInstallCtx<'_>) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn has_module(&self, specifier: &ModuleKey) -> bool {
+            specifier.0 == "host:numbers"
+        }
+
+        fn install_module(
+            &self,
+            specifier: &ModuleKey,
+            ctx: &mut HostModuleInstallCtx<'_>,
+        ) -> Result<bool, Error> {
+            if !self.has_module(specifier) {
+                return Ok(false);
+            }
+
+            ctx.export_const("one", JsValue::Number(1.0))?;
+            ctx.export_const("default", JsValue::Number(2.0))?;
+
+            Ok(true)
+        }
+    }
 
     fn create_pool_runtime(
         sim: &mut SimRuntime,
@@ -507,6 +609,65 @@ mod tests {
             .downcast::<JsPoolReply>()
             .map(|reply| *reply)
             .map_err(|_| Error::ActorReplyTypeMismatch)
+    }
+
+    fn define_module(
+        sim: &mut SimRuntime,
+        worker: &WorkerHandle,
+        pool: &ActorRef<JsRuntimePoolActor>,
+        specifier: &str,
+        source: &str,
+    ) -> Result<(), Error> {
+        match pool_call(
+            sim,
+            worker,
+            pool,
+            JsPoolMsg::DefineModule {
+                specifier: specifier.to_owned(),
+                source: source.to_owned(),
+            },
+        )? {
+            JsPoolReply::ModuleDefined => Ok(()),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    fn evaluate_module(
+        sim: &mut SimRuntime,
+        worker: &WorkerHandle,
+        pool: &ActorRef<JsRuntimePoolActor>,
+        runtime_id: JsRuntimeId,
+        specifier: &str,
+    ) -> Result<JsPoolReply, Error> {
+        pool_call(
+            sim,
+            worker,
+            pool,
+            JsPoolMsg::EvaluateModule {
+                runtime_id,
+                specifier: specifier.to_owned(),
+            },
+        )
+    }
+
+    fn get_module_export(
+        sim: &mut SimRuntime,
+        worker: &WorkerHandle,
+        pool: &ActorRef<JsRuntimePoolActor>,
+        runtime_id: JsRuntimeId,
+        specifier: &str,
+        export_name: &str,
+    ) -> Result<JsPoolReply, Error> {
+        pool_call(
+            sim,
+            worker,
+            pool,
+            JsPoolMsg::GetModuleExport {
+                runtime_id,
+                specifier: specifier.to_owned(),
+                export_name: export_name.to_owned(),
+            },
+        )
     }
 
     #[test]
@@ -2171,6 +2332,382 @@ mod tests {
             JsPoolReply::EvalFailed(Error::JsNotCallable) => {}
             other => panic!("unexpected reply: {other:?}"),
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_named_exports_and_imports() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./values.js",
+            r#"
+                export const one = 1;
+                export const two = one + 1;
+            "#,
+        )?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./main.js",
+            r#"
+                import { one, two } from "./values.js";
+                console.log(one + two);
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./main.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_default_export_and_import() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(&mut sim, &worker, &pool, "./value.js", "export default 3;")?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./main.js",
+            r#"
+                import value from "./value.js";
+                console.log(value);
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./main.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_namespace_import() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./values.js",
+            r#"
+                export const one = 1;
+                export const two = 2;
+            "#,
+        )?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./main.js",
+            r#"
+                import * as values from "./values.js";
+                console.log(values.one + values.two);
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./main.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_named_re_export() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(&mut sim, &worker, &pool, "./a.js", "export const one = 1;")?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./b.js",
+            r#"export { one } from "./a.js";"#,
+        )?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./main.js",
+            r#"
+                import { one } from "./b.js";
+                console.log(one);
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./main.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"1\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_star_re_export() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./a.js",
+            r#"
+                export const one = 1;
+                export const two = 2;
+            "#,
+        )?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./b.js",
+            r#"export * from "./a.js";"#,
+        )?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./main.js",
+            r#"
+                import { one, two } from "./b.js";
+                console.log(one + two);
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./main.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_default_named_re_export() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(&mut sim, &worker, &pool, "./a.js", "export default 3;")?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./b.js",
+            r#"export { default as value } from "./a.js";"#,
+        )?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./main.js",
+            r#"
+                import { value } from "./b.js";
+                console.log(value);
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./main.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_cyclic_graph_with_live_bindings() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./a.js",
+            r#"
+                import { b } from "./b.js";
+                export const a = 1;
+                export const fromB = b;
+            "#,
+        )?;
+        define_module(&mut sim, &worker, &pool, "./b.js", "export const b = 2;")?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./main.js",
+            r#"
+                import { a, fromB } from "./a.js";
+                console.log(a + fromB);
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./main.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_tdz_uninitialized_binding_in_cycle_errors() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, _output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./a.js",
+            r#"
+                import { b } from "./b.js";
+                console.log(b);
+                export const a = 1;
+            "#,
+        )?;
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./b.js",
+            r#"
+                import { a } from "./a.js";
+                console.log(a);
+                export const b = 2;
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./a.js")? {
+            JsPoolReply::EvalFailed(Error::JsUninitializedBinding { .. }) => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_module_host_can_get_exports() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, _output_rx) = create_pool_runtime(&mut sim)?;
+
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./values.js",
+            r#"
+                export const one = 1;
+                export default 2;
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./values.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(
+            get_module_export(&mut sim, &worker, &pool, runtime_id, "./values.js", "one")?,
+            JsPoolReply::ModuleExport {
+                value: JsValue::Number(1.0)
+            }
+        );
+        assert_eq!(
+            get_module_export(
+                &mut sim,
+                &worker,
+                &pool,
+                runtime_id,
+                "./values.js",
+                "default",
+            )?,
+            JsPoolReply::ModuleExport {
+                value: JsValue::Number(2.0)
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_attachment_can_provide_host_module_exports() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let worker = sim.workers()[0].clone();
+        let (output_tx, output_rx) = flume::unbounded::<JsOutputChunk>();
+        let pool = sim.register_actor(
+            &worker,
+            JsRuntimePoolActor::new(JsRuntimePoolConfig {
+                attachments: vec![
+                    Box::new(ConsoleAttachment { output_tx }),
+                    Box::new(HostNumbersAttachment),
+                ],
+                gc_policy: GcPolicy::default(),
+            }),
+        )?;
+
+        let runtime_id = match pool_call(&mut sim, &worker, &pool, JsPoolMsg::CreateRuntime)? {
+            JsPoolReply::RuntimeCreated(runtime_id) => runtime_id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        define_module(
+            &mut sim,
+            &worker,
+            &pool,
+            "./main.js",
+            r#"
+                import value, { one } from "host:numbers";
+                console.log(one + value);
+            "#,
+        )?;
+
+        match evaluate_module(&mut sim, &worker, &pool, runtime_id, "./main.js")? {
+            JsPoolReply::ModuleEvaluated { .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"3\n");
+        assert_eq!(
+            get_module_export(&mut sim, &worker, &pool, runtime_id, "host:numbers", "one")?,
+            JsPoolReply::ModuleExport {
+                value: JsValue::Number(1.0)
+            }
+        );
 
         Ok(())
     }

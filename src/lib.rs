@@ -22,13 +22,15 @@ pub use error::Error;
 pub use js::{
     AttachmentHostCtx, AttachmentInstallCtx, Binding, BindingCellId, BindingKind, BytecodeProgram,
     ChannelByteSink, ConsoleAttachment, ConstId, Constant, ConstantPool,
-    DEFAULT_GC_THRESHOLD_BYTES, EnvFrame, EnvFrameId, EnvStack, GcHeader, GcMark, GcPolicy,
-    HeapObject, HeapStats, HostFunction, HostFunctionKind, Instr, InstructionBudget, JsAttachment,
+    DEFAULT_GC_THRESHOLD_BYTES, EnvFrame, EnvFrameId, EnvStack, ExportName, GcHeader, GcMark,
+    GcPolicy, HeapObject, HeapStats, HostFunction, HostFunctionKind, HostModuleInstallCtx,
+    ImportEntry, ImportName, IndirectExportEntry, Instr, InstructionBudget, JsAttachment,
     JsCompileError, JsHeap, JsHostBindings, JsObject, JsOutputChunk, JsOutputReceiver,
     JsOutputSender, JsPoolMsg, JsPoolReply, JsProperty, JsRuntimeConfig, JsRuntimeId,
     JsRuntimeInstance, JsRuntimePoolActor, JsRuntimePoolConfig, JsSpan, JsStreamKind, JsValue,
-    ObjectId, ObjectKind, PropertyKey, RunResult, Symbol, SymbolTable, Vm,
-    compile_source_to_bytecode,
+    LocalBindingEntry, LocalExportEntry, ModuleId, ModuleKey, ModuleRecord, ModuleRegistry,
+    ModuleState, ObjectId, ObjectKind, PropertyKey, ResolvedExport, RunResult, StarExportEntry,
+    Symbol, SymbolTable, Vm, compile_module_source, compile_source_to_bytecode,
 };
 pub use runtime::{
     CallHandle, Runtime, RuntimeApi, RuntimeBuilder, Shutdown, SimRuntime, SimRuntimeBuilder,

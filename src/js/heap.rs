@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 
 use super::attachment::JsHostBindings;
-use super::{BytecodeProgram, EnvFrameId, JsStreamKind, JsValue, Symbol, SymbolTable};
+use super::{
+    BindingCellId, BytecodeProgram, EnvFrameId, JsStreamKind, JsValue, ModuleId, Symbol,
+    SymbolTable,
+};
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ObjectId(pub u64);
@@ -570,6 +573,7 @@ pub enum ObjectKind {
     Ordinary,
     HostFunction(HostFunction),
     JsFunction(JsFunction),
+    ModuleNamespace(ModuleNamespace),
     // If host object kinds later own JsValue children, add explicit strong and
     // weak child traversal hooks instead of treating all host state as ordinary
     // object properties.
@@ -581,6 +585,7 @@ impl ObjectKind {
             Self::Ordinary => {}
             Self::HostFunction(host_function) => host_function.visit_children(visitor),
             Self::JsFunction(function) => function.visit_children(visitor),
+            Self::ModuleNamespace(namespace) => namespace.visit_children(visitor),
         }
     }
 
@@ -589,6 +594,7 @@ impl ObjectKind {
             Self::Ordinary => {}
             Self::HostFunction(host_function) => host_function.append_child_values(values),
             Self::JsFunction(function) => function.append_child_values(values),
+            Self::ModuleNamespace(namespace) => namespace.append_child_values(values),
         }
     }
 
@@ -597,6 +603,7 @@ impl ObjectKind {
             Self::Ordinary => Ok(()),
             Self::HostFunction(host_function) => host_function.release_children(heap),
             Self::JsFunction(function) => function.release_children(heap),
+            Self::ModuleNamespace(namespace) => namespace.release_children(heap),
         }
     }
 
@@ -605,6 +612,7 @@ impl ObjectKind {
             Self::Ordinary => {}
             Self::HostFunction(host_function) => host_function.append_runtime_edges(edges),
             Self::JsFunction(function) => function.append_runtime_edges(edges),
+            Self::ModuleNamespace(namespace) => namespace.append_runtime_edges(edges),
         }
     }
 }
@@ -704,6 +712,27 @@ impl JsFunction {
 
     fn append_runtime_edges(&self, edges: &mut RuntimeEdges) {
         edges.frames.push(self.captured_env);
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModuleNamespace {
+    pub module: ModuleId,
+    pub exports: HashMap<Symbol, BindingCellId>,
+}
+
+impl ModuleNamespace {
+    fn visit_children(&self, _visitor: &mut impl FnMut(ObjectId)) {}
+
+    fn append_child_values(&self, _values: &mut Vec<JsValue>) {}
+
+    fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn append_runtime_edges(&self, _edges: &mut RuntimeEdges) {
+        // Namespace objects point at binding cells. Module environment frames are
+        // runtime roots, so exported heap values are traced from those frames.
     }
 }
 

@@ -1,8 +1,9 @@
 use crate::Error;
 
 use super::{
-    BindingKind, EnvStack, HostFunction, HostFunctionKind, JsHeap, JsOutputChunk, JsOutputSender,
-    JsRuntimeId, JsStreamKind, JsValue, ObjectKind, PropertyKey, SymbolTable,
+    BindingKind, EnvFrameId, EnvStack, ExportName, HostFunction, HostFunctionKind, JsHeap,
+    JsOutputChunk, JsOutputSender, JsRuntimeId, JsStreamKind, JsValue, LocalExportEntry, ModuleKey,
+    ObjectKind, PropertyKey, SymbolTable,
 };
 
 pub trait JsAttachment: Send {
@@ -10,6 +11,18 @@ pub trait JsAttachment: Send {
 
     fn bind_host(&self, _ctx: &mut AttachmentHostCtx<'_>) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn has_module(&self, _specifier: &ModuleKey) -> bool {
+        false
+    }
+
+    fn install_module(
+        &self,
+        _specifier: &ModuleKey,
+        _ctx: &mut HostModuleInstallCtx<'_>,
+    ) -> Result<bool, Error> {
+        Ok(false)
     }
 }
 
@@ -24,6 +37,62 @@ pub struct AttachmentInstallCtx<'a> {
 pub struct AttachmentHostCtx<'a> {
     pub runtime_id: JsRuntimeId,
     pub host: &'a mut JsHostBindings,
+}
+
+pub struct HostModuleInstallCtx<'a> {
+    pub runtime_id: JsRuntimeId,
+    pub symbols: &'a mut SymbolTable,
+    pub heap: &'a mut JsHeap,
+    env: &'a mut EnvStack,
+    env_frame: EnvFrameId,
+    local_exports: Vec<LocalExportEntry>,
+}
+
+impl<'a> HostModuleInstallCtx<'a> {
+    pub(crate) fn new(
+        runtime_id: JsRuntimeId,
+        symbols: &'a mut SymbolTable,
+        heap: &'a mut JsHeap,
+        env: &'a mut EnvStack,
+        env_frame: EnvFrameId,
+    ) -> Self {
+        Self {
+            runtime_id,
+            symbols,
+            heap,
+            env,
+            env_frame,
+            local_exports: Vec::new(),
+        }
+    }
+
+    pub fn export_const(&mut self, export_name: &str, value: JsValue) -> Result<(), Error> {
+        let local_name = self.symbols.intern(export_name);
+        let export_name = if export_name == "default" {
+            ExportName::Default
+        } else {
+            ExportName::Named(local_name)
+        };
+
+        self.env.declare_in_frame_value(
+            self.env_frame,
+            local_name,
+            BindingKind::Const,
+            value,
+            self.heap,
+            self.symbols,
+        )?;
+        self.local_exports.push(LocalExportEntry {
+            export_name,
+            local_name,
+        });
+
+        Ok(())
+    }
+
+    pub(crate) fn into_local_exports(self) -> Vec<LocalExportEntry> {
+        self.local_exports
+    }
 }
 
 #[derive(Clone, Default)]
