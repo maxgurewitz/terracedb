@@ -162,13 +162,11 @@ impl Compiler {
     }
 
     fn emit(&mut self, instr: Instr) -> usize {
-        let at = self.current_ip();
-        self.program.instructions.push(instr);
-        at
+        self.program.push_instr(instr)
     }
 
     fn emit_const(&mut self, constant: Constant) -> ConstId {
-        self.program.constants.push(constant)
+        self.program.push_const(constant)
     }
 
     fn emit_load_const(&mut self, constant: Constant) {
@@ -181,21 +179,11 @@ impl Compiler {
     }
 
     fn current_ip(&self) -> usize {
-        self.program.instructions.len()
+        self.program.instructions_len()
     }
 
     fn patch_jump(&mut self, at: usize, target: usize) {
-        match self
-            .program
-            .instructions
-            .get_mut(at)
-            .expect("invalid jump patch")
-        {
-            Instr::Jump(slot) | Instr::JumpIfFalse(slot) | Instr::JumpIfTrue(slot) => {
-                *slot = target;
-            }
-            _ => panic!("cannot patch non-jump instruction"),
-        }
+        self.program.patch_jump(at, target);
     }
 
     fn compile_statement_list_item(
@@ -979,22 +967,19 @@ mod tests {
 
         assert!(
             program
-                .instructions
-                .iter()
+                .iter_instructions()
                 .any(|instr| matches!(instr, Instr::DeclareLet(_)))
         );
         assert!(
             program
-                .instructions
-                .iter()
+                .iter_instructions()
                 .any(|instr| matches!(instr, Instr::GetProperty(_)))
         );
         assert!(
             program
-                .instructions
-                .iter()
+                .iter_instructions()
                 .any(|instr| matches!(instr, Instr::Call(1)))
         );
-        assert!(matches!(program.instructions.last(), Some(Instr::Halt)));
+        assert!(matches!(program.last_instr(), Some(Instr::Halt)));
     }
 }

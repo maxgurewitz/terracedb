@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-use super::{JsHeap, JsValue, SegmentId, Symbol, SymbolTable};
+use super::{JsHeap, JsValue, SegmentId, Symbol, SymbolTable, ValueCols};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct EnvStack {
@@ -12,24 +12,24 @@ pub struct EnvStack {
     current: EnvFrameId,
     binding_segment: SegmentId,
     frame_segment: SegmentId,
-    frames: Vec<Option<EnvFrame>>,
-    cells: Vec<Option<Binding>>,
-}
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct EnvFrame {
-    parent: Option<EnvFrameId>,
-    bindings: HashMap<Symbol, BindingCellId>,
-    depth: usize,
-    active: bool,
-    capture_count: usize,
-}
+    env_frame_live: Vec<bool>,
+    env_frame_parent: Vec<Option<EnvFrameId>>,
+    env_frame_depth: Vec<usize>,
+    env_frame_active: Vec<bool>,
+    env_frame_capture_count: Vec<usize>,
+    env_frame_binding_range_start: Vec<u32>,
+    env_frame_binding_range_len: Vec<u32>,
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Binding {
-    kind: BindingKind,
-    value: JsValue,
-    initialized: bool,
+    env_frame_binding_live: Vec<bool>,
+    env_frame_binding_symbol: Vec<Symbol>,
+    env_frame_binding_cell: Vec<BindingCellId>,
+
+    env_cell_live: Vec<bool>,
+    env_cell_owner_frame: Vec<EnvFrameId>,
+    env_cell_kind: Vec<BindingKind>,
+    env_cell_initialized: Vec<bool>,
+    env_cell_value: ValueCols,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -50,16 +50,11 @@ pub enum BindingKind {
     Const,
 }
 
-impl EnvFrame {
-    fn new(parent: Option<EnvFrameId>, depth: usize) -> Self {
-        Self {
-            parent,
-            bindings: HashMap::new(),
-            depth,
-            active: true,
-            capture_count: 0,
-        }
-    }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BindingSnapshot {
+    pub kind: BindingKind,
+    pub value: JsValue,
+    pub initialized: bool,
 }
 
 impl EnvStack {
@@ -68,24 +63,39 @@ impl EnvStack {
             segment: frame_segment,
             slot: 0,
         };
-
-        Self {
+        let mut stack = Self {
             root,
             current: root,
             binding_segment,
             frame_segment,
-            frames: vec![Some(EnvFrame::new(None, 1))],
-            cells: Vec::new(),
-        }
+            env_frame_live: Vec::new(),
+            env_frame_parent: Vec::new(),
+            env_frame_depth: Vec::new(),
+            env_frame_active: Vec::new(),
+            env_frame_capture_count: Vec::new(),
+            env_frame_binding_range_start: Vec::new(),
+            env_frame_binding_range_len: Vec::new(),
+            env_frame_binding_live: Vec::new(),
+            env_frame_binding_symbol: Vec::new(),
+            env_frame_binding_cell: Vec::new(),
+            env_cell_live: Vec::new(),
+            env_cell_owner_frame: Vec::new(),
+            env_cell_kind: Vec::new(),
+            env_cell_initialized: Vec::new(),
+            env_cell_value: ValueCols::new(),
+        };
+
+        stack.push_frame_row(None, 1, true);
+        stack
     }
 
     pub(crate) fn capture_current_frame(&mut self) -> Result<EnvFrameId, Error> {
         let mut current = Some(self.current);
 
         while let Some(frame_id) = current {
-            let frame = self.frame_mut(frame_id)?;
-            frame.capture_count += 1;
-            current = frame.parent;
+            self.validate_frame_id(frame_id)?;
+            self.env_frame_capture_count[frame_id.slot as usize] += 1;
+            current = self.env_frame_parent[frame_id.slot as usize];
         }
 
         Ok(self.current)
@@ -96,56 +106,34 @@ impl EnvStack {
     }
 
     pub(crate) fn live_frame_count(&self) -> usize {
-        self.frames.iter().filter(|frame| frame.is_some()).count()
+        self.env_frame_live.iter().filter(|live| **live).count()
     }
 
     pub(crate) fn live_cell_count(&self) -> usize {
-        self.cells.iter().filter(|cell| cell.is_some()).count()
+        self.env_cell_live.iter().filter(|live| **live).count()
     }
 
     pub(crate) fn set_current_frame(&mut self, frame: EnvFrameId) -> Result<EnvFrameId, Error> {
-        self.frame(frame)?;
-
+        self.validate_frame_id(frame)?;
         let previous = self.current;
         self.current = frame;
-
         Ok(previous)
     }
 
     pub(crate) fn create_module_frame(&mut self) -> EnvFrameId {
-        let depth = self.frame(self.root).expect("root frame must exist").depth + 1;
-        let id = EnvFrameId {
-            segment: self.frame_segment,
-            slot: self.frames.len() as u32,
-        };
-
-        self.frames
-            .push(Some(EnvFrame::new(Some(self.root), depth)));
-
-        id
+        let depth = self.env_frame_depth[self.root.slot as usize] + 1;
+        self.push_frame_row(Some(self.root), depth, true)
     }
 
     pub(crate) fn restore_current_frame(&mut self, frame: EnvFrameId) -> Result<(), Error> {
-        self.frame(frame)?;
+        self.validate_frame_id(frame)?;
         self.current = frame;
-
         Ok(())
     }
 
     pub(crate) fn push_scope(&mut self) {
-        let depth = self
-            .frame(self.current)
-            .expect("current frame must exist")
-            .depth
-            + 1;
-        let id = EnvFrameId {
-            segment: self.frame_segment,
-            slot: self.frames.len() as u32,
-        };
-
-        self.frames
-            .push(Some(EnvFrame::new(Some(self.current), depth)));
-        self.current = id;
+        let depth = self.env_frame_depth[self.current.slot as usize] + 1;
+        self.current = self.push_frame_row(Some(self.current), depth, true);
     }
 
     pub(crate) fn pop_scope(&mut self, heap: &mut JsHeap) -> Result<(), Error> {
@@ -154,19 +142,15 @@ impl EnvStack {
         }
 
         let frame_id = self.current;
-        let parent = self
-            .frame(frame_id)?
-            .parent
-            .expect("non-root frame has parent");
+        let parent =
+            self.env_frame_parent[frame_id.slot as usize].expect("non-root frame has parent");
 
         self.current = parent;
         self.deactivate_frame(frame_id, heap)
     }
 
     pub(crate) fn depth(&self) -> usize {
-        self.frame(self.current)
-            .expect("current frame must exist")
-            .depth
+        self.env_frame_depth[self.current.slot as usize]
     }
 
     pub(crate) fn truncate_to_depth(
@@ -198,19 +182,14 @@ impl EnvStack {
         kind: BindingKind,
         symbols: &SymbolTable,
     ) -> Result<BindingCellId, Error> {
-        if self.frame(frame)?.bindings.contains_key(&name) {
+        if self.binding_cell_in_frame(frame, name)?.is_some() {
             return Err(Error::JsDuplicateBinding {
                 name: symbols.resolve_expect(name).to_owned(),
             });
         }
 
-        let cell = self.alloc_cell(Binding {
-            kind,
-            value: JsValue::Undefined,
-            initialized: false,
-        });
-
-        self.frame_mut(frame)?.bindings.insert(name, cell);
+        let cell = self.alloc_cell(frame, kind, JsValue::Undefined, false);
+        self.push_frame_binding(frame, name, cell)?;
 
         Ok(cell)
     }
@@ -246,17 +225,15 @@ impl EnvStack {
         cell: BindingCellId,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
-        self.cell(cell)?;
+        self.validate_cell_id(cell)?;
 
-        if self.frame(frame)?.bindings.contains_key(&name) {
+        if self.binding_cell_in_frame(frame, name)?.is_some() {
             return Err(Error::JsDuplicateBinding {
                 name: symbols.resolve_expect(name).to_owned(),
             });
         }
 
-        self.frame_mut(frame)?.bindings.insert(name, cell);
-
-        Ok(())
+        self.push_frame_binding(frame, name, cell)
     }
 
     pub(crate) fn cell_for_name_in_frame(
@@ -265,10 +242,7 @@ impl EnvStack {
         name: Symbol,
         symbols: &SymbolTable,
     ) -> Result<BindingCellId, Error> {
-        self.frame(frame)?
-            .bindings
-            .get(&name)
-            .copied()
+        self.binding_cell_in_frame(frame, name)?
             .ok_or_else(|| Error::JsBindingNotFound {
                 name: symbols.resolve_expect(name).to_owned(),
             })
@@ -312,16 +286,16 @@ impl EnvStack {
         heap: &mut JsHeap,
         symbols: &SymbolTable,
     ) -> Result<JsValue, Error> {
-        let binding = self.cell(cell)?;
+        self.validate_cell_id(cell)?;
+        let index = cell.slot as usize;
 
-        if !binding.initialized {
+        if !self.env_cell_initialized[index] {
             return Err(Error::JsUninitializedBinding {
                 name: symbols.resolve_expect(name).to_owned(),
             });
         }
 
-        let value = binding.value.clone();
-
+        let value = self.env_cell_value.get(cell.slot);
         heap.dup_value(&value);
 
         Ok(value)
@@ -335,69 +309,76 @@ impl EnvStack {
         heap: &mut JsHeap,
         symbols: &SymbolTable,
     ) -> Result<(), Error> {
-        {
-            let binding = self.cell(cell)?;
+        self.validate_cell_id(cell)?;
+        let index = cell.slot as usize;
 
-            if binding.kind == BindingKind::Const && binding.initialized {
-                return Err(Error::JsAssignToConst {
-                    name: symbols.resolve_expect(name).to_owned(),
-                });
-            }
+        if self.env_cell_kind[index] == BindingKind::Const && self.env_cell_initialized[index] {
+            return Err(Error::JsAssignToConst {
+                name: symbols.resolve_expect(name).to_owned(),
+            });
         }
 
         heap.dup_value(&value);
-        let old = {
-            let binding = self.cell_mut(cell)?;
-            let old = std::mem::replace(&mut binding.value, value);
-            binding.initialized = true;
-            old
-        };
-
+        let old = self.env_cell_value.get(cell.slot);
+        self.env_cell_value.set(cell.slot, value);
+        self.env_cell_initialized[index] = true;
         heap.free_value(old)
     }
 
     pub(crate) fn release_all_scopes(&mut self, heap: &mut JsHeap) -> Result<(), Error> {
-        for cell in &mut self.cells {
-            if let Some(binding) = cell.take() {
-                heap.free_value(binding.value)?;
+        for slot in 0..self.env_cell_live.len() {
+            if !self.env_cell_live[slot] {
+                continue;
             }
+
+            self.env_cell_live[slot] = false;
+            let value = self.env_cell_value.get(slot as u32);
+            heap.free_value(value)?;
         }
 
-        self.frames.clear();
-
+        self.env_frame_live.fill(false);
+        self.env_frame_binding_live.fill(false);
         Ok(())
     }
 
     pub(crate) fn active_frame_roots(&self) -> Vec<EnvFrameId> {
-        self.frames
+        self.env_frame_live
             .iter()
             .enumerate()
-            .filter_map(|(index, frame)| {
-                frame
-                    .as_ref()
-                    .filter(|frame| frame.active)
-                    .map(|_| EnvFrameId {
+            .filter_map(|(index, live)| {
+                if *live && self.env_frame_active[index] {
+                    Some(EnvFrameId {
                         segment: self.frame_segment,
                         slot: index as u32,
                     })
+                } else {
+                    None
+                }
             })
             .collect()
     }
 
     pub(crate) fn frame_edges(&self, frame_id: EnvFrameId) -> Result<EnvFrameEdges, Error> {
-        let frame = self.frame(frame_id)?;
+        self.validate_frame_id(frame_id)?;
+        let frame_index = frame_id.slot as usize;
         let mut edges = EnvFrameEdges {
             frames: Vec::new(),
             objects: Vec::new(),
         };
 
-        if let Some(parent) = frame.parent {
+        if let Some(parent) = self.env_frame_parent[frame_index] {
             edges.frames.push(parent);
         }
 
-        for cell in frame.bindings.values() {
-            if let JsValue::Object(object) = &self.cell(*cell)?.value {
-                edges.objects.push(*object);
+        for binding in self.binding_indices(frame_id)? {
+            if !self.env_frame_binding_live[binding] {
+                continue;
+            }
+
+            let cell = self.env_frame_binding_cell[binding];
+            self.validate_cell_id(cell)?;
+            if let JsValue::Object(object) = self.env_cell_value.get(cell.slot) {
+                edges.objects.push(object);
             }
         }
 
@@ -410,17 +391,18 @@ impl EnvStack {
         heap: &mut JsHeap,
     ) -> Result<usize, Error> {
         let frames = self
-            .frames
+            .env_frame_live
             .iter()
             .enumerate()
-            .filter_map(|(index, frame)| {
-                frame
-                    .as_ref()
-                    .filter(|frame| !frame.active)
-                    .map(|_| EnvFrameId {
+            .filter_map(|(index, live)| {
+                if *live && !self.env_frame_active[index] {
+                    Some(EnvFrameId {
                         segment: self.frame_segment,
                         slot: index as u32,
                     })
+                } else {
+                    None
+                }
             })
             .collect::<Vec<_>>();
         let mut released = 0;
@@ -437,14 +419,111 @@ impl EnvStack {
         Ok(released)
     }
 
-    fn deactivate_frame(&mut self, frame_id: EnvFrameId, heap: &mut JsHeap) -> Result<(), Error> {
-        let should_release = {
-            let frame = self.frame_mut(frame_id)?;
-            frame.active = false;
-            frame.capture_count == 0
-        };
+    fn push_frame_row(
+        &mut self,
+        parent: Option<EnvFrameId>,
+        depth: usize,
+        active: bool,
+    ) -> EnvFrameId {
+        let slot = self.env_frame_live.len() as u32;
+        self.env_frame_live.push(true);
+        self.env_frame_parent.push(parent);
+        self.env_frame_depth.push(depth);
+        self.env_frame_active.push(active);
+        self.env_frame_capture_count.push(0);
+        self.env_frame_binding_range_start
+            .push(self.env_frame_binding_live.len() as u32);
+        self.env_frame_binding_range_len.push(0);
 
-        if should_release {
+        EnvFrameId {
+            segment: self.frame_segment,
+            slot,
+        }
+    }
+
+    fn alloc_cell(
+        &mut self,
+        owner_frame: EnvFrameId,
+        kind: BindingKind,
+        value: JsValue,
+        initialized: bool,
+    ) -> BindingCellId {
+        let slot = self.env_cell_live.len() as u32;
+        self.env_cell_live.push(true);
+        self.env_cell_owner_frame.push(owner_frame);
+        self.env_cell_kind.push(kind);
+        self.env_cell_initialized.push(initialized);
+        self.env_cell_value.push(value);
+
+        BindingCellId {
+            segment: self.binding_segment,
+            slot,
+        }
+    }
+
+    fn push_frame_binding(
+        &mut self,
+        frame: EnvFrameId,
+        symbol: Symbol,
+        cell: BindingCellId,
+    ) -> Result<(), Error> {
+        self.validate_frame_id(frame)?;
+        self.validate_cell_id(cell)?;
+        let frame_index = frame.slot as usize;
+        let expected_start = self.env_frame_binding_live.len() as u32;
+        let range_end = self.env_frame_binding_range_start[frame_index]
+            + self.env_frame_binding_range_len[frame_index];
+
+        if range_end != expected_start {
+            return self.repack_and_push_frame_binding(frame, symbol, cell);
+        }
+
+        self.env_frame_binding_live.push(true);
+        self.env_frame_binding_symbol.push(symbol);
+        self.env_frame_binding_cell.push(cell);
+        self.env_frame_binding_range_len[frame_index] += 1;
+        Ok(())
+    }
+
+    fn repack_and_push_frame_binding(
+        &mut self,
+        frame: EnvFrameId,
+        symbol: Symbol,
+        cell: BindingCellId,
+    ) -> Result<(), Error> {
+        let existing = self
+            .binding_indices(frame)?
+            .into_iter()
+            .filter(|index| self.env_frame_binding_live[*index])
+            .map(|index| {
+                (
+                    self.env_frame_binding_symbol[index],
+                    self.env_frame_binding_cell[index],
+                )
+            })
+            .collect::<Vec<_>>();
+        let frame_index = frame.slot as usize;
+
+        for index in self.binding_indices(frame)? {
+            self.env_frame_binding_live[index] = false;
+        }
+
+        self.env_frame_binding_range_start[frame_index] = self.env_frame_binding_live.len() as u32;
+        self.env_frame_binding_range_len[frame_index] = 0;
+
+        for (symbol, cell) in existing {
+            self.push_frame_binding(frame, symbol, cell)?;
+        }
+
+        self.push_frame_binding(frame, symbol, cell)
+    }
+
+    fn deactivate_frame(&mut self, frame_id: EnvFrameId, heap: &mut JsHeap) -> Result<(), Error> {
+        self.validate_frame_id(frame_id)?;
+        let index = frame_id.slot as usize;
+        self.env_frame_active[index] = false;
+
+        if self.env_frame_capture_count[index] == 0 {
             self.release_frame(frame_id, heap)?;
         }
 
@@ -452,13 +531,28 @@ impl EnvStack {
     }
 
     fn release_frame(&mut self, frame_id: EnvFrameId, heap: &mut JsHeap) -> Result<(), Error> {
-        let Some(frame) = self.frame_slot_mut(frame_id)?.take() else {
-            return Ok(());
-        };
+        self.validate_frame_id(frame_id)?;
+        let frame_index = frame_id.slot as usize;
 
-        for cell in frame.bindings.into_values() {
-            if let Some(binding) = self.cell_slot_mut(cell)?.take() {
-                heap.free_value(binding.value)?;
+        if !self.env_frame_live[frame_index] {
+            return Ok(());
+        }
+
+        let bindings = self.binding_indices(frame_id)?;
+        self.env_frame_live[frame_index] = false;
+        for binding in bindings {
+            if !self.env_frame_binding_live[binding] {
+                continue;
+            }
+
+            self.env_frame_binding_live[binding] = false;
+            let cell = self.env_frame_binding_cell[binding];
+            let cell_index = cell.slot as usize;
+
+            if self.env_cell_live[cell_index] && self.env_cell_owner_frame[cell_index] == frame_id {
+                self.env_cell_live[cell_index] = false;
+                let value = self.env_cell_value.get(cell.slot);
+                heap.free_value(value)?;
             }
         }
 
@@ -469,81 +563,51 @@ impl EnvStack {
         let mut current = Some(self.current);
 
         while let Some(frame_id) = current {
-            let frame = self.frame(frame_id).ok()?;
-
-            if let Some(cell) = frame.bindings.get(&name) {
-                return Some(*cell);
+            let frame_index = frame_id.slot as usize;
+            if self.validate_frame_id(frame_id).is_err() {
+                return None;
             }
 
-            current = frame.parent;
+            if let Ok(Some(cell)) = self.binding_cell_in_frame(frame_id, name) {
+                return Some(cell);
+            }
+
+            current = self.env_frame_parent[frame_index];
         }
 
         None
     }
 
-    fn alloc_cell(&mut self, binding: Binding) -> BindingCellId {
-        let id = BindingCellId {
-            segment: self.binding_segment,
-            slot: self.cells.len() as u32,
-        };
-        self.cells.push(Some(binding));
-        id
+    fn binding_cell_in_frame(
+        &self,
+        frame: EnvFrameId,
+        name: Symbol,
+    ) -> Result<Option<BindingCellId>, Error> {
+        for index in self.binding_indices(frame)? {
+            if self.env_frame_binding_live[index] && self.env_frame_binding_symbol[index] == name {
+                return Ok(Some(self.env_frame_binding_cell[index]));
+            }
+        }
+
+        Ok(None)
     }
 
-    fn frame(&self, id: EnvFrameId) -> Result<&EnvFrame, Error> {
-        self.validate_frame_id(id)?;
-
-        self.frames
-            .get(id.slot as usize)
-            .and_then(Option::as_ref)
-            .ok_or(Error::JsEnvFrameNotFound { frame: id.slot })
-    }
-
-    fn frame_mut(&mut self, id: EnvFrameId) -> Result<&mut EnvFrame, Error> {
-        self.validate_frame_id(id)?;
-
-        self.frames
-            .get_mut(id.slot as usize)
-            .and_then(Option::as_mut)
-            .ok_or(Error::JsEnvFrameNotFound { frame: id.slot })
-    }
-
-    fn frame_slot_mut(&mut self, id: EnvFrameId) -> Result<&mut Option<EnvFrame>, Error> {
-        self.validate_frame_id(id)?;
-
-        self.frames
-            .get_mut(id.slot as usize)
-            .ok_or(Error::JsEnvFrameNotFound { frame: id.slot })
-    }
-
-    fn cell(&self, id: BindingCellId) -> Result<&Binding, Error> {
-        self.validate_cell_id(id)?;
-
-        self.cells
-            .get(id.slot as usize)
-            .and_then(Option::as_ref)
-            .ok_or(Error::JsBindingCellNotFound { cell: id.slot })
-    }
-
-    fn cell_mut(&mut self, id: BindingCellId) -> Result<&mut Binding, Error> {
-        self.validate_cell_id(id)?;
-
-        self.cells
-            .get_mut(id.slot as usize)
-            .and_then(Option::as_mut)
-            .ok_or(Error::JsBindingCellNotFound { cell: id.slot })
-    }
-
-    fn cell_slot_mut(&mut self, id: BindingCellId) -> Result<&mut Option<Binding>, Error> {
-        self.validate_cell_id(id)?;
-
-        self.cells
-            .get_mut(id.slot as usize)
-            .ok_or(Error::JsBindingCellNotFound { cell: id.slot })
+    fn binding_indices(&self, frame: EnvFrameId) -> Result<Vec<usize>, Error> {
+        self.validate_frame_id(frame)?;
+        let frame_index = frame.slot as usize;
+        let start = self.env_frame_binding_range_start[frame_index] as usize;
+        let len = self.env_frame_binding_range_len[frame_index] as usize;
+        Ok((start..start + len).collect())
     }
 
     fn validate_frame_id(&self, id: EnvFrameId) -> Result<(), Error> {
-        if id.segment != self.frame_segment {
+        if id.segment != self.frame_segment
+            || !self
+                .env_frame_live
+                .get(id.slot as usize)
+                .copied()
+                .unwrap_or(false)
+        {
             return Err(Error::JsEnvFrameNotFound { frame: id.slot });
         }
 
@@ -551,7 +615,13 @@ impl EnvStack {
     }
 
     fn validate_cell_id(&self, id: BindingCellId) -> Result<(), Error> {
-        if id.segment != self.binding_segment {
+        if id.segment != self.binding_segment
+            || !self
+                .env_cell_live
+                .get(id.slot as usize)
+                .copied()
+                .unwrap_or(false)
+        {
             return Err(Error::JsBindingCellNotFound { cell: id.slot });
         }
 

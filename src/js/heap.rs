@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem};
+use std::mem;
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +7,7 @@ use crate::Error;
 use super::attachment::JsHostBindings;
 use super::{
     BindingCellId, BytecodeProgram, EnvFrameId, JsStreamKind, JsValue, ModuleId, SegmentId, Symbol,
-    SymbolTable,
+    SymbolTable, ValueCols,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -43,32 +43,6 @@ impl Default for GcPolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct JsHeap {
-    segment: SegmentId,
-    next_object_slot: u32,
-    objects: Vec<Option<HeapObject>>,
-    free_slots: Vec<u32>,
-    gc_objects: Vec<ObjectId>,
-    zero_ref: Vec<ObjectId>,
-    tmp_cycle: Vec<ObjectId>,
-    // Future weak JS references need their own side table/list here. WeakRef,
-    // FinalizationRegistry, WeakMap, and WeakSet must be processed before cycle
-    // freeing, not represented as ordinary strong child edges.
-    allocated_objects: usize,
-    allocated_bytes: usize,
-    freed_objects: usize,
-    gc_runs: u64,
-    gc_policy: GcPolicy,
-    gc_phase: GcPhase,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HeapObject {
-    header: GcHeader,
-    object: JsObject,
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GcHeader {
     pub ref_count: u32,
@@ -97,6 +71,62 @@ pub struct HeapStats {
     pub gc_runs: u64,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ObjectKindTag {
+    Ordinary,
+    HostFunction,
+    JsFunction,
+    ModuleNamespace,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JsHeap {
+    segment: SegmentId,
+    free_object_slots: Vec<u32>,
+
+    heap_object_live: Vec<bool>,
+    heap_object_ref_count: Vec<u32>,
+    heap_object_gc_mark: Vec<GcMark>,
+    heap_object_bytes: Vec<usize>,
+    heap_object_kind: Vec<ObjectKindTag>,
+    heap_object_kind_payload: Vec<u32>,
+    heap_object_property_range_start: Vec<u32>,
+    heap_object_property_range_len: Vec<u32>,
+
+    heap_property_live: Vec<bool>,
+    heap_property_key_symbol: Vec<Symbol>,
+    heap_property_value: ValueCols,
+
+    host_function_live: Vec<bool>,
+    host_function_name: Vec<Symbol>,
+    host_function_kind: Vec<HostFunctionKind>,
+
+    js_function_live: Vec<bool>,
+    js_function_name: Vec<Option<Symbol>>,
+    js_function_param_range_start: Vec<u32>,
+    js_function_param_range_len: Vec<u32>,
+    js_function_body: Vec<BytecodeProgram>,
+    js_function_captured_env: Vec<EnvFrameId>,
+    js_function_param_symbol: Vec<Symbol>,
+
+    module_namespace_live: Vec<bool>,
+    module_namespace_module: Vec<ModuleId>,
+    module_namespace_export_range_start: Vec<u32>,
+    module_namespace_export_range_len: Vec<u32>,
+    module_namespace_export_symbol: Vec<Symbol>,
+    module_namespace_export_cell: Vec<BindingCellId>,
+
+    gc_object: Vec<ObjectId>,
+    gc_zero_ref: Vec<ObjectId>,
+    gc_tmp_cycle: Vec<ObjectId>,
+    allocated_objects: usize,
+    allocated_bytes: usize,
+    freed_objects: usize,
+    gc_runs: u64,
+    gc_policy: GcPolicy,
+    gc_phase: GcPhase,
+}
+
 impl JsHeap {
     pub fn new() -> Self {
         Self::with_gc_policy(GcPolicy::default())
@@ -109,12 +139,37 @@ impl JsHeap {
     pub fn with_segment_and_gc_policy(segment: SegmentId, gc_policy: GcPolicy) -> Self {
         Self {
             segment,
-            next_object_slot: 0,
-            objects: Vec::new(),
-            free_slots: Vec::new(),
-            gc_objects: Vec::new(),
-            zero_ref: Vec::new(),
-            tmp_cycle: Vec::new(),
+            free_object_slots: Vec::new(),
+            heap_object_live: Vec::new(),
+            heap_object_ref_count: Vec::new(),
+            heap_object_gc_mark: Vec::new(),
+            heap_object_bytes: Vec::new(),
+            heap_object_kind: Vec::new(),
+            heap_object_kind_payload: Vec::new(),
+            heap_object_property_range_start: Vec::new(),
+            heap_object_property_range_len: Vec::new(),
+            heap_property_live: Vec::new(),
+            heap_property_key_symbol: Vec::new(),
+            heap_property_value: ValueCols::new(),
+            host_function_live: Vec::new(),
+            host_function_name: Vec::new(),
+            host_function_kind: Vec::new(),
+            js_function_live: Vec::new(),
+            js_function_name: Vec::new(),
+            js_function_param_range_start: Vec::new(),
+            js_function_param_range_len: Vec::new(),
+            js_function_body: Vec::new(),
+            js_function_captured_env: Vec::new(),
+            js_function_param_symbol: Vec::new(),
+            module_namespace_live: Vec::new(),
+            module_namespace_module: Vec::new(),
+            module_namespace_export_range_start: Vec::new(),
+            module_namespace_export_range_len: Vec::new(),
+            module_namespace_export_symbol: Vec::new(),
+            module_namespace_export_cell: Vec::new(),
+            gc_object: Vec::new(),
+            gc_zero_ref: Vec::new(),
+            gc_tmp_cycle: Vec::new(),
             allocated_objects: 0,
             allocated_bytes: 0,
             freed_objects: 0,
@@ -129,29 +184,40 @@ impl JsHeap {
     }
 
     pub fn alloc_object(&mut self, kind: ObjectKind) -> ObjectId {
-        let object = JsObject::new(kind);
-        let slot = self.free_slots.pop().unwrap_or(self.next_object_slot);
+        let (kind_tag, payload) = self.alloc_kind_payload(kind);
+        let slot = self
+            .free_object_slots
+            .pop()
+            .unwrap_or(self.heap_object_live.len() as u32);
         let id = ObjectId {
             segment: self.segment,
             slot,
         };
-        self.next_object_slot = self.next_object_slot.max(slot + 1);
+        let index = slot as usize;
+        let bytes = estimate_object_bytes(kind_tag);
 
-        let bytes = estimate_object_bytes(&object);
-
-        if self.objects.len() <= slot as usize {
-            self.objects.resize_with(slot as usize + 1, || None);
+        if index == self.heap_object_live.len() {
+            self.heap_object_live.push(true);
+            self.heap_object_ref_count.push(0);
+            self.heap_object_gc_mark.push(GcMark::None);
+            self.heap_object_bytes.push(bytes);
+            self.heap_object_kind.push(kind_tag);
+            self.heap_object_kind_payload.push(payload);
+            self.heap_object_property_range_start
+                .push(self.heap_property_live.len() as u32);
+            self.heap_object_property_range_len.push(0);
+        } else {
+            self.heap_object_live[index] = true;
+            self.heap_object_ref_count[index] = 0;
+            self.heap_object_gc_mark[index] = GcMark::None;
+            self.heap_object_bytes[index] = bytes;
+            self.heap_object_kind[index] = kind_tag;
+            self.heap_object_kind_payload[index] = payload;
+            self.heap_object_property_range_start[index] = self.heap_property_live.len() as u32;
+            self.heap_object_property_range_len[index] = 0;
         }
 
-        self.objects[slot as usize] = Some(HeapObject {
-            header: GcHeader {
-                ref_count: 0,
-                mark: GcMark::None,
-                bytes,
-            },
-            object,
-        });
-        self.gc_objects.push(id);
+        self.gc_object.push(id);
         self.allocated_objects += 1;
         self.allocated_bytes += bytes;
 
@@ -173,37 +239,29 @@ impl JsHeap {
     }
 
     pub fn dup_object(&mut self, id: ObjectId) {
-        let object = self
-            .objects
-            .get_mut(id.slot as usize)
-            .and_then(Option::as_mut)
+        let index = self
+            .live_object_index(id)
             .expect("dup_object for missing object");
-        object.header.ref_count += 1;
+        self.heap_object_ref_count[index] += 1;
     }
 
     pub fn free_object_ref(&mut self, id: ObjectId) -> Result<(), Error> {
-        let object = self
-            .objects
-            .get_mut(id.slot as usize)
-            .and_then(Option::as_mut)
-            .ok_or(Error::JsObjectNotFound {
-                object: id.debug_index(),
-            })?;
+        let index = self.live_object_index(id)?;
 
-        if object.header.ref_count == 0 {
+        if self.heap_object_ref_count[index] == 0 {
             return Err(Error::JsRefCountUnderflow {
                 object: id.debug_index(),
             });
         }
 
-        object.header.ref_count -= 1;
+        self.heap_object_ref_count[index] -= 1;
 
-        if object.header.ref_count == 0 {
+        if self.heap_object_ref_count[index] == 0 {
             if self.gc_phase == GcPhase::RemoveCycles {
                 return Ok(());
             }
 
-            self.zero_ref.push(id);
+            self.gc_zero_ref.push(id);
             self.drain_zero_ref()?;
         }
 
@@ -211,10 +269,10 @@ impl JsHeap {
     }
 
     pub fn get_property(&mut self, object: ObjectId, key: PropertyKey) -> Result<JsValue, Error> {
+        self.live_object_index(object)?;
         let value = self
-            .object(object)?
-            .object
-            .get_property(key)
+            .find_property_index(object, key)?
+            .map(|property| self.heap_property_value.get(property as u32))
             .unwrap_or(JsValue::Undefined);
 
         self.dup_value(&value);
@@ -228,25 +286,27 @@ impl JsHeap {
         key: PropertyKey,
         value: JsValue,
     ) -> Result<(), Error> {
-        if self.object(object).is_err() {
-            return Err(Error::JsObjectNotFound {
-                object: object.debug_index(),
-            });
-        }
-
+        self.live_object_index(object)?;
         self.dup_value(&value);
 
-        let old = self.object_mut(object)?.set_property(key, value);
+        if let Some(property) = self.find_property_index(object, key)? {
+            let old = self.heap_property_value.get(property as u32);
+            self.heap_property_value.set(property as u32, value);
+            return self.free_value(old);
+        }
 
-        if let Some(old) = old {
-            self.free_value(old.value)?;
+        let result = self.push_object_property(object, key, value.clone());
+        if let Err(err) = result {
+            self.free_value(value)?;
+            return Err(err);
         }
 
         Ok(())
     }
 
     pub fn object_kind(&self, object: ObjectId) -> Result<ObjectKind, Error> {
-        Ok(self.object(object)?.object.kind().clone())
+        let index = self.live_object_index(object)?;
+        self.object_kind_at(index)
     }
 
     pub fn stats(&self) -> HeapStats {
@@ -288,7 +348,7 @@ impl JsHeap {
             frames: Vec::new(),
         };
 
-        self.object(object)?.object.append_runtime_edges(&mut edges);
+        self.append_object_runtime_edges(object, &mut edges)?;
 
         Ok(edges)
     }
@@ -297,8 +357,6 @@ impl JsHeap {
         self.gc_runs += 1;
         self.drain_zero_ref()?;
         self.reset_gc_marks();
-        // When weak references exist, this is the point to clear dead weak
-        // entries and enqueue finalization callbacks before removing cycles.
         self.gc_decref_all()?;
         self.gc_scan_live()?;
         self.gc_restore_cycles()?;
@@ -309,11 +367,11 @@ impl JsHeap {
     }
 
     pub(crate) fn drain_zero_ref(&mut self) -> Result<(), Error> {
-        while let Some(id) = self.zero_ref.pop() {
+        while let Some(id) = self.gc_zero_ref.pop() {
             let should_free = self
-                .object(id)
+                .live_object_index(id)
                 .ok()
-                .is_some_and(|object| object.header.ref_count == 0);
+                .is_some_and(|index| self.heap_object_ref_count[index] == 0);
 
             if should_free {
                 self.free_object_now(id)?;
@@ -324,23 +382,18 @@ impl JsHeap {
     }
 
     fn free_object_now(&mut self, id: ObjectId) -> Result<(), Error> {
-        let heap_object = self
-            .objects
-            .get_mut(id.slot as usize)
-            .and_then(Option::take)
-            .ok_or(Error::JsObjectNotFound {
-                object: id.debug_index(),
-            })?;
-
-        self.account_freed_object(id, heap_object.header.bytes);
-        heap_object.object.release_children(self)
+        let index = self.live_object_index(id)?;
+        let bytes = self.heap_object_bytes[index];
+        self.release_object_children(id)?;
+        self.account_freed_object(id, bytes);
+        Ok(())
     }
 
     fn gc_decref_all(&mut self) -> Result<(), Error> {
-        self.tmp_cycle.clear();
+        self.gc_tmp_cycle.clear();
 
-        for id in self.gc_objects.clone() {
-            if self.object(id).is_ok() {
+        for id in self.gc_object.clone() {
+            if self.live_object_index(id).is_ok() {
                 self.gc_decref_children(id)?;
             }
         }
@@ -349,32 +402,24 @@ impl JsHeap {
     }
 
     fn gc_decref_children(&mut self, id: ObjectId) -> Result<(), Error> {
-        let mut children = Vec::new();
-
-        self.object(id)?.object.visit_children(&mut |child| {
-            children.push(child);
-        });
+        let children = self.child_objects(id)?;
 
         for child in children {
-            let child_object = self
-                .objects
-                .get_mut(child.slot as usize)
-                .and_then(Option::as_mut)
-                .ok_or(Error::JsObjectNotFound {
-                    object: child.debug_index(),
-                })?;
+            let child_index = self.live_object_index(child)?;
 
-            if child_object.header.ref_count == 0 {
+            if self.heap_object_ref_count[child_index] == 0 {
                 return Err(Error::JsRefCountUnderflow {
                     object: child.debug_index(),
                 });
             }
 
-            child_object.header.ref_count -= 1;
+            self.heap_object_ref_count[child_index] -= 1;
 
-            if child_object.header.ref_count == 0 && child_object.header.mark != GcMark::Tmp {
-                child_object.header.mark = GcMark::Tmp;
-                self.tmp_cycle.push(child);
+            if self.heap_object_ref_count[child_index] == 0
+                && self.heap_object_gc_mark[child_index] != GcMark::Tmp
+            {
+                self.heap_object_gc_mark[child_index] = GcMark::Tmp;
+                self.gc_tmp_cycle.push(child);
             }
         }
 
@@ -382,11 +427,11 @@ impl JsHeap {
     }
 
     fn gc_scan_live(&mut self) -> Result<(), Error> {
-        for id in self.gc_objects.clone() {
+        for id in self.gc_object.clone() {
             let is_live_root = self
-                .object(id)
+                .live_object_index(id)
                 .ok()
-                .is_some_and(|object| object.header.ref_count > 0);
+                .is_some_and(|index| self.heap_object_ref_count[index] > 0);
 
             if is_live_root {
                 self.gc_scan_object(id)?;
@@ -397,40 +442,17 @@ impl JsHeap {
     }
 
     fn gc_scan_object(&mut self, id: ObjectId) -> Result<(), Error> {
-        let already_live = {
-            let object = self
-                .objects
-                .get_mut(id.slot as usize)
-                .and_then(Option::as_mut)
-                .ok_or(Error::JsObjectNotFound {
-                    object: id.debug_index(),
-                })?;
+        let index = self.live_object_index(id)?;
 
-            if object.header.mark == GcMark::Live {
-                true
-            } else {
-                object.header.mark = GcMark::Live;
-                false
-            }
-        };
-
-        if already_live {
+        if self.heap_object_gc_mark[index] == GcMark::Live {
             return Ok(());
         }
 
-        let mut children = Vec::new();
+        self.heap_object_gc_mark[index] = GcMark::Live;
 
-        self.object(id)?.object.visit_children(&mut |child| {
-            children.push(child);
-        });
-
-        for child in children {
-            if let Some(child_object) = self
-                .objects
-                .get_mut(child.slot as usize)
-                .and_then(Option::as_mut)
-            {
-                child_object.header.ref_count += 1;
+        for child in self.child_objects(id)? {
+            if let Ok(child_index) = self.live_object_index(child) {
+                self.heap_object_ref_count[child_index] += 1;
             }
 
             self.gc_scan_object(child)?;
@@ -440,11 +462,11 @@ impl JsHeap {
     }
 
     fn gc_restore_cycles(&mut self) -> Result<(), Error> {
-        for id in self.tmp_cycle.clone() {
+        for id in self.gc_tmp_cycle.clone() {
             let should_restore = self
-                .object(id)
+                .live_object_index(id)
                 .ok()
-                .is_some_and(|object| object.header.mark != GcMark::Live);
+                .is_some_and(|index| self.heap_object_gc_mark[index] != GcMark::Live);
 
             if should_restore {
                 self.gc_incref_children(id)?;
@@ -455,19 +477,9 @@ impl JsHeap {
     }
 
     fn gc_incref_children(&mut self, id: ObjectId) -> Result<(), Error> {
-        let mut children = Vec::new();
-
-        self.object(id)?.object.visit_children(&mut |child| {
-            children.push(child);
-        });
-
-        for child in children {
-            if let Some(child_object) = self
-                .objects
-                .get_mut(child.slot as usize)
-                .and_then(Option::as_mut)
-            {
-                child_object.header.ref_count += 1;
+        for child in self.child_objects(id)? {
+            if let Ok(child_index) = self.live_object_index(child) {
+                self.heap_object_ref_count[child_index] += 1;
             }
         }
 
@@ -475,19 +487,19 @@ impl JsHeap {
     }
 
     fn gc_free_cycles(&mut self) -> Result<usize, Error> {
-        let candidates = mem::take(&mut self.tmp_cycle);
+        let candidates = mem::take(&mut self.gc_tmp_cycle);
         let collected = candidates
             .into_iter()
             .filter(|id| {
-                self.object(*id)
+                self.live_object_index(*id)
                     .ok()
-                    .is_some_and(|object| object.header.mark != GcMark::Live)
+                    .is_some_and(|index| self.heap_object_gc_mark[index] != GcMark::Live)
             })
             .collect::<Vec<_>>();
 
         self.gc_phase = GcPhase::RemoveCycles;
         for id in &collected {
-            if self.object(*id).is_ok() {
+            if self.live_object_index(*id).is_ok() {
                 self.release_object_children(*id)?;
             }
         }
@@ -496,16 +508,11 @@ impl JsHeap {
         let mut freed = 0;
 
         for id in collected {
-            let Some(heap_object) = self
-                .objects
-                .get_mut(id.slot as usize)
-                .and_then(Option::take)
-            else {
-                continue;
-            };
-
-            self.account_freed_object(id, heap_object.header.bytes);
-            freed += 1;
+            if let Ok(index) = self.live_object_index(id) {
+                let bytes = self.heap_object_bytes[index];
+                self.account_freed_object(id, bytes);
+                freed += 1;
+            }
         }
 
         self.reset_gc_marks();
@@ -514,7 +521,7 @@ impl JsHeap {
     }
 
     fn release_object_children(&mut self, id: ObjectId) -> Result<(), Error> {
-        let values = self.object(id)?.object.child_values();
+        let values = self.child_values(id)?;
 
         for value in values {
             self.free_value(value)?;
@@ -522,40 +529,277 @@ impl JsHeap {
 
         Ok(())
     }
+
     fn reset_gc_marks(&mut self) {
-        for object in &mut self.objects {
-            if let Some(object) = object.as_mut() {
-                object.header.mark = GcMark::None;
+        for index in 0..self.heap_object_gc_mark.len() {
+            if self.heap_object_live[index] {
+                self.heap_object_gc_mark[index] = GcMark::None;
             }
         }
     }
 
     fn account_freed_object(&mut self, id: ObjectId, bytes: usize) {
+        let index = id.slot as usize;
+        let properties = self.property_indices(id).unwrap_or_default();
+        self.heap_object_live[index] = false;
+        self.heap_object_ref_count[index] = 0;
         self.allocated_objects = self.allocated_objects.saturating_sub(1);
         self.freed_objects += 1;
         self.allocated_bytes = self.allocated_bytes.saturating_sub(bytes);
-        self.gc_objects.retain(|existing| *existing != id);
-        self.zero_ref.retain(|existing| *existing != id);
-        self.free_slots.push(id.slot);
+        self.gc_object.retain(|existing| *existing != id);
+        self.gc_zero_ref.retain(|existing| *existing != id);
+        self.free_object_slots.push(id.slot);
+
+        for property in properties {
+            self.heap_property_live[property] = false;
+        }
     }
 
-    fn object(&self, object: ObjectId) -> Result<&HeapObject, Error> {
-        self.objects
-            .get(object.slot as usize)
-            .and_then(Option::as_ref)
-            .ok_or(Error::JsObjectNotFound {
-                object: object.debug_index(),
-            })
+    fn alloc_kind_payload(&mut self, kind: ObjectKind) -> (ObjectKindTag, u32) {
+        match kind {
+            ObjectKind::Ordinary => (ObjectKindTag::Ordinary, 0),
+            ObjectKind::HostFunction(function) => {
+                let slot = self.host_function_live.len() as u32;
+                self.host_function_live.push(true);
+                self.host_function_name.push(function.name);
+                self.host_function_kind.push(function.kind);
+                (ObjectKindTag::HostFunction, slot)
+            }
+            ObjectKind::JsFunction(function) => {
+                let slot = self.js_function_live.len() as u32;
+                self.js_function_live.push(true);
+                self.js_function_name.push(function.name);
+                self.js_function_param_range_start
+                    .push(self.js_function_param_symbol.len() as u32);
+                self.js_function_param_range_len
+                    .push(function.params.len() as u32);
+                self.js_function_param_symbol.extend(function.params);
+                self.js_function_body.push(function.body);
+                self.js_function_captured_env.push(function.captured_env);
+                (ObjectKindTag::JsFunction, slot)
+            }
+            ObjectKind::ModuleNamespace(namespace) => {
+                let slot = self.module_namespace_live.len() as u32;
+                self.module_namespace_live.push(true);
+                self.module_namespace_module.push(namespace.module);
+                self.module_namespace_export_range_start
+                    .push(self.module_namespace_export_symbol.len() as u32);
+                self.module_namespace_export_range_len
+                    .push(namespace.exports.len() as u32);
+                for (symbol, cell) in namespace.exports {
+                    self.module_namespace_export_symbol.push(symbol);
+                    self.module_namespace_export_cell.push(cell);
+                }
+                (ObjectKindTag::ModuleNamespace, slot)
+            }
+        }
     }
 
-    fn object_mut(&mut self, object: ObjectId) -> Result<&mut JsObject, Error> {
-        self.objects
-            .get_mut(object.slot as usize)
-            .and_then(Option::as_mut)
-            .map(|heap_object| &mut heap_object.object)
-            .ok_or(Error::JsObjectNotFound {
-                object: object.debug_index(),
+    fn object_kind_at(&self, object_index: usize) -> Result<ObjectKind, Error> {
+        let payload = self.heap_object_kind_payload[object_index] as usize;
+        match self.heap_object_kind[object_index] {
+            ObjectKindTag::Ordinary => Ok(ObjectKind::Ordinary),
+            ObjectKindTag::HostFunction => {
+                if !self
+                    .host_function_live
+                    .get(payload)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return Err(Error::JsObjectNotFound {
+                        object: object_index as u64,
+                    });
+                }
+
+                Ok(ObjectKind::HostFunction(HostFunction {
+                    name: self.host_function_name[payload],
+                    kind: self.host_function_kind[payload],
+                }))
+            }
+            ObjectKindTag::JsFunction => {
+                if !self.js_function_live.get(payload).copied().unwrap_or(false) {
+                    return Err(Error::JsObjectNotFound {
+                        object: object_index as u64,
+                    });
+                }
+
+                let start = self.js_function_param_range_start[payload] as usize;
+                let len = self.js_function_param_range_len[payload] as usize;
+
+                Ok(ObjectKind::JsFunction(Box::new(JsFunction {
+                    name: self.js_function_name[payload],
+                    params: self.js_function_param_symbol[start..start + len].to_vec(),
+                    body: self.js_function_body[payload].clone(),
+                    captured_env: self.js_function_captured_env[payload],
+                })))
+            }
+            ObjectKindTag::ModuleNamespace => {
+                if !self
+                    .module_namespace_live
+                    .get(payload)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return Err(Error::JsObjectNotFound {
+                        object: object_index as u64,
+                    });
+                }
+
+                let start = self.module_namespace_export_range_start[payload] as usize;
+                let len = self.module_namespace_export_range_len[payload] as usize;
+                let mut exports = Vec::with_capacity(len);
+
+                for index in start..start + len {
+                    exports.push((
+                        self.module_namespace_export_symbol[index],
+                        self.module_namespace_export_cell[index],
+                    ));
+                }
+
+                Ok(ObjectKind::ModuleNamespace(ModuleNamespace {
+                    module: self.module_namespace_module[payload],
+                    exports,
+                }))
+            }
+        }
+    }
+
+    fn push_object_property(
+        &mut self,
+        object: ObjectId,
+        key: PropertyKey,
+        value: JsValue,
+    ) -> Result<(), Error> {
+        let index = self.live_object_index(object)?;
+        let expected_start = self.heap_property_live.len() as u32;
+        let range_end = self.heap_object_property_range_start[index]
+            + self.heap_object_property_range_len[index];
+
+        if range_end != expected_start {
+            return self.repack_and_push_object_property(object, key, value);
+        }
+
+        self.heap_property_live.push(true);
+        let PropertyKey::Symbol(symbol) = key;
+        self.heap_property_key_symbol.push(symbol);
+        self.heap_property_value.push(value);
+        self.heap_object_property_range_len[index] += 1;
+        self.heap_object_bytes[index] = self.heap_object_bytes[index].saturating_add(16);
+        self.allocated_bytes = self.allocated_bytes.saturating_add(16);
+        Ok(())
+    }
+
+    fn repack_and_push_object_property(
+        &mut self,
+        object: ObjectId,
+        key: PropertyKey,
+        value: JsValue,
+    ) -> Result<(), Error> {
+        let properties = self
+            .property_indices(object)?
+            .into_iter()
+            .filter(|index| self.heap_property_live[*index])
+            .map(|index| {
+                (
+                    PropertyKey::Symbol(self.heap_property_key_symbol[index]),
+                    self.heap_property_value.get(index as u32),
+                )
             })
+            .collect::<Vec<_>>();
+        let object_index = object.slot as usize;
+
+        for index in self.property_indices(object)? {
+            self.heap_property_live[index] = false;
+        }
+
+        self.heap_object_property_range_start[object_index] = self.heap_property_live.len() as u32;
+        self.heap_object_property_range_len[object_index] = 0;
+
+        for (key, value) in properties {
+            self.push_object_property(object, key, value)?;
+        }
+
+        self.push_object_property(object, key, value)
+    }
+
+    fn find_property_index(
+        &self,
+        object: ObjectId,
+        key: PropertyKey,
+    ) -> Result<Option<usize>, Error> {
+        let PropertyKey::Symbol(symbol) = key;
+        for index in self.property_indices(object)? {
+            if self.heap_property_live[index] && self.heap_property_key_symbol[index] == symbol {
+                return Ok(Some(index));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn child_objects(&self, object: ObjectId) -> Result<Vec<ObjectId>, Error> {
+        let mut objects = Vec::new();
+
+        for value in self.child_values(object)? {
+            if let JsValue::Object(object) = value {
+                objects.push(object);
+            }
+        }
+
+        Ok(objects)
+    }
+
+    fn child_values(&self, object: ObjectId) -> Result<Vec<JsValue>, Error> {
+        let mut values = Vec::new();
+
+        for index in self.property_indices(object)? {
+            if self.heap_property_live[index] {
+                values.push(self.heap_property_value.get(index as u32));
+            }
+        }
+
+        Ok(values)
+    }
+
+    fn append_object_runtime_edges(
+        &self,
+        object: ObjectId,
+        edges: &mut RuntimeEdges,
+    ) -> Result<(), Error> {
+        for child in self.child_objects(object)? {
+            edges.objects.push(child);
+        }
+
+        let object_index = self.live_object_index(object)?;
+        if self.heap_object_kind[object_index] == ObjectKindTag::JsFunction {
+            let payload = self.heap_object_kind_payload[object_index] as usize;
+            edges.frames.push(self.js_function_captured_env[payload]);
+        }
+
+        Ok(())
+    }
+
+    fn property_indices(&self, object: ObjectId) -> Result<Vec<usize>, Error> {
+        let index = self.live_object_index(object)?;
+        let start = self.heap_object_property_range_start[index] as usize;
+        let len = self.heap_object_property_range_len[index] as usize;
+        Ok((start..start + len).collect())
+    }
+
+    fn live_object_index(&self, object: ObjectId) -> Result<usize, Error> {
+        if object.segment != self.segment
+            || !self
+                .heap_object_live
+                .get(object.slot as usize)
+                .copied()
+                .unwrap_or(false)
+        {
+            return Err(Error::JsObjectNotFound {
+                object: object.debug_index(),
+            });
+        }
+
+        Ok(object.slot as usize)
     }
 }
 
@@ -566,139 +810,14 @@ impl Default for JsHeap {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct JsObject {
-    kind: ObjectKind,
-    properties: HashMap<PropertyKey, JsProperty>,
-}
-
-impl JsObject {
-    pub fn new(kind: ObjectKind) -> Self {
-        Self {
-            kind,
-            properties: HashMap::new(),
-        }
-    }
-
-    pub fn kind(&self) -> &ObjectKind {
-        &self.kind
-    }
-
-    pub fn get_property(&self, key: PropertyKey) -> Option<JsValue> {
-        self.properties.get(&key).map(JsProperty::value)
-    }
-
-    pub fn set_property(&mut self, key: PropertyKey, value: JsValue) -> Option<JsProperty> {
-        self.properties.insert(key, JsProperty::new(value))
-    }
-
-    pub fn visit_children(&self, visitor: &mut impl FnMut(ObjectId)) {
-        for property in self.properties.values() {
-            if let JsValue::Object(id) = property.value {
-                visitor(id);
-            }
-        }
-
-        // Do not add WeakRef/WeakMap-style edges here. This traversal is only
-        // for strong references that keep the target object alive.
-        self.kind.visit_children(visitor);
-    }
-
-    pub fn release_children(self, heap: &mut JsHeap) -> Result<(), Error> {
-        let Self { kind, properties } = self;
-
-        for property in properties.into_values() {
-            heap.free_value(property.value)?;
-        }
-
-        kind.release_children(heap)
-    }
-
-    fn child_values(&self) -> Vec<JsValue> {
-        let mut values = self
-            .properties
-            .values()
-            .map(JsProperty::value)
-            .collect::<Vec<_>>();
-        self.kind.append_child_values(&mut values);
-        values
-    }
-
-    fn append_runtime_edges(&self, edges: &mut RuntimeEdges) {
-        for property in self.properties.values() {
-            if let JsValue::Object(id) = &property.value {
-                edges.objects.push(*id);
-            }
-        }
-
-        self.kind.append_runtime_edges(edges);
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum ObjectKind {
     Ordinary,
     HostFunction(HostFunction),
-    JsFunction(JsFunction),
+    JsFunction(Box<JsFunction>),
     ModuleNamespace(ModuleNamespace),
-    // If host object kinds later own JsValue children, add explicit strong and
-    // weak child traversal hooks instead of treating all host state as ordinary
-    // object properties.
 }
 
-impl ObjectKind {
-    fn visit_children(&self, visitor: &mut impl FnMut(ObjectId)) {
-        match self {
-            Self::Ordinary => {}
-            Self::HostFunction(host_function) => host_function.visit_children(visitor),
-            Self::JsFunction(function) => function.visit_children(visitor),
-            Self::ModuleNamespace(namespace) => namespace.visit_children(visitor),
-        }
-    }
-
-    fn append_child_values(&self, values: &mut Vec<JsValue>) {
-        match self {
-            Self::Ordinary => {}
-            Self::HostFunction(host_function) => host_function.append_child_values(values),
-            Self::JsFunction(function) => function.append_child_values(values),
-            Self::ModuleNamespace(namespace) => namespace.append_child_values(values),
-        }
-    }
-
-    fn release_children(self, heap: &mut JsHeap) -> Result<(), Error> {
-        match self {
-            Self::Ordinary => Ok(()),
-            Self::HostFunction(host_function) => host_function.release_children(heap),
-            Self::JsFunction(function) => function.release_children(heap),
-            Self::ModuleNamespace(namespace) => namespace.release_children(heap),
-        }
-    }
-
-    fn append_runtime_edges(&self, edges: &mut RuntimeEdges) {
-        match self {
-            Self::Ordinary => {}
-            Self::HostFunction(host_function) => host_function.append_runtime_edges(edges),
-            Self::JsFunction(function) => function.append_runtime_edges(edges),
-            Self::ModuleNamespace(namespace) => namespace.append_runtime_edges(edges),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct JsProperty {
-    value: JsValue,
-}
-
-impl JsProperty {
-    pub fn new(value: JsValue) -> Self {
-        Self { value }
-    }
-
-    pub fn value(&self) -> JsValue {
-        self.value.clone()
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct HostFunction {
     pub name: Symbol,
     pub kind: HostFunctionKind,
@@ -712,7 +831,7 @@ impl HostFunction {
         _heap: &mut JsHeap,
         _symbols: &SymbolTable,
     ) -> Result<JsValue, Error> {
-        match &self.kind {
+        match self.kind {
             HostFunctionKind::ConsoleLog => {
                 host.emit_console(JsStreamKind::Stdout, args)?;
                 Ok(JsValue::Undefined)
@@ -723,30 +842,9 @@ impl HostFunction {
             }
         }
     }
-
-    fn visit_children(&self, _visitor: &mut impl FnMut(ObjectId)) {
-        // Console host functions currently own only a channel sender and scalar
-        // runtime id. If a host function later owns JsValue state, expose those
-        // strong children here so cycle collection sees them.
-    }
-
-    fn append_child_values(&self, _values: &mut Vec<JsValue>) {
-        // See visit_children: console host functions do not currently own JS
-        // values that need release during object teardown.
-    }
-
-    fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn append_runtime_edges(&self, _edges: &mut RuntimeEdges) {
-        // Console host functions currently do not hold JS heap or env-frame
-        // references. Future host state that owns JS values must expose those
-        // edges here.
-    }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum HostFunctionKind {
     ConsoleLog,
     ConsoleError,
@@ -760,46 +858,10 @@ pub struct JsFunction {
     pub captured_env: EnvFrameId,
 }
 
-impl JsFunction {
-    fn visit_children(&self, _visitor: &mut impl FnMut(ObjectId)) {
-        // Captured lexical environments live in the VM-owned EnvStack tables,
-        // not in the JS object heap. Binding cells retain their JsValue
-        // contents directly, so function objects do not expose captured envs as
-        // ordinary object-to-object heap edges.
-    }
-
-    fn append_child_values(&self, _values: &mut Vec<JsValue>) {
-        // See visit_children: environment cells are released by EnvStack.
-    }
-
-    fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn append_runtime_edges(&self, edges: &mut RuntimeEdges) {
-        edges.frames.push(self.captured_env);
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModuleNamespace {
     pub module: ModuleId,
-    pub exports: HashMap<Symbol, BindingCellId>,
-}
-
-impl ModuleNamespace {
-    fn visit_children(&self, _visitor: &mut impl FnMut(ObjectId)) {}
-
-    fn append_child_values(&self, _values: &mut Vec<JsValue>) {}
-
-    fn release_children(self, _heap: &mut JsHeap) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn append_runtime_edges(&self, _edges: &mut RuntimeEdges) {
-        // Namespace objects point at binding cells. Module environment frames are
-        // runtime roots, so exported heap values are traced from those frames.
-    }
+    pub exports: Vec<(Symbol, BindingCellId)>,
 }
 
 pub(crate) struct RuntimeEdges {
@@ -807,8 +869,6 @@ pub(crate) struct RuntimeEdges {
     pub(crate) frames: Vec<EnvFrameId>,
 }
 
-fn estimate_object_bytes(object: &JsObject) -> usize {
-    mem::size_of::<HeapObject>()
-        + mem::size_of_val(object)
-        + object.properties.len() * mem::size_of::<(PropertyKey, JsProperty)>()
+fn estimate_object_bytes(kind: ObjectKindTag) -> usize {
+    mem::size_of::<GcHeader>() + mem::size_of_val(&kind)
 }

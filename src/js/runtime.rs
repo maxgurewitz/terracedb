@@ -15,6 +15,7 @@ use super::{BytecodeProgram, Instr, compile_module_source, compile_source_to_byt
 
 const JS_RUNTIME_SNAPSHOT_VERSION: u32 = 1;
 
+#[derive(Clone, Copy)]
 pub(crate) struct RuntimeRecord {
     id: JsRuntimeId,
     storage_segments: RuntimeStorageSegments,
@@ -293,7 +294,7 @@ impl RuntimeRecordView<'_> {
             ctx.into_local_exports()
         };
         let mut program = BytecodeProgram::new();
-        program.instructions.push(Instr::Halt);
+        program.push_instr(Instr::Halt);
 
         Ok(self.modules.insert_loaded(
             key,
@@ -324,7 +325,7 @@ impl RuntimeRecordView<'_> {
             ModuleState::New | ModuleState::Loading | ModuleState::Loaded => {}
         }
 
-        self.modules.get_mut(module)?.state = ModuleState::Linking;
+        self.modules.set_state(module, ModuleState::Linking)?;
 
         self.create_module_bindings(module)?;
 
@@ -335,7 +336,7 @@ impl RuntimeRecordView<'_> {
         }
 
         self.resolve_module_imports(module)?;
-        self.modules.get_mut(module)?.state = ModuleState::Linked;
+        self.modules.set_state(module, ModuleState::Linked)?;
 
         Ok(())
     }
@@ -361,16 +362,16 @@ impl RuntimeRecordView<'_> {
             }
         }
 
-        let mut export_cells = HashMap::new();
+        let mut export_cells = Vec::new();
 
         for export in local_exports {
             let cell =
                 self.vm
                     .cell_for_name_in_frame(env_frame, export.local_name, self.symbols)?;
-            export_cells.insert(export.export_name, cell);
+            export_cells.push((export.export_name, cell));
         }
 
-        self.modules.get_mut(module)?.export_cells = export_cells;
+        self.modules.set_export_cells(module, export_cells)?;
 
         Ok(())
     }
@@ -440,7 +441,7 @@ impl RuntimeRecordView<'_> {
     }
 
     fn create_module_namespace_object(&mut self, module: ModuleId) -> Result<ObjectId, Error> {
-        let mut exports = HashMap::new();
+        let mut exports = Vec::new();
 
         for export_name in self.modules.exported_names(module)? {
             let ExportName::Named(symbol) = export_name else {
@@ -450,7 +451,7 @@ impl RuntimeRecordView<'_> {
             if let ResolvedExport::Binding { binding, .. } =
                 self.modules.resolve_export(module, export_name)?
             {
-                exports.insert(symbol, binding);
+                exports.push((symbol, binding));
             }
         }
 
@@ -471,7 +472,7 @@ impl RuntimeRecordView<'_> {
             _ => {}
         }
 
-        self.modules.get_mut(module)?.state = ModuleState::Evaluating;
+        self.modules.set_state(module, ModuleState::Evaluating)?;
 
         let dependencies = self.modules.get(module)?.requested_modules.clone();
         for dependency in dependencies {
@@ -486,11 +487,11 @@ impl RuntimeRecordView<'_> {
 
         match self.vm.run_in_frame(program, env_frame, self.symbols) {
             Ok(_) => {
-                self.modules.get_mut(module)?.state = ModuleState::Evaluated;
+                self.modules.set_state(module, ModuleState::Evaluated)?;
                 Ok(())
             }
             Err(err) => {
-                self.modules.get_mut(module)?.state = ModuleState::Failed;
+                self.modules.set_state(module, ModuleState::Failed)?;
                 Err(err)
             }
         }

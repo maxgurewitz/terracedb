@@ -177,9 +177,9 @@ impl JsRuntimePoolActor {
         self.storage.refresh_runtime_usage(runtime_id)?;
         let resident_bytes = self.storage.runtime_resident_bytes(runtime_id)?;
         let dirty_bytes = self.storage.runtime_dirty_bytes(runtime_id)?;
-        let slot = self.runtimes.get_mut(runtime_id)?;
-        slot.resident_bytes = resident_bytes;
-        slot.dirty_bytes = dirty_bytes;
+        self.runtimes
+            .get_mut(runtime_id)?
+            .set_accounting(resident_bytes, dirty_bytes);
         Ok(())
     }
 

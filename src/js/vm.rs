@@ -8,7 +8,7 @@ use super::attachment::JsHostBindings;
 use super::{
     BindingCellId, BindingKind, BytecodeProgram, EnvFrameId, EnvStack, GcPolicy, Instr, JsFunction,
     JsHeap, JsValue, ModuleNamespace, ObjectId, ObjectKind, PropertyKey, RuntimeStorageSegments,
-    RuntimeStorageUsage, SegmentId, StackId, Symbol, SymbolTable,
+    RuntimeStorageUsage, SegmentId, StackId, Symbol, SymbolTable, ValueCols,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -26,7 +26,7 @@ pub enum RunResult {
 #[derive(Deserialize, Serialize)]
 pub struct Vm {
     stack_id: StackId,
-    stack: Vec<JsValue>,
+    stack: ValueCols,
     env: EnvStack,
     heap: JsHeap,
     execution: Option<ExecutionState>,
@@ -37,16 +37,60 @@ pub struct Vm {
 
 #[derive(Deserialize, Serialize)]
 struct ExecutionState {
-    frames: Vec<ExecFrame>,
+    frame_program: Vec<BytecodeProgram>,
+    frame_ip: Vec<usize>,
+    frame_allow_return: Vec<bool>,
+    frame_base_scope_depth: Vec<usize>,
+    frame_restore_frame: Vec<Option<EnvFrameId>>,
 }
 
-#[derive(Deserialize, Serialize)]
 struct ExecFrame {
     program: BytecodeProgram,
     ip: usize,
     allow_return: bool,
     base_scope_depth: usize,
     restore_frame: Option<EnvFrameId>,
+}
+
+impl ExecutionState {
+    fn new() -> Self {
+        Self {
+            frame_program: Vec::new(),
+            frame_ip: Vec::new(),
+            frame_allow_return: Vec::new(),
+            frame_base_scope_depth: Vec::new(),
+            frame_restore_frame: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, frame: ExecFrame) {
+        self.frame_program.push(frame.program);
+        self.frame_ip.push(frame.ip);
+        self.frame_allow_return.push(frame.allow_return);
+        self.frame_base_scope_depth.push(frame.base_scope_depth);
+        self.frame_restore_frame.push(frame.restore_frame);
+    }
+
+    fn pop(&mut self) -> Option<ExecFrame> {
+        Some(ExecFrame {
+            program: self.frame_program.pop()?,
+            ip: self.frame_ip.pop()?,
+            allow_return: self.frame_allow_return.pop()?,
+            base_scope_depth: self.frame_base_scope_depth.pop()?,
+            restore_frame: self.frame_restore_frame.pop()?,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frame_program.is_empty()
+    }
+
+    fn current_index(&self) -> Result<usize, Error> {
+        self.frame_program
+            .len()
+            .checked_sub(1)
+            .ok_or(Error::JsInstructionPointerOutOfBounds { ip: 0 })
+    }
 }
 
 enum StepResult {
@@ -81,7 +125,7 @@ impl Vm {
                 segment: segments.stack,
                 slot: 0,
             },
-            stack: Vec::new(),
+            stack: ValueCols::new(),
             env: EnvStack::with_segments(segments.bindings, segments.env_frames),
             heap: JsHeap::with_segment_and_gc_policy(segments.heap, gc_policy),
             execution: None,
@@ -206,15 +250,15 @@ impl Vm {
 
     pub(crate) fn start(&mut self, program: BytecodeProgram) -> Result<RunResult, Error> {
         self.release_all_stack_values()?;
-        self.execution = Some(ExecutionState {
-            frames: vec![ExecFrame {
-                program,
-                ip: 0,
-                allow_return: false,
-                base_scope_depth: self.env.depth(),
-                restore_frame: None,
-            }],
+        let mut execution = ExecutionState::new();
+        execution.push(ExecFrame {
+            program,
+            ip: 0,
+            allow_return: false,
+            base_scope_depth: self.env.depth(),
+            restore_frame: None,
         });
+        self.execution = Some(execution);
 
         Ok(RunResult::Suspended)
     }
@@ -261,14 +305,11 @@ impl Vm {
 
         while executed < budget.instructions {
             let instr = {
-                let frame = self.current_frame_mut()?;
-                let instr = frame
-                    .program
-                    .instructions
-                    .get(frame.ip)
-                    .ok_or(Error::JsInstructionPointerOutOfBounds { ip: frame.ip })?
-                    .clone();
-                frame.ip += 1;
+                let execution = self.execution.as_mut().expect("checked above");
+                let frame = execution.current_index()?;
+                let ip = execution.frame_ip[frame];
+                let instr = execution.frame_program[frame].instr(ip)?;
+                execution.frame_ip[frame] += 1;
                 instr
             };
 
@@ -293,7 +334,7 @@ impl Vm {
     ) -> Result<Option<JsValue>, Error> {
         match instr {
             Instr::LoadConst(id) => {
-                let value = self.current_frame()?.program.constants.get(id)?.to_value();
+                let value = self.current_program()?.get_const(id)?.to_value();
                 self.push_value(value);
             }
             Instr::PushScope => {
@@ -354,7 +395,7 @@ impl Vm {
                 self.push_value(JsValue::Bool(result?));
             }
             Instr::Jump(target) => {
-                self.current_frame_mut()?.ip = target;
+                self.set_current_ip(target)?;
             }
             Instr::JumpIfFalse(target) => {
                 let value = self.pop_value()?;
@@ -362,7 +403,7 @@ impl Vm {
                 self.heap.free_value(value)?;
 
                 if !result? {
-                    self.current_frame_mut()?.ip = target;
+                    self.set_current_ip(target)?;
                 }
             }
             Instr::JumpIfTrue(target) => {
@@ -371,18 +412,20 @@ impl Vm {
                 self.heap.free_value(value)?;
 
                 if result? {
-                    self.current_frame_mut()?.ip = target;
+                    self.set_current_ip(target)?;
                 }
             }
             Instr::CreateFunction(id) => {
-                let function = self.current_frame()?.program.get_function(id)?.clone();
+                let function = self.current_program()?.get_function(id)?.clone();
                 let captured_env = self.env.capture_current_frame()?;
-                let object = self.heap.alloc_object(ObjectKind::JsFunction(JsFunction {
-                    name: function.name,
-                    params: function.params,
-                    body: function.body,
-                    captured_env,
-                }));
+                let object = self
+                    .heap
+                    .alloc_object(ObjectKind::JsFunction(Box::new(JsFunction {
+                        name: function.name,
+                        params: function.params,
+                        body: function.body,
+                        captured_env,
+                    })));
 
                 self.push_value(JsValue::Object(object));
             }
@@ -392,7 +435,7 @@ impl Vm {
             Instr::Return => {
                 let value = self.pop_value()?;
 
-                if self.current_frame()?.allow_return {
+                if self.current_allow_return()? {
                     return self.complete_frame(value);
                 }
 
@@ -410,8 +453,15 @@ impl Vm {
             }
             Instr::DefineProperty(key) => {
                 let value = self.pop_value()?;
-                let result = expect_object(self.stack.last().ok_or(Error::JsStackUnderflow)?)
-                    .and_then(|object| self.heap.set_property(object, key, value.clone()));
+                let result = expect_object(
+                    &self
+                        .stack
+                        .len()
+                        .checked_sub(1)
+                        .map(|index| self.stack.get(index as u32))
+                        .ok_or(Error::JsStackUnderflow)?,
+                )
+                .and_then(|object| self.heap.set_property(object, key, value.clone()));
                 self.heap.free_value(value)?;
                 result?;
             }
@@ -568,7 +618,7 @@ impl Vm {
                 .call(args, &self.host, &mut self.heap, symbols)
                 .map(Some),
             ObjectKind::JsFunction(function) => {
-                self.enter_js_function(function, args, symbols)?;
+                self.enter_js_function(*function, args, symbols)?;
                 Ok(None)
             }
             ObjectKind::ModuleNamespace(_) => Err(Error::JsNotCallable),
@@ -585,7 +635,12 @@ impl Vm {
         match self.heap.object_kind(object)? {
             ObjectKind::ModuleNamespace(namespace) => match key {
                 PropertyKey::Symbol(symbol) => {
-                    let Some(cell) = namespace.exports.get(&symbol).copied() else {
+                    let Some((_, cell)) = namespace
+                        .exports
+                        .iter()
+                        .find(|(export, _)| *export == symbol)
+                        .copied()
+                    else {
                         return Ok(JsValue::Undefined);
                     };
 
@@ -632,7 +687,6 @@ impl Vm {
         self.execution
             .as_mut()
             .expect("call requires active execution")
-            .frames
             .push(ExecFrame {
                 program: function.body,
                 ip: 0,
@@ -675,7 +729,7 @@ impl Vm {
         let frame = self
             .execution
             .as_mut()
-            .and_then(|execution| execution.frames.pop())
+            .and_then(ExecutionState::pop)
             .ok_or(Error::JsInstructionPointerOutOfBounds { ip: 0 })?;
 
         let cleanup_result = self
@@ -691,10 +745,7 @@ impl Vm {
             return Err(err);
         }
 
-        let is_done = self
-            .execution
-            .as_ref()
-            .is_none_or(|execution| execution.frames.is_empty());
+        let is_done = self.execution.as_ref().is_none_or(ExecutionState::is_empty);
 
         if is_done {
             self.execution = None;
@@ -708,7 +759,7 @@ impl Vm {
 
     fn abort_execution(&mut self) -> Result<(), Error> {
         if let Some(mut execution) = self.execution.take() {
-            while let Some(frame) = execution.frames.pop() {
+            while let Some(frame) = execution.pop() {
                 self.env
                     .truncate_to_depth(frame.base_scope_depth, &mut self.heap)?;
 
@@ -721,18 +772,32 @@ impl Vm {
         self.release_all_stack_values()
     }
 
-    fn current_frame(&self) -> Result<&ExecFrame, Error> {
-        self.execution
+    fn current_program(&self) -> Result<&BytecodeProgram, Error> {
+        let execution = self
+            .execution
             .as_ref()
-            .and_then(|execution| execution.frames.last())
-            .ok_or(Error::JsInstructionPointerOutOfBounds { ip: 0 })
+            .ok_or(Error::JsInstructionPointerOutOfBounds { ip: 0 })?;
+        let frame = execution.current_index()?;
+        Ok(&execution.frame_program[frame])
     }
 
-    fn current_frame_mut(&mut self) -> Result<&mut ExecFrame, Error> {
-        self.execution
+    fn current_allow_return(&self) -> Result<bool, Error> {
+        let execution = self
+            .execution
+            .as_ref()
+            .ok_or(Error::JsInstructionPointerOutOfBounds { ip: 0 })?;
+        let frame = execution.current_index()?;
+        Ok(execution.frame_allow_return[frame])
+    }
+
+    fn set_current_ip(&mut self, ip: usize) -> Result<(), Error> {
+        let execution = self
+            .execution
             .as_mut()
-            .and_then(|execution| execution.frames.last_mut())
-            .ok_or(Error::JsInstructionPointerOutOfBounds { ip: 0 })
+            .ok_or(Error::JsInstructionPointerOutOfBounds { ip: 0 })?;
+        let frame = execution.current_index()?;
+        execution.frame_ip[frame] = ip;
+        Ok(())
     }
 
     fn run_gc_at_safepoint(&mut self) -> Result<usize, Error> {
@@ -750,9 +815,9 @@ impl Vm {
         let mut frame_work = self.env.active_frame_roots();
         let mut object_work = self
             .stack
-            .iter()
+            .values()
             .filter_map(|value| match value {
-                JsValue::Object(object) => Some(*object),
+                JsValue::Object(object) => Some(object),
                 _ => None,
             })
             .collect::<Vec<_>>();

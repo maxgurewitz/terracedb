@@ -5,10 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 
 use super::{
-    Binding, BytecodeProgram, Constant, EnvFrame, EnvFrameId, GcPolicy, HeapObject, ImportEntry,
-    Instr, JsRuntimeId, JsValue, LocalExportEntry, ModuleKey, ModuleRecord, ModuleRegistry,
-    ObjectId, RuntimeDetached, RuntimeRecord, RuntimeRecordView, RuntimeRecordViewRef,
-    RuntimeSnapshot, StackId, SymbolTable, Vm,
+    GcPolicy, JsRuntimeId, ModuleRegistry, RuntimeDetached, RuntimeRecord, RuntimeRecordView,
+    RuntimeRecordViewRef, RuntimeSnapshot, SymbolTable, Vm,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -86,85 +84,21 @@ impl SegmentTable {
         self.next_segment_id += 1;
         let start_slot = self.next_start_slot(kind, capacity_slots);
 
-        let meta = SegmentMeta {
+        self.segments.insert(
             id,
-            owner,
-            kind,
-            start_slot,
-            used_slots: 0,
-            capacity_slots,
-            dirty: false,
-            dirty_bytes: 0,
-        };
-
-        self.segments.insert(id, meta);
-
-        let runtime_segments = self.by_runtime.entry(owner).or_default();
-        match kind {
-            SegmentKind::RuntimeRecords => runtime_segments.runtime_records.push(id),
-            SegmentKind::SymbolTables => runtime_segments.symbol_tables.push(id),
-            SegmentKind::VmStates => runtime_segments.vm_states.push(id),
-            SegmentKind::ModuleRegistries => runtime_segments.module_registries.push(id),
-            SegmentKind::HeapObjects => runtime_segments.heap.push(id),
-            SegmentKind::BindingCells => runtime_segments.bindings.push(id),
-            SegmentKind::EnvFrames => runtime_segments.env_frames.push(id),
-            SegmentKind::VmStack => runtime_segments.stacks.push(id),
-            SegmentKind::Programs => runtime_segments.programs.push(id),
-            SegmentKind::SymbolNames
-            | SegmentKind::ProgramConstants
-            | SegmentKind::ProgramInstructions
-            | SegmentKind::ProgramFunctions => {}
-            SegmentKind::Modules => runtime_segments.modules.push(id),
-        }
-
+            SegmentMeta {
+                id,
+                owner,
+                kind,
+                start_slot,
+                used_slots: 0,
+                capacity_slots,
+                dirty: false,
+                dirty_bytes: 0,
+            },
+        );
+        self.add_runtime_segment(owner, kind, id);
         id
-    }
-
-    fn reuse_segment(&mut self, owner: JsRuntimeId, kind: SegmentKind) -> Option<SegmentId> {
-        let segment = self.free_by_kind.get_mut(&kind)?.pop()?;
-        let meta = self.segments.get_mut(&segment)?;
-
-        meta.owner = owner;
-        meta.used_slots = 0;
-        meta.dirty = false;
-        meta.dirty_bytes = 0;
-
-        self.add_runtime_segment(owner, kind, segment);
-
-        Some(segment)
-    }
-
-    fn next_start_slot(&mut self, kind: SegmentKind, capacity_slots: usize) -> u32 {
-        let next = self.next_start_by_kind.entry(kind).or_default();
-        let start = *next;
-        *next = next.saturating_add(capacity_slots as u32);
-        start
-    }
-
-    fn add_runtime_segment(&mut self, owner: JsRuntimeId, kind: SegmentKind, segment: SegmentId) {
-        let runtime_segments = self.by_runtime.entry(owner).or_default();
-        let list = match kind {
-            SegmentKind::RuntimeRecords => Some(&mut runtime_segments.runtime_records),
-            SegmentKind::SymbolTables => Some(&mut runtime_segments.symbol_tables),
-            SegmentKind::VmStates => Some(&mut runtime_segments.vm_states),
-            SegmentKind::ModuleRegistries => Some(&mut runtime_segments.module_registries),
-            SegmentKind::HeapObjects => Some(&mut runtime_segments.heap),
-            SegmentKind::BindingCells => Some(&mut runtime_segments.bindings),
-            SegmentKind::EnvFrames => Some(&mut runtime_segments.env_frames),
-            SegmentKind::VmStack => Some(&mut runtime_segments.stacks),
-            SegmentKind::Programs => Some(&mut runtime_segments.programs),
-            SegmentKind::Modules => Some(&mut runtime_segments.modules),
-            SegmentKind::SymbolNames
-            | SegmentKind::ProgramConstants
-            | SegmentKind::ProgramInstructions
-            | SegmentKind::ProgramFunctions => None,
-        };
-
-        if let Some(list) = list
-            && !list.contains(&segment)
-        {
-            list.push(segment);
-        }
     }
 
     pub fn register_existing_segment(
@@ -271,22 +205,10 @@ impl SegmentTable {
         let segments = self
             .segments_for_runtime(runtime)
             .ok_or(Error::RuntimeNotFound(runtime))?;
-
         let mut total = 0usize;
-        for segment in segments
-            .runtime_records
-            .iter()
-            .chain(segments.symbol_tables.iter())
-            .chain(segments.vm_states.iter())
-            .chain(segments.module_registries.iter())
-            .chain(segments.heap.iter())
-            .chain(segments.bindings.iter())
-            .chain(segments.env_frames.iter())
-            .chain(segments.stacks.iter())
-            .chain(segments.programs.iter())
-            .chain(segments.modules.iter())
-        {
-            let meta = self.meta(*segment)?;
+
+        for segment in self.runtime_segment_iter(segments) {
+            let meta = self.meta(segment)?;
             total = total.saturating_add(meta.used_slots.saturating_mul(8));
         }
 
@@ -297,9 +219,64 @@ impl SegmentTable {
         let segments = self
             .segments_for_runtime(runtime)
             .ok_or(Error::RuntimeNotFound(runtime))?;
-
         let mut total = 0usize;
-        for segment in segments
+
+        for segment in self.runtime_segment_iter(segments) {
+            total = total.saturating_add(self.meta(segment)?.dirty_bytes);
+        }
+
+        Ok(total)
+    }
+
+    fn reuse_segment(&mut self, owner: JsRuntimeId, kind: SegmentKind) -> Option<SegmentId> {
+        let segment = self.free_by_kind.get_mut(&kind)?.pop()?;
+        let meta = self.segments.get_mut(&segment)?;
+        meta.owner = owner;
+        meta.used_slots = 0;
+        meta.dirty = false;
+        meta.dirty_bytes = 0;
+        self.add_runtime_segment(owner, kind, segment);
+        Some(segment)
+    }
+
+    fn next_start_slot(&mut self, kind: SegmentKind, capacity_slots: usize) -> u32 {
+        let next = self.next_start_by_kind.entry(kind).or_default();
+        let start = *next;
+        *next = next.saturating_add(capacity_slots as u32);
+        start
+    }
+
+    fn add_runtime_segment(&mut self, owner: JsRuntimeId, kind: SegmentKind, segment: SegmentId) {
+        let runtime_segments = self.by_runtime.entry(owner).or_default();
+        let list = match kind {
+            SegmentKind::RuntimeRecords => Some(&mut runtime_segments.runtime_records),
+            SegmentKind::SymbolTables => Some(&mut runtime_segments.symbol_tables),
+            SegmentKind::VmStates => Some(&mut runtime_segments.vm_states),
+            SegmentKind::ModuleRegistries => Some(&mut runtime_segments.module_registries),
+            SegmentKind::HeapObjects => Some(&mut runtime_segments.heap),
+            SegmentKind::BindingCells => Some(&mut runtime_segments.bindings),
+            SegmentKind::EnvFrames => Some(&mut runtime_segments.env_frames),
+            SegmentKind::VmStack => Some(&mut runtime_segments.stacks),
+            SegmentKind::Programs => Some(&mut runtime_segments.programs),
+            SegmentKind::Modules => Some(&mut runtime_segments.modules),
+            SegmentKind::SymbolNames
+            | SegmentKind::ProgramConstants
+            | SegmentKind::ProgramInstructions
+            | SegmentKind::ProgramFunctions => None,
+        };
+
+        if let Some(list) = list
+            && !list.contains(&segment)
+        {
+            list.push(segment);
+        }
+    }
+
+    fn runtime_segment_iter<'a>(
+        &'a self,
+        segments: &'a RuntimeSegments,
+    ) -> impl Iterator<Item = SegmentId> + 'a {
+        segments
             .runtime_records
             .iter()
             .chain(segments.symbol_tables.iter())
@@ -311,11 +288,7 @@ impl SegmentTable {
             .chain(segments.stacks.iter())
             .chain(segments.programs.iter())
             .chain(segments.modules.iter())
-        {
-            total = total.saturating_add(self.meta(*segment)?.dirty_bytes);
-        }
-
-        Ok(total)
+            .copied()
     }
 }
 
@@ -327,7 +300,7 @@ pub struct PoolRuntimeStorage {
     pub symbols: PoolSymbolStorage,
     pub programs: PoolProgramStorage,
     pub modules: PoolModuleStorage,
-    runtime_records: FlatSegmentStore<RuntimeRecord>,
+    runtime_records: RuntimeRecordCols,
     runtime_index: HashMap<JsRuntimeId, RuntimeRecordId>,
 }
 
@@ -341,7 +314,7 @@ impl PoolRuntimeStorage {
             symbols: PoolSymbolStorage::new(),
             programs: PoolProgramStorage::new(),
             modules: PoolModuleStorage::new(),
-            runtime_records: FlatSegmentStore::new(),
+            runtime_records: RuntimeRecordCols::new(),
             runtime_index: HashMap::new(),
         }
     }
@@ -462,7 +435,7 @@ impl PoolRuntimeStorage {
     pub fn validate_object_owner(
         &self,
         runtime: JsRuntimeId,
-        object: ObjectId,
+        object: super::ObjectId,
     ) -> Result<(), Error> {
         self.validate_segment_owner(runtime, object.segment)
     }
@@ -470,7 +443,7 @@ impl PoolRuntimeStorage {
     pub fn refresh_runtime_usage(&mut self, runtime: JsRuntimeId) -> Result<(), Error> {
         let (storage_segments, usage) = {
             let runtime_state = self.runtime(runtime)?;
-            let vm = self.vm.state(&self.segments, runtime_state.vm_state_id())?;
+            let vm = self.vm.state(runtime_state.vm_state_id())?;
             (runtime_state.storage_segments(), vm.storage_usage())
         };
 
@@ -482,7 +455,6 @@ impl PoolRuntimeStorage {
             .set_used_slots(storage_segments.env_frames, usage.env_frames)?;
         self.segments
             .set_used_slots(storage_segments.stack, usage.stacks)?;
-
         Ok(())
     }
 
@@ -496,70 +468,16 @@ impl PoolRuntimeStorage {
             return Err(Error::JsRuntimeAlreadyExists(runtime_id));
         }
 
-        let symbol_slot = self.symbols.alloc_table(
-            &mut self.segments,
-            storage_segments.symbol_table,
-            SymbolTable::new(),
-        )?;
+        let symbol_slot = self
+            .symbols
+            .alloc_table(storage_segments.symbol_table, SymbolTable::new())?;
         let vm_slot = self.vm.alloc_state(
-            &mut self.segments,
             storage_segments.vm_state,
             Vm::with_storage_segments(storage_segments, gc_policy),
         )?;
-        let module_slot = self.modules.alloc_registry(
-            &mut self.segments,
-            storage_segments.module_registry,
-            ModuleRegistry::new(),
-        )?;
-        let runtime = RuntimeRecord::new(
-            runtime_id,
-            storage_segments,
-            SymbolTableId {
-                segment: storage_segments.symbol_table,
-                slot: symbol_slot,
-            },
-            VmStateId {
-                segment: storage_segments.vm_state,
-                slot: vm_slot,
-            },
-            ModuleRegistryId {
-                segment: storage_segments.module_registry,
-                slot: module_slot,
-            },
-        );
-        let segment = storage_segments.runtime_record;
-        let slot = self
-            .runtime_records
-            .alloc(&mut self.segments, segment, runtime)?;
-        self.runtime_index
-            .insert(runtime_id, RuntimeRecordId { segment, slot });
-        Ok(())
-    }
-
-    pub(crate) fn insert_runtime_snapshot(
-        &mut self,
-        snapshot: RuntimeSnapshot,
-    ) -> Result<(), Error> {
-        let runtime_id = snapshot.runtime_id;
-        let storage_segments = snapshot.storage_segments;
-
-        if self.runtime_index.contains_key(&runtime_id) {
-            return Err(Error::JsRuntimeAlreadyExists(runtime_id));
-        }
-
-        let symbol_slot = self.symbols.alloc_table(
-            &mut self.segments,
-            storage_segments.symbol_table,
-            snapshot.symbols,
-        )?;
-        let vm_slot =
-            self.vm
-                .alloc_state(&mut self.segments, storage_segments.vm_state, snapshot.vm)?;
-        let module_slot = self.modules.alloc_registry(
-            &mut self.segments,
-            storage_segments.module_registry,
-            snapshot.modules,
-        )?;
+        let module_slot = self
+            .modules
+            .alloc_registry(storage_segments.module_registry, ModuleRegistry::new())?;
         let runtime = RuntimeRecord::new(
             runtime_id,
             storage_segments,
@@ -588,11 +506,61 @@ impl PoolRuntimeStorage {
                 slot,
             },
         );
-
         Ok(())
     }
 
-    pub(crate) fn runtime(&self, runtime: JsRuntimeId) -> Result<&RuntimeRecord, Error> {
+    pub(crate) fn insert_runtime_snapshot(
+        &mut self,
+        snapshot: RuntimeSnapshot,
+    ) -> Result<(), Error> {
+        let runtime_id = snapshot.runtime_id;
+        let storage_segments = snapshot.storage_segments;
+
+        if self.runtime_index.contains_key(&runtime_id) {
+            return Err(Error::JsRuntimeAlreadyExists(runtime_id));
+        }
+
+        let symbol_slot = self
+            .symbols
+            .alloc_table(storage_segments.symbol_table, snapshot.symbols)?;
+        let vm_slot = self
+            .vm
+            .alloc_state(storage_segments.vm_state, snapshot.vm)?;
+        let module_slot = self
+            .modules
+            .alloc_registry(storage_segments.module_registry, snapshot.modules)?;
+        let runtime = RuntimeRecord::new(
+            runtime_id,
+            storage_segments,
+            SymbolTableId {
+                segment: storage_segments.symbol_table,
+                slot: symbol_slot,
+            },
+            VmStateId {
+                segment: storage_segments.vm_state,
+                slot: vm_slot,
+            },
+            ModuleRegistryId {
+                segment: storage_segments.module_registry,
+                slot: module_slot,
+            },
+        );
+        let slot = self.runtime_records.alloc(
+            &mut self.segments,
+            storage_segments.runtime_record,
+            runtime,
+        )?;
+        self.runtime_index.insert(
+            runtime_id,
+            RuntimeRecordId {
+                segment: storage_segments.runtime_record,
+                slot,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn runtime(&self, runtime: JsRuntimeId) -> Result<RuntimeRecord, Error> {
         let id = self
             .runtime_index
             .get(&runtime)
@@ -607,13 +575,9 @@ impl PoolRuntimeStorage {
         runtime: JsRuntimeId,
     ) -> Result<RuntimeRecordViewRef<'_>, Error> {
         let record = self.runtime(runtime)?;
-        let symbols = self
-            .symbols
-            .table(&self.segments, record.symbol_table_id())?;
-        let vm = self.vm.state(&self.segments, record.vm_state_id())?;
-        let modules = self
-            .modules
-            .registry(&self.segments, record.module_registry_id())?;
+        let symbols = self.symbols.table(record.symbol_table_id())?;
+        let vm = self.vm.state(record.vm_state_id())?;
+        let modules = self.modules.registry(record.module_registry_id())?;
 
         Ok(RuntimeRecordViewRef {
             id: record.id(),
@@ -637,9 +601,9 @@ impl PoolRuntimeStorage {
                 record.module_registry_id(),
             )
         };
-        let symbols = self.symbols.table_mut(&self.segments, symbol_table)?;
-        let vm = self.vm.state_mut(&self.segments, vm_state)?;
-        let modules = self.modules.registry_mut(&self.segments, module_registry)?;
+        let symbols = self.symbols.table_mut(symbol_table)?;
+        let vm = self.vm.state_mut(vm_state)?;
+        let modules = self.modules.registry_mut(module_registry)?;
 
         Ok(RuntimeRecordView {
             id,
@@ -660,19 +624,12 @@ impl PoolRuntimeStorage {
         let runtime_record = self
             .runtime_records
             .free(&mut self.segments, id.segment, id.slot)?;
-        let symbols = self
-            .symbols
-            .free_table(&mut self.segments, runtime_record.symbol_table_id())?;
-        drop(symbols);
-        let modules = self
+        let _symbols = self.symbols.free_table(runtime_record.symbol_table_id())?;
+        let _modules = self
             .modules
-            .free_registry(&mut self.segments, runtime_record.module_registry_id())?;
-        drop(modules);
-        let vm = self
-            .vm
-            .free_state(&mut self.segments, runtime_record.vm_state_id())?;
+            .free_registry(runtime_record.module_registry_id())?;
+        let vm = self.vm.free_state(runtime_record.vm_state_id())?;
         self.segments.remove_runtime(runtime_record.id());
-
         Ok(RuntimeDetached::new(vm))
     }
 
@@ -697,6 +654,21 @@ pub struct RuntimeStorageSegments {
     pub bindings: SegmentId,
     pub env_frames: SegmentId,
     pub stack: SegmentId,
+}
+
+impl RuntimeStorageSegments {
+    fn empty() -> Self {
+        Self {
+            runtime_record: SegmentId(0),
+            symbol_table: SegmentId(0),
+            vm_state: SegmentId(0),
+            module_registry: SegmentId(0),
+            heap: SegmentId(0),
+            bindings: SegmentId(0),
+            env_frames: SegmentId(0),
+            stack: SegmentId(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -732,162 +704,143 @@ pub struct RuntimeStorageUsage {
     pub stack_values: usize,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct FlatSegmentStore<T> {
-    values: Vec<Option<T>>,
-    free_slots: HashMap<SegmentId, Vec<u32>>,
+#[derive(Default)]
+pub struct RuntimeRecordCols {
+    live: Vec<bool>,
+    id: Vec<JsRuntimeId>,
+    storage_segments: Vec<RuntimeStorageSegments>,
+    symbol_table: Vec<SymbolTableId>,
+    vm_state: Vec<VmStateId>,
+    module_registry: Vec<ModuleRegistryId>,
 }
 
-impl<T> FlatSegmentStore<T> {
-    pub fn new() -> Self {
-        Self {
-            values: Vec::new(),
-            free_slots: HashMap::new(),
-        }
+impl RuntimeRecordCols {
+    fn new() -> Self {
+        Self::default()
     }
 
-    pub fn alloc(
+    fn alloc(
         &mut self,
         segments: &mut SegmentTable,
         segment: SegmentId,
-        value: T,
+        value: RuntimeRecord,
     ) -> Result<u32, Error> {
-        let slot = if let Some(slot) = self.free_slots.get_mut(&segment).and_then(Vec::pop) {
-            slot
-        } else {
-            self.next_empty_slot(segments.meta(segment)?)?
-        };
-        let index = self.absolute_index(segments.meta(segment)?, slot)?;
-
-        self.ensure_len(index + 1);
-        self.values[index] = Some(value);
-
-        let used = self.count_used_in_segment(segments.meta(segment)?)?;
-        segments.set_used_slots(segment, used)?;
+        let slot = 0;
+        let index = absolute_index(segments.meta(segment)?, slot)?;
+        ensure_slot(&mut self.live, index, false);
+        ensure_slot(&mut self.id, index, JsRuntimeId(0));
+        ensure_slot(
+            &mut self.storage_segments,
+            index,
+            RuntimeStorageSegments::empty(),
+        );
+        ensure_slot(
+            &mut self.symbol_table,
+            index,
+            SymbolTableId {
+                segment: SegmentId(0),
+                slot: 0,
+            },
+        );
+        ensure_slot(
+            &mut self.vm_state,
+            index,
+            VmStateId {
+                segment: SegmentId(0),
+                slot: 0,
+            },
+        );
+        ensure_slot(
+            &mut self.module_registry,
+            index,
+            ModuleRegistryId {
+                segment: SegmentId(0),
+                slot: 0,
+            },
+        );
+        self.live[index] = true;
+        self.id[index] = value.id();
+        self.storage_segments[index] = value.storage_segments();
+        self.symbol_table[index] = value.symbol_table_id();
+        self.vm_state[index] = value.vm_state_id();
+        self.module_registry[index] = value.module_registry_id();
+        segments.set_used_slots(segment, 1)?;
         segments.mark_dirty(segment, 1)?;
-
         Ok(slot)
     }
 
-    pub fn get(&self, segments: &SegmentTable, segment: SegmentId, slot: u32) -> Result<&T, Error> {
-        let index = self.absolute_index(segments.meta(segment)?, slot)?;
-        self.values
-            .get(index)
-            .and_then(Option::as_ref)
-            .ok_or(Error::JsSegmentSlotEmpty {
-                segment: segment.0,
-                slot,
-            })
-    }
-
-    pub fn get_mut(
-        &mut self,
+    fn get(
+        &self,
         segments: &SegmentTable,
         segment: SegmentId,
         slot: u32,
-    ) -> Result<&mut T, Error> {
-        let index = self.absolute_index(segments.meta(segment)?, slot)?;
-        self.values
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .ok_or(Error::JsSegmentSlotEmpty {
+    ) -> Result<RuntimeRecord, Error> {
+        let index = absolute_index(segments.meta(segment)?, slot)?;
+        if !self.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
                 segment: segment.0,
                 slot,
-            })
+            });
+        }
+        Ok(RuntimeRecord::new(
+            self.id[index],
+            self.storage_segments[index],
+            self.symbol_table[index],
+            self.vm_state[index],
+            self.module_registry[index],
+        ))
     }
 
-    pub fn free(
+    fn free(
         &mut self,
         segments: &mut SegmentTable,
         segment: SegmentId,
         slot: u32,
-    ) -> Result<T, Error> {
-        let index = self.absolute_index(segments.meta(segment)?, slot)?;
-        let value =
-            self.values
-                .get_mut(index)
-                .and_then(Option::take)
-                .ok_or(Error::JsSegmentSlotEmpty {
-                    segment: segment.0,
-                    slot,
-                })?;
-
-        self.free_slots.entry(segment).or_default().push(slot);
-        let used = self.count_used_in_segment(segments.meta(segment)?)?;
-        segments.set_used_slots(segment, used)?;
-        segments.mark_dirty(segment, 1)?;
-
-        Ok(value)
-    }
-
-    pub fn clear_segment(
-        &mut self,
-        segments: &mut SegmentTable,
-        segment: SegmentId,
-    ) -> Result<(), Error> {
-        let meta = segments.meta(segment)?.clone();
-        let start = meta.start_slot as usize;
-        let end = start.saturating_add(meta.capacity_slots);
-        self.ensure_len(end);
-
-        for slot in start..end {
-            self.values[slot] = None;
-        }
-
-        self.free_slots.remove(&segment);
-        segments.set_used_slots(segment, 0)?;
-        segments.mark_dirty(segment, meta.capacity_slots)?;
-        Ok(())
-    }
-
-    fn next_empty_slot(&self, meta: &SegmentMeta) -> Result<u32, Error> {
-        let start = meta.start_slot as usize;
-        let end = start.saturating_add(meta.capacity_slots);
-
-        for index in start..end {
-            if self.values.get(index).is_none_or(Option::is_none) {
-                return Ok((index - start) as u32);
-            }
-        }
-
-        Err(Error::JsSegmentFull { segment: meta.id.0 })
-    }
-
-    fn count_used_in_segment(&self, meta: &SegmentMeta) -> Result<usize, Error> {
-        let start = meta.start_slot as usize;
-        let end = start.saturating_add(meta.capacity_slots);
-        Ok((start..end)
-            .filter(|index| self.values.get(*index).is_some_and(Option::is_some))
-            .count())
-    }
-
-    fn absolute_index(&self, meta: &SegmentMeta, slot: u32) -> Result<usize, Error> {
-        if slot as usize >= meta.capacity_slots {
-            return Err(Error::JsSegmentSlotOutOfBounds {
-                segment: meta.id.0,
+    ) -> Result<RuntimeRecord, Error> {
+        let index = absolute_index(segments.meta(segment)?, slot)?;
+        if !self.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: segment.0,
                 slot,
             });
         }
-
-        Ok(meta.start_slot as usize + slot as usize)
-    }
-
-    fn ensure_len(&mut self, len: usize) {
-        if self.values.len() < len {
-            self.values.resize_with(len, || None);
-        }
+        self.live[index] = false;
+        segments.set_used_slots(segment, 0)?;
+        segments.mark_dirty(segment, 1)?;
+        Ok(RuntimeRecord::new(
+            self.id[index],
+            self.storage_segments[index],
+            self.symbol_table[index],
+            self.vm_state[index],
+            self.module_registry[index],
+        ))
     }
 }
 
-impl<T> Default for FlatSegmentStore<T> {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Default)]
+pub struct SymbolTableCols {
+    live: Vec<bool>,
+    segment: Vec<SegmentId>,
+    value: Vec<SymbolTable>,
+}
+
+#[derive(Default)]
+pub struct VmStateCols {
+    live: Vec<bool>,
+    segment: Vec<SegmentId>,
+    value: Vec<Vm>,
+}
+
+#[derive(Default)]
+pub struct ModuleRegistryCols {
+    live: Vec<bool>,
+    segment: Vec<SegmentId>,
+    value: Vec<ModuleRegistry>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct PoolHeapStorage {
-    pub objects: FlatSegmentStore<HeapObject>,
+    pub heap_object_live: Vec<bool>,
 }
 
 impl PoolHeapStorage {
@@ -898,8 +851,8 @@ impl PoolHeapStorage {
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct PoolEnvStorage {
-    pub binding_cells: FlatSegmentStore<Binding>,
-    pub env_frames: FlatSegmentStore<EnvFrame>,
+    pub env_cell_live: Vec<bool>,
+    pub env_frame_live: Vec<bool>,
 }
 
 impl PoolEnvStorage {
@@ -910,13 +863,17 @@ impl PoolEnvStorage {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VmStack {
-    pub values: Vec<JsValue>,
+    pub value_tag: Vec<super::ValueTag>,
+    pub value_number: Vec<f64>,
+    pub value_bool: Vec<bool>,
+    pub value_string: Vec<String>,
+    pub value_object: Vec<super::ObjectId>,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Default)]
 pub struct PoolVmStorage {
-    pub stacks: FlatSegmentStore<VmStack>,
-    states: FlatSegmentStore<Vm>,
+    pub stack_live: Vec<bool>,
+    states: VmStateCols,
 }
 
 impl PoolVmStorage {
@@ -924,40 +881,73 @@ impl PoolVmStorage {
         Self::default()
     }
 
-    pub(crate) fn alloc_state(
-        &mut self,
-        segments: &mut SegmentTable,
-        segment: SegmentId,
-        vm: Vm,
-    ) -> Result<u32, Error> {
-        self.states.alloc(segments, segment, vm)
+    pub(crate) fn alloc_state(&mut self, segment: SegmentId, vm: Vm) -> Result<u32, Error> {
+        let index = segment.0 as usize;
+        ensure_slot(&mut self.states.live, index, false);
+        ensure_slot(&mut self.states.segment, index, SegmentId(0));
+        ensure_default_slot(&mut self.states.value, index);
+        self.states.live[index] = true;
+        self.states.segment[index] = segment;
+        self.states.value[index] = vm;
+        Ok(0)
     }
 
-    pub(crate) fn state(&self, segments: &SegmentTable, id: VmStateId) -> Result<&Vm, Error> {
-        self.states.get(segments, id.segment, id.slot)
+    pub(crate) fn state(&self, id: VmStateId) -> Result<&Vm, Error> {
+        let index = id.segment.0 as usize;
+        if !self.states.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.states
+            .value
+            .get(index)
+            .ok_or(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            })
     }
 
-    pub(crate) fn state_mut(
-        &mut self,
-        segments: &SegmentTable,
-        id: VmStateId,
-    ) -> Result<&mut Vm, Error> {
-        self.states.get_mut(segments, id.segment, id.slot)
+    pub(crate) fn state_mut(&mut self, id: VmStateId) -> Result<&mut Vm, Error> {
+        let index = id.segment.0 as usize;
+        if !self.states.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.states
+            .value
+            .get_mut(index)
+            .ok_or(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            })
     }
 
-    pub(crate) fn free_state(
-        &mut self,
-        segments: &mut SegmentTable,
-        id: VmStateId,
-    ) -> Result<Vm, Error> {
-        self.states.free(segments, id.segment, id.slot)
+    pub(crate) fn free_state(&mut self, id: VmStateId) -> Result<Vm, Error> {
+        let index = id.segment.0 as usize;
+        if !self.states.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.states.live[index] = false;
+        Ok(std::mem::take(&mut self.states.value[index]))
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Default)]
 pub struct PoolSymbolStorage {
-    tables: FlatSegmentStore<SymbolTable>,
-    pub names: FlatSegmentStore<String>,
+    tables: SymbolTableCols,
+    pub string_bytes: Vec<u8>,
+    pub string_start: Vec<u32>,
+    pub string_len: Vec<u32>,
+    pub symbol_live: Vec<bool>,
+    pub symbol_runtime: Vec<JsRuntimeId>,
+    pub symbol_string: Vec<u32>,
     pub by_runtime_name: HashMap<(JsRuntimeId, String), u32>,
 }
 
@@ -968,35 +958,63 @@ impl PoolSymbolStorage {
 
     pub(crate) fn alloc_table(
         &mut self,
-        segments: &mut SegmentTable,
         segment: SegmentId,
         table: SymbolTable,
     ) -> Result<u32, Error> {
-        self.tables.alloc(segments, segment, table)
+        let index = segment.0 as usize;
+        ensure_slot(&mut self.tables.live, index, false);
+        ensure_slot(&mut self.tables.segment, index, SegmentId(0));
+        ensure_default_slot(&mut self.tables.value, index);
+        self.tables.live[index] = true;
+        self.tables.segment[index] = segment;
+        self.tables.value[index] = table;
+        Ok(0)
     }
 
-    pub(crate) fn table(
-        &self,
-        segments: &SegmentTable,
-        id: SymbolTableId,
-    ) -> Result<&SymbolTable, Error> {
-        self.tables.get(segments, id.segment, id.slot)
+    pub(crate) fn table(&self, id: SymbolTableId) -> Result<&SymbolTable, Error> {
+        let index = id.segment.0 as usize;
+        if !self.tables.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.tables
+            .value
+            .get(index)
+            .ok_or(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            })
     }
 
-    pub(crate) fn table_mut(
-        &mut self,
-        segments: &SegmentTable,
-        id: SymbolTableId,
-    ) -> Result<&mut SymbolTable, Error> {
-        self.tables.get_mut(segments, id.segment, id.slot)
+    pub(crate) fn table_mut(&mut self, id: SymbolTableId) -> Result<&mut SymbolTable, Error> {
+        let index = id.segment.0 as usize;
+        if !self.tables.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.tables
+            .value
+            .get_mut(index)
+            .ok_or(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            })
     }
 
-    pub(crate) fn free_table(
-        &mut self,
-        segments: &mut SegmentTable,
-        id: SymbolTableId,
-    ) -> Result<SymbolTable, Error> {
-        self.tables.free(segments, id.segment, id.slot)
+    pub(crate) fn free_table(&mut self, id: SymbolTableId) -> Result<SymbolTable, Error> {
+        let index = id.segment.0 as usize;
+        if !self.tables.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.tables.live[index] = false;
+        Ok(std::mem::take(&mut self.tables.value[index]))
     }
 }
 
@@ -1013,16 +1031,28 @@ pub struct StoredProgram {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StoredFunction {
     pub name: Option<super::Symbol>,
-    pub params: Vec<super::Symbol>,
-    pub body: BytecodeProgram,
+    pub param_start: u32,
+    pub param_len: u32,
+    pub body: super::ProgramId,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct PoolProgramStorage {
-    pub programs: FlatSegmentStore<StoredProgram>,
-    pub constants: Vec<Constant>,
-    pub instructions: Vec<Instr>,
-    pub functions: Vec<StoredFunction>,
+    pub program_live: Vec<bool>,
+    pub program_runtime: Vec<JsRuntimeId>,
+    pub program_constant_range_start: Vec<u32>,
+    pub program_constant_range_len: Vec<u32>,
+    pub program_instr_range_start: Vec<u32>,
+    pub program_instr_range_len: Vec<u32>,
+    pub program_function_range_start: Vec<u32>,
+    pub program_function_range_len: Vec<u32>,
+    pub constant_value: super::ValueCols,
+    pub instr_opcode: Vec<super::Instr>,
+    pub compiled_function_name: Vec<Option<super::Symbol>>,
+    pub compiled_function_param_range_start: Vec<u32>,
+    pub compiled_function_param_range_len: Vec<u32>,
+    pub compiled_function_body: Vec<super::ProgramId>,
+    pub compiled_function_param_symbol: Vec<super::Symbol>,
 }
 
 impl PoolProgramStorage {
@@ -1031,13 +1061,14 @@ impl PoolProgramStorage {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Default)]
 pub struct PoolModuleStorage {
-    pub modules: FlatSegmentStore<ModuleRecord>,
-    registries: FlatSegmentStore<ModuleRegistry>,
-    pub by_runtime_key: HashMap<(JsRuntimeId, ModuleKey), u32>,
-    pub import_entries: Vec<ImportEntry>,
-    pub local_export_entries: Vec<LocalExportEntry>,
+    pub module_live: Vec<bool>,
+    pub module_runtime: Vec<JsRuntimeId>,
+    registries: ModuleRegistryCols,
+    pub by_runtime_key: HashMap<(JsRuntimeId, super::ModuleKey), u32>,
+    pub module_import_request: Vec<super::ModuleKey>,
+    pub module_local_export_local_name: Vec<super::Symbol>,
 }
 
 impl PoolModuleStorage {
@@ -1047,42 +1078,80 @@ impl PoolModuleStorage {
 
     pub(crate) fn alloc_registry(
         &mut self,
-        segments: &mut SegmentTable,
         segment: SegmentId,
         registry: ModuleRegistry,
     ) -> Result<u32, Error> {
-        self.registries.alloc(segments, segment, registry)
+        let index = segment.0 as usize;
+        ensure_slot(&mut self.registries.live, index, false);
+        ensure_slot(&mut self.registries.segment, index, SegmentId(0));
+        ensure_default_slot(&mut self.registries.value, index);
+        self.registries.live[index] = true;
+        self.registries.segment[index] = segment;
+        self.registries.value[index] = registry;
+        Ok(0)
     }
 
-    pub(crate) fn registry(
-        &self,
-        segments: &SegmentTable,
-        id: ModuleRegistryId,
-    ) -> Result<&ModuleRegistry, Error> {
-        self.registries.get(segments, id.segment, id.slot)
+    pub(crate) fn registry(&self, id: ModuleRegistryId) -> Result<&ModuleRegistry, Error> {
+        let index = id.segment.0 as usize;
+        if !self.registries.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.registries
+            .value
+            .get(index)
+            .ok_or(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            })
     }
 
     pub(crate) fn registry_mut(
         &mut self,
-        segments: &SegmentTable,
         id: ModuleRegistryId,
     ) -> Result<&mut ModuleRegistry, Error> {
-        self.registries.get_mut(segments, id.segment, id.slot)
+        let index = id.segment.0 as usize;
+        if !self.registries.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.registries
+            .value
+            .get_mut(index)
+            .ok_or(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            })
     }
 
-    pub(crate) fn free_registry(
-        &mut self,
-        segments: &mut SegmentTable,
-        id: ModuleRegistryId,
-    ) -> Result<ModuleRegistry, Error> {
-        self.registries.free(segments, id.segment, id.slot)
+    pub(crate) fn free_registry(&mut self, id: ModuleRegistryId) -> Result<ModuleRegistry, Error> {
+        let index = id.segment.0 as usize;
+        if !self.registries.live.get(index).copied().unwrap_or(false) {
+            return Err(Error::JsSegmentSlotEmpty {
+                segment: id.segment.0,
+                slot: id.slot,
+            });
+        }
+        self.registries.live[index] = false;
+        Ok(std::mem::take(&mut self.registries.value[index]))
     }
 }
 
 #[derive(Debug, Default)]
 pub struct RuntimeTable {
     next_runtime_id: u64,
-    slots: Vec<Option<RuntimeSlot>>,
+    runtime_live: Vec<bool>,
+    runtime_id: Vec<JsRuntimeId>,
+    runtime_state: Vec<RuntimeState>,
+    runtime_root_env: Vec<super::EnvFrameId>,
+    runtime_stack: Vec<super::StackId>,
+    runtime_current_program: Vec<Option<super::ProgramId>>,
+    runtime_resident_bytes: Vec<usize>,
+    runtime_dirty_bytes: Vec<usize>,
     by_id: HashMap<JsRuntimeId, u32>,
     free_slots: Vec<u32>,
 }
@@ -1107,55 +1176,101 @@ impl RuntimeTable {
             return Err(Error::JsRuntimeAlreadyExists(slot.id));
         }
 
-        let id = slot.id;
-        let index = self.free_slots.pop().unwrap_or(self.slots.len() as u32);
-        if index as usize == self.slots.len() {
-            self.slots.push(Some(slot));
-        } else {
-            self.slots[index as usize] = Some(slot);
-        }
-        self.by_id.insert(id, index);
+        let index = self
+            .free_slots
+            .pop()
+            .unwrap_or(self.runtime_live.len() as u32) as usize;
+        ensure_slot(&mut self.runtime_live, index, false);
+        ensure_slot(&mut self.runtime_id, index, JsRuntimeId(0));
+        ensure_slot(&mut self.runtime_state, index, RuntimeState::Idle);
+        ensure_slot(&mut self.runtime_root_env, index, slot.root_env);
+        ensure_slot(&mut self.runtime_stack, index, slot.stack);
+        ensure_slot(&mut self.runtime_current_program, index, None);
+        ensure_slot(&mut self.runtime_resident_bytes, index, 0);
+        ensure_slot(&mut self.runtime_dirty_bytes, index, 0);
 
+        self.runtime_live[index] = true;
+        self.runtime_id[index] = slot.id;
+        self.runtime_state[index] = slot.state;
+        self.runtime_root_env[index] = slot.root_env;
+        self.runtime_stack[index] = slot.stack;
+        self.runtime_current_program[index] = slot.current_program;
+        self.runtime_resident_bytes[index] = slot.resident_bytes;
+        self.runtime_dirty_bytes[index] = slot.dirty_bytes;
+        self.by_id.insert(slot.id, index as u32);
         Ok(())
     }
 
     pub fn remove(&mut self, id: JsRuntimeId) -> Result<RuntimeSlot, Error> {
-        let index = self.by_id.remove(&id).ok_or(Error::RuntimeNotFound(id))?;
-        let slot = self
-            .slots
-            .get_mut(index as usize)
-            .and_then(Option::take)
-            .ok_or(Error::RuntimeNotFound(id))?;
-        self.free_slots.push(index);
-        Ok(slot)
+        let index = self.by_id.remove(&id).ok_or(Error::RuntimeNotFound(id))? as usize;
+        if !self.runtime_live.get(index).copied().unwrap_or(false) {
+            return Err(Error::RuntimeNotFound(id));
+        }
+
+        self.runtime_live[index] = false;
+        self.free_slots.push(index as u32);
+        Ok(self.slot_at(index))
     }
 
-    pub fn get(&self, id: JsRuntimeId) -> Result<&RuntimeSlot, Error> {
-        let index = self
-            .by_id
-            .get(&id)
-            .copied()
-            .ok_or(Error::RuntimeNotFound(id))?;
-        self.slots
-            .get(index as usize)
-            .and_then(Option::as_ref)
-            .ok_or(Error::RuntimeNotFound(id))
+    pub fn get(&self, id: JsRuntimeId) -> Result<RuntimeSlotRef<'_>, Error> {
+        let index = self.index_for(id)?;
+        Ok(RuntimeSlotRef { table: self, index })
     }
 
-    pub fn get_mut(&mut self, id: JsRuntimeId) -> Result<&mut RuntimeSlot, Error> {
-        let index = self
-            .by_id
-            .get(&id)
-            .copied()
-            .ok_or(Error::RuntimeNotFound(id))?;
-        self.slots
-            .get_mut(index as usize)
-            .and_then(Option::as_mut)
-            .ok_or(Error::RuntimeNotFound(id))
+    pub fn get_mut(&mut self, id: JsRuntimeId) -> Result<RuntimeSlotMut<'_>, Error> {
+        let index = self.index_for(id)?;
+        Ok(RuntimeSlotMut { table: self, index })
     }
 
     pub fn contains(&self, id: JsRuntimeId) -> bool {
         self.by_id.contains_key(&id)
+    }
+
+    fn index_for(&self, id: JsRuntimeId) -> Result<usize, Error> {
+        let index = self
+            .by_id
+            .get(&id)
+            .copied()
+            .ok_or(Error::RuntimeNotFound(id))? as usize;
+        if !self.runtime_live.get(index).copied().unwrap_or(false) {
+            return Err(Error::RuntimeNotFound(id));
+        }
+        Ok(index)
+    }
+
+    fn slot_at(&self, index: usize) -> RuntimeSlot {
+        RuntimeSlot {
+            id: self.runtime_id[index],
+            state: self.runtime_state[index],
+            root_env: self.runtime_root_env[index],
+            stack: self.runtime_stack[index],
+            current_program: self.runtime_current_program[index],
+            resident_bytes: self.runtime_resident_bytes[index],
+            dirty_bytes: self.runtime_dirty_bytes[index],
+        }
+    }
+}
+
+pub struct RuntimeSlotRef<'a> {
+    table: &'a RuntimeTable,
+    index: usize,
+}
+
+impl RuntimeSlotRef<'_> {
+    pub fn id(&self) -> JsRuntimeId {
+        self.table.runtime_id[self.index]
+    }
+}
+
+pub struct RuntimeSlotMut<'a> {
+    table: &'a mut RuntimeTable,
+    index: usize,
+}
+
+impl RuntimeSlotMut<'_> {
+    pub fn set_accounting(&mut self, resident_bytes: usize, dirty_bytes: usize) {
+        self.table.runtime_resident_bytes[self.index] = resident_bytes;
+        self.table.runtime_dirty_bytes[self.index] = dirty_bytes;
     }
 }
 
@@ -1163,8 +1278,8 @@ impl RuntimeTable {
 pub struct RuntimeSlot {
     pub id: JsRuntimeId,
     pub state: RuntimeState,
-    pub root_env: EnvFrameId,
-    pub stack: StackId,
+    pub root_env: super::EnvFrameId,
+    pub stack: super::StackId,
     pub current_program: Option<super::ProgramId>,
     pub resident_bytes: usize,
     pub dirty_bytes: usize,
@@ -1175,4 +1290,26 @@ pub enum RuntimeState {
     Idle,
     Running,
     SuspendedInMemory,
+}
+
+fn absolute_index(meta: &SegmentMeta, slot: u32) -> Result<usize, Error> {
+    if slot as usize >= meta.capacity_slots {
+        return Err(Error::JsSegmentSlotOutOfBounds {
+            segment: meta.id.0,
+            slot,
+        });
+    }
+    Ok(meta.start_slot as usize + slot as usize)
+}
+
+fn ensure_slot<T: Clone>(values: &mut Vec<T>, index: usize, value: T) {
+    if values.len() <= index {
+        values.resize(index + 1, value);
+    }
+}
+
+fn ensure_default_slot<T: Default>(values: &mut Vec<T>, index: usize) {
+    if values.len() <= index {
+        values.resize_with(index + 1, T::default);
+    }
 }
