@@ -15,19 +15,10 @@ use super::{BytecodeProgram, Instr, compile_module_source, compile_source_to_byt
 
 const JS_RUNTIME_SNAPSHOT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct JsRuntimeConfig {
     pub gc_policy: GcPolicy,
     pub storage_segments: Option<RuntimeStorageSegments>,
-}
-
-impl Default for JsRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            gc_policy: GcPolicy::default(),
-            storage_segments: None,
-        }
-    }
 }
 
 pub struct JsRuntimeInstance {
@@ -137,10 +128,10 @@ impl JsRuntimeInstance {
 
     pub(crate) fn run_for_budget(&mut self, budget: InstructionBudget) -> RunResult {
         let result = self.vm.run_for_budget(budget, &self.symbols);
-        if !matches!(result, RunResult::Suspended) {
-            if let Err(err) = self.vm.maybe_run_gc() {
-                return RunResult::Failed(err);
-            }
+        if !matches!(result, RunResult::Suspended)
+            && let Err(err) = self.vm.maybe_run_gc()
+        {
+            return RunResult::Failed(err);
         }
 
         result
@@ -148,10 +139,10 @@ impl JsRuntimeInstance {
 
     pub(crate) fn run_until_complete(&mut self) -> RunResult {
         let result = self.vm.run_until_complete(&self.symbols);
-        if !matches!(result, RunResult::Suspended) {
-            if let Err(err) = self.vm.maybe_run_gc() {
-                return RunResult::Failed(err);
-            }
+        if !matches!(result, RunResult::Suspended)
+            && let Err(err) = self.vm.maybe_run_gc()
+        {
+            return RunResult::Failed(err);
         }
 
         result

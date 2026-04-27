@@ -1,3 +1,4 @@
+#[allow(clippy::module_inception)]
 mod actor;
 mod actor_ref;
 mod ids;

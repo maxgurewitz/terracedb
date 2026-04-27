@@ -2,6 +2,7 @@ mod bytes;
 mod clock;
 mod completion;
 mod entropy;
+#[allow(clippy::module_inception)]
 mod env;
 mod fs;
 mod ids;

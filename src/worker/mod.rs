@@ -6,6 +6,7 @@ mod inbox;
 mod ingress;
 mod message;
 mod pending_response;
+#[allow(clippy::module_inception)]
 mod worker;
 
 pub(crate) use erased::ErasedActor;
