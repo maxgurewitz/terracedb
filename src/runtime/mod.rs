@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use crate::{
     Actor, ActorId, ActorRef, Clock, CompletionTarget, Entropy, Env, ErasedActorMsg,
-    ErasedResponse, Error, Fs, HostReply, NoopObservability, ObjectStore, Observability, RequestId,
-    TimerId, Timers, WorkerHandle, WorkerId, WorkerMsg,
+    ErasedResponse, Error, Fs, HostReply, NoopObservability, Observability, RequestId, TimerId,
+    Timers, WorkerHandle, WorkerId, WorkerMsg,
 };
 
 mod sim;
@@ -246,7 +246,6 @@ pub(crate) struct RealEnv {
     timers: StubTimers,
     fs: StubFs,
     net: StubNet,
-    object_store: StubObjectStore,
 }
 
 impl RealEnv {
@@ -262,7 +261,6 @@ impl RealEnv {
             timers: StubTimers,
             fs: StubFs,
             net: StubNet,
-            object_store: StubObjectStore,
         }
     }
 }
@@ -290,10 +288,6 @@ impl Env for RealEnv {
 
     fn net(&mut self) -> &mut dyn crate::Net {
         &mut self.net
-    }
-
-    fn object_store(&mut self) -> &mut dyn ObjectStore {
-        &mut self.object_store
     }
 }
 
@@ -456,7 +450,6 @@ pub(crate) struct SimEnv {
     timers: SimTimers,
     fs: StubFs,
     net: StubNet,
-    object_store: StubObjectStore,
 }
 
 impl SimEnv {
@@ -468,7 +461,6 @@ impl SimEnv {
             timers: SimTimers { time },
             fs: StubFs,
             net: StubNet,
-            object_store: StubObjectStore,
         })
     }
 }
@@ -497,10 +489,6 @@ impl Env for SimEnv {
     fn net(&mut self) -> &mut dyn crate::Net {
         &mut self.net
     }
-
-    fn object_store(&mut self) -> &mut dyn ObjectStore {
-        &mut self.object_store
-    }
 }
 
 struct StubClock;
@@ -508,14 +496,12 @@ struct StubEntropy;
 struct StubTimers;
 struct StubFs;
 struct StubNet;
-struct StubObjectStore;
 
 impl Clock for StubClock {}
 impl Entropy for StubEntropy {}
 impl Timers for StubTimers {}
 impl Fs for StubFs {}
 impl crate::Net for StubNet {}
-impl ObjectStore for StubObjectStore {}
 
 #[cfg(test)]
 mod tests {

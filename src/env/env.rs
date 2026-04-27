@@ -1,4 +1,4 @@
-use super::{Clock, Entropy, Fs, Net, ObjectStore, Observability, Timers};
+use super::{Clock, Entropy, Fs, Net, Observability, Timers};
 
 pub trait Env: Send {
     fn observability(&mut self) -> &mut dyn Observability {
@@ -23,9 +23,5 @@ pub trait Env: Send {
 
     fn net(&mut self) -> &mut dyn Net {
         panic!("Env::net stub")
-    }
-
-    fn object_store(&mut self) -> &mut dyn ObjectStore {
-        panic!("Env::object_store stub")
     }
 }

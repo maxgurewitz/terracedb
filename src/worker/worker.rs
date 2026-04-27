@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     Actor, ActorId, ActorRef, CompletionTarget, Env, Error, FsCompletion, LocalActorId,
-    LocalActorRef, NetCompletion, ObjectCompletion, OpId, ReplyTo, RequestId, ShardCtx,
-    TimerCompletion, TimerId, WorkerHandle, WorkerId,
+    LocalActorRef, NetCompletion, OpId, ReplyTo, RequestId, ShardCtx, TimerCompletion, TimerId,
+    WorkerHandle, WorkerId,
 };
 
 use super::{
@@ -138,9 +138,6 @@ impl WorkerCore {
             }
             WorkerMsg::FsCompletion(completion) => {
                 self.dispatch_completion(Completion::Fs(completion), env)?;
-            }
-            WorkerMsg::ObjectStoreCompletion(completion) => {
-                self.dispatch_completion(Completion::ObjectStore(completion), env)?;
             }
             WorkerMsg::TimerFired { timer_id, target } => {
                 self.dispatch_completion(Completion::Timer { timer_id, target }, env)?;
@@ -389,7 +386,6 @@ impl ShardCtx for WorkerShardCtx {
 enum Completion {
     Net(NetCompletion),
     Fs(FsCompletion),
-    ObjectStore(ObjectCompletion),
     Timer {
         timer_id: TimerId,
         target: CompletionTarget,
@@ -403,9 +399,6 @@ impl Completion {
                 let _ = completion;
             }
             Self::Fs(completion) => {
-                let _ = completion;
-            }
-            Self::ObjectStore(completion) => {
                 let _ = completion;
             }
             Self::Timer { timer_id, target } => {
