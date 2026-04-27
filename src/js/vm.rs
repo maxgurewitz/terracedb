@@ -198,7 +198,7 @@ impl Vm {
     }
 
     pub(crate) fn cell_for_name_in_frame(
-        &self,
+        &mut self,
         frame: EnvFrameId,
         name: Symbol,
         symbols: &SymbolTable,
@@ -520,6 +520,19 @@ impl Vm {
 
     pub(crate) fn heap_stats(&self) -> super::HeapStats {
         self.heap.stats()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_trace(&self) -> super::StorageAccessTrace {
+        let mut trace = self.heap.storage_trace();
+        trace.env_frame_binding_symbol = self.env.storage_trace().env_frame_binding_symbol;
+        trace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_storage_trace(&self) {
+        self.heap.reset_storage_trace();
+        self.env.reset_storage_trace();
     }
 
     pub(crate) fn force_gc(&mut self) -> Result<usize, Error> {

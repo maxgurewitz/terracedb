@@ -189,6 +189,11 @@ impl RuntimeRecordView<'_> {
         self.vm.force_gc()
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_storage_trace(&mut self) {
+        self.vm.reset_storage_trace();
+    }
+
     pub fn evaluate_module(
         &mut self,
         root: ModuleKey,
@@ -508,6 +513,11 @@ impl RuntimeRecordView<'_> {
 impl RuntimeRecordViewRef<'_> {
     pub(crate) fn heap_stats(&self) -> HeapStats {
         self.vm.heap_stats()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_trace(&self) -> super::StorageAccessTrace {
+        self.vm.storage_trace()
     }
 
     pub(crate) fn serialize(&self) -> Result<Vec<u8>, Error> {

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crate::{Actor, Env, Error, WorkerShardCtx};
 
+#[cfg(test)]
+use super::StorageAccessTrace;
 use super::{
     GcPolicy, HeapStats, InstructionBudget, JsAttachment, JsAttachmentBundle, JsRuntimeId, JsValue,
     ModuleId, ModuleKey, PoolRuntimeStorage, RunResult, RuntimeSlot, RuntimeSnapshot, RuntimeState,
@@ -113,6 +115,14 @@ pub enum JsPoolMsg {
     HeapStats {
         runtime_id: JsRuntimeId,
     },
+    #[cfg(test)]
+    StorageTrace {
+        runtime_id: JsRuntimeId,
+    },
+    #[cfg(test)]
+    ResetStorageTrace {
+        runtime_id: JsRuntimeId,
+    },
     DestroyRuntime {
         runtime_id: JsRuntimeId,
     },
@@ -124,14 +134,28 @@ pub enum JsPoolReply {
     EvalCompleted(JsValue),
     EvalFailed(Error),
     ModuleDefined,
-    ModuleEvaluated { module: ModuleId },
-    ModuleExport { value: JsValue },
+    ModuleEvaluated {
+        module: ModuleId,
+    },
+    ModuleExport {
+        value: JsValue,
+    },
     RunResult(RunResult),
-    RuntimeSerialized { bytes: Vec<u8> },
+    RuntimeSerialized {
+        bytes: Vec<u8>,
+    },
     RuntimeDropped,
-    RuntimeDeserialized { runtime_id: JsRuntimeId },
-    GcCompleted { freed: usize },
+    RuntimeDeserialized {
+        runtime_id: JsRuntimeId,
+    },
+    GcCompleted {
+        freed: usize,
+    },
     HeapStats(HeapStats),
+    #[cfg(test)]
+    StorageTrace(StorageAccessTrace),
+    #[cfg(test)]
+    StorageTraceReset,
     RuntimeDestroyed,
 }
 
@@ -322,6 +346,21 @@ impl JsRuntimePoolActor {
         Ok(JsPoolReply::HeapStats(runtime.heap_stats()))
     }
 
+    #[cfg(test)]
+    fn storage_trace(&self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
+        let runtime = self.storage.runtime_view(runtime_id)?;
+
+        Ok(JsPoolReply::StorageTrace(runtime.storage_trace()))
+    }
+
+    #[cfg(test)]
+    fn reset_storage_trace(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
+        let mut runtime = self.storage.runtime_view_mut(runtime_id)?;
+        runtime.reset_storage_trace();
+
+        Ok(JsPoolReply::StorageTraceReset)
+    }
+
     fn destroy_runtime(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
         let _slot = self.runtimes.remove(runtime_id)?;
         let runtime = self.storage.remove_runtime(runtime_id)?;
@@ -365,6 +404,10 @@ impl Actor<WorkerShardCtx> for JsRuntimePoolActor {
             JsPoolMsg::DeserializeRuntime { bytes } => self.deserialize_runtime(&bytes),
             JsPoolMsg::ForceGc { runtime_id } => self.force_gc(runtime_id),
             JsPoolMsg::HeapStats { runtime_id } => self.heap_stats(runtime_id),
+            #[cfg(test)]
+            JsPoolMsg::StorageTrace { runtime_id } => self.storage_trace(runtime_id),
+            #[cfg(test)]
+            JsPoolMsg::ResetStorageTrace { runtime_id } => self.reset_storage_trace(runtime_id),
             JsPoolMsg::DestroyRuntime { runtime_id } => self.destroy_runtime(runtime_id),
         }
     }
@@ -522,6 +565,54 @@ mod tests {
         }
     }
 
+    fn storage_trace(
+        sim: &mut SimRuntime,
+        worker: &WorkerHandle,
+        pool: &ActorRef<JsRuntimePoolActor>,
+        runtime_id: JsRuntimeId,
+    ) -> Result<StorageAccessTrace, Error> {
+        let call = sim.call(
+            worker,
+            pool.id,
+            Box::new(JsPoolMsg::StorageTrace { runtime_id }),
+        )?;
+
+        sim.run_until_idle()?;
+
+        match *call
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::StorageTrace(trace) => Ok(trace),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    fn reset_storage_trace(
+        sim: &mut SimRuntime,
+        worker: &WorkerHandle,
+        pool: &ActorRef<JsRuntimePoolActor>,
+        runtime_id: JsRuntimeId,
+    ) -> Result<(), Error> {
+        let call = sim.call(
+            worker,
+            pool.id,
+            Box::new(JsPoolMsg::ResetStorageTrace { runtime_id }),
+        )?;
+
+        sim.run_until_idle()?;
+
+        match *call
+            .wait()?
+            .downcast::<JsPoolReply>()
+            .map_err(|_| Error::ActorReplyTypeMismatch)?
+        {
+            JsPoolReply::StorageTraceReset => Ok(()),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
     fn force_gc(
         sim: &mut SimRuntime,
         worker: &WorkerHandle,
@@ -547,6 +638,82 @@ mod tests {
             JsPoolReply::RuntimeCreated(id) => Ok(id),
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    #[test]
+    fn storage_column_trace_verifies_indexed_property_lookup() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let mut setup = String::from("let obj = {};\n");
+        for index in 0..32 {
+            setup.push_str(&format!("obj.p{index} = {index};\n"));
+        }
+
+        assert!(matches!(
+            eval_source(&mut sim, &worker, &pool, runtime_id, &setup)?,
+            JsPoolReply::EvalCompleted(JsValue::Undefined)
+        ));
+
+        reset_storage_trace(&mut sim, &worker, &pool, runtime_id)?;
+
+        assert!(matches!(
+            eval_source(
+                &mut sim,
+                &worker,
+                &pool,
+                runtime_id,
+                "console.log(obj.p31);",
+            )?,
+            JsPoolReply::EvalCompleted(JsValue::Undefined)
+        ));
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"31\n");
+
+        let trace = storage_trace(&mut sim, &worker, &pool, runtime_id)?;
+
+        assert!(
+            trace.heap_property_key_symbol.reads <= 4,
+            "expected indexed property lookup to read a bounded number of key rows, read {}",
+            trace.heap_property_key_symbol.reads
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn storage_column_trace_verifies_indexed_binding_lookup() -> Result<(), Error> {
+        let mut sim = SimRuntime::builder().seed(123).workers(1).build()?;
+        let (worker, pool, runtime_id, output_rx) = create_pool_runtime(&mut sim)?;
+
+        let mut setup = String::new();
+        for index in 0..32 {
+            setup.push_str(&format!("let x{index} = {index};\n"));
+        }
+
+        assert!(matches!(
+            eval_source(&mut sim, &worker, &pool, runtime_id, &setup)?,
+            JsPoolReply::EvalCompleted(JsValue::Undefined)
+        ));
+
+        reset_storage_trace(&mut sim, &worker, &pool, runtime_id)?;
+
+        assert!(matches!(
+            eval_source(&mut sim, &worker, &pool, runtime_id, "console.log(x31);",)?,
+            JsPoolReply::EvalCompleted(JsValue::Undefined)
+        ));
+
+        assert_eq!(collect_stdout(&output_rx, runtime_id), b"31\n");
+
+        let trace = storage_trace(&mut sim, &worker, &pool, runtime_id)?;
+
+        assert!(
+            trace.env_frame_binding_symbol.reads <= 4,
+            "expected indexed binding lookup to read a bounded number of binding rows, read {}",
+            trace.env_frame_binding_symbol.reads
+        );
+
+        Ok(())
     }
 
     #[test]

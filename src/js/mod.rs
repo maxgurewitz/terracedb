@@ -1,6 +1,7 @@
 mod attachment;
 mod bindings;
 mod bytecode;
+mod column;
 mod compile;
 mod heap;
 mod ids;
@@ -21,6 +22,9 @@ pub use bindings::{BindingCellId, BindingKind, BindingSnapshot, EnvFrameId, EnvS
 pub use bytecode::{
     BytecodeProgram, CompiledFunction, ConstId, Constant, ConstantPool, FunctionId, Instr, Opcode,
 };
+#[cfg(test)]
+pub(crate) use column::StorageAccessTrace;
+pub(crate) use column::StorageColumn;
 pub use compile::{JsCompileError, JsSpan, compile_module_source, compile_source_to_bytecode};
 pub use heap::{
     DEFAULT_GC_THRESHOLD_BYTES, GcHeader, GcMark, GcPolicy, HeapStats, HostFunction,

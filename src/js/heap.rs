@@ -1,4 +1,4 @@
-use std::mem;
+use std::{collections::HashMap, mem};
 
 use serde::{Deserialize, Serialize};
 
@@ -6,8 +6,8 @@ use crate::Error;
 
 use super::attachment::JsHostBindings;
 use super::{
-    BindingCellId, BytecodeProgram, EnvFrameId, JsStreamKind, JsValue, ModuleId, SegmentId, Symbol,
-    SymbolTable, ValueCols,
+    BindingCellId, BytecodeProgram, EnvFrameId, JsStreamKind, JsValue, ModuleId, SegmentId,
+    StorageColumn, Symbol, SymbolTable, ValueCols,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -94,8 +94,11 @@ pub struct JsHeap {
     heap_object_property_range_len: Vec<u32>,
 
     heap_property_live: Vec<bool>,
-    heap_property_key_symbol: Vec<Symbol>,
+    heap_property_key_symbol: StorageColumn<Symbol>,
     heap_property_value: ValueCols,
+
+    #[serde(skip, default)]
+    property_index: HashMap<(u32, Symbol), usize>,
 
     host_function_live: Vec<bool>,
     host_function_name: Vec<Symbol>,
@@ -149,8 +152,9 @@ impl JsHeap {
             heap_object_property_range_start: Vec::new(),
             heap_object_property_range_len: Vec::new(),
             heap_property_live: Vec::new(),
-            heap_property_key_symbol: Vec::new(),
+            heap_property_key_symbol: StorageColumn::new(),
             heap_property_value: ValueCols::new(),
+            property_index: HashMap::new(),
             host_function_live: Vec::new(),
             host_function_name: Vec::new(),
             host_function_kind: Vec::new(),
@@ -316,6 +320,19 @@ impl JsHeap {
             freed_objects: self.freed_objects,
             gc_runs: self.gc_runs,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_trace(&self) -> super::StorageAccessTrace {
+        super::StorageAccessTrace {
+            heap_property_key_symbol: self.heap_property_key_symbol.trace(),
+            ..super::StorageAccessTrace::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_storage_trace(&self) {
+        self.heap_property_key_symbol.reset_trace();
     }
 
     pub fn maybe_run_gc(&mut self) -> Result<usize, Error> {
@@ -548,6 +565,8 @@ impl JsHeap {
         self.allocated_bytes = self.allocated_bytes.saturating_sub(bytes);
         self.gc_object.retain(|existing| *existing != id);
         self.gc_zero_ref.retain(|existing| *existing != id);
+        self.property_index
+            .retain(|(object_slot, _), _| *object_slot != id.slot);
         self.free_object_slots.push(id.slot);
 
         for property in properties {
@@ -681,8 +700,11 @@ impl JsHeap {
 
         self.heap_property_live.push(true);
         let PropertyKey::Symbol(symbol) = key;
+        let property_index = self.heap_property_live.len() - 1;
         self.heap_property_key_symbol.push(symbol);
         self.heap_property_value.push(value);
+        self.property_index
+            .insert((object.slot, symbol), property_index);
         self.heap_object_property_range_len[index] += 1;
         self.heap_object_bytes[index] = self.heap_object_bytes[index].saturating_add(16);
         self.allocated_bytes = self.allocated_bytes.saturating_add(16);
@@ -701,7 +723,7 @@ impl JsHeap {
             .filter(|index| self.heap_property_live[*index])
             .map(|index| {
                 (
-                    PropertyKey::Symbol(self.heap_property_key_symbol[index]),
+                    PropertyKey::Symbol(self.property_key_symbol(index)),
                     self.heap_property_value.get(index as u32),
                 )
             })
@@ -723,13 +745,20 @@ impl JsHeap {
     }
 
     fn find_property_index(
-        &self,
+        &mut self,
         object: ObjectId,
         key: PropertyKey,
     ) -> Result<Option<usize>, Error> {
         let PropertyKey::Symbol(symbol) = key;
+        if let Some(index) = self.property_index.get(&(object.slot, symbol)).copied()
+            && self.property_index_entry_valid(object, index)
+        {
+            return Ok(Some(index));
+        }
+
         for index in self.property_indices(object)? {
-            if self.heap_property_live[index] && self.heap_property_key_symbol[index] == symbol {
+            if self.heap_property_live[index] && self.property_key_symbol(index) == symbol {
+                self.property_index.insert((object.slot, symbol), index);
                 return Ok(Some(index));
             }
         }
@@ -784,6 +813,32 @@ impl JsHeap {
         let start = self.heap_object_property_range_start[index] as usize;
         let len = self.heap_object_property_range_len[index] as usize;
         Ok((start..start + len).collect())
+    }
+
+    fn property_key_symbol(&self, index: usize) -> Symbol {
+        *self
+            .heap_property_key_symbol
+            .get(index)
+            .expect("heap property key column out of sync")
+    }
+
+    fn property_index_entry_valid(&self, object: ObjectId, property: usize) -> bool {
+        if !self
+            .heap_property_live
+            .get(property)
+            .copied()
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        let Ok(object_index) = self.live_object_index(object) else {
+            return false;
+        };
+        let start = self.heap_object_property_range_start[object_index] as usize;
+        let len = self.heap_object_property_range_len[object_index] as usize;
+
+        (start..start + len).contains(&property)
     }
 
     fn live_object_index(&self, object: ObjectId) -> Result<usize, Error> {

@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-use super::{JsHeap, JsValue, SegmentId, Symbol, SymbolTable, ValueCols};
+use super::{JsHeap, JsValue, SegmentId, StorageColumn, Symbol, SymbolTable, ValueCols};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct EnvStack {
@@ -22,8 +22,11 @@ pub struct EnvStack {
     env_frame_binding_range_len: Vec<u32>,
 
     env_frame_binding_live: Vec<bool>,
-    env_frame_binding_symbol: Vec<Symbol>,
+    env_frame_binding_symbol: StorageColumn<Symbol>,
     env_frame_binding_cell: Vec<BindingCellId>,
+
+    #[serde(skip, default)]
+    binding_index: HashMap<(u32, Symbol), BindingCellId>,
 
     env_cell_live: Vec<bool>,
     env_cell_owner_frame: Vec<EnvFrameId>,
@@ -76,8 +79,9 @@ impl EnvStack {
             env_frame_binding_range_start: Vec::new(),
             env_frame_binding_range_len: Vec::new(),
             env_frame_binding_live: Vec::new(),
-            env_frame_binding_symbol: Vec::new(),
+            env_frame_binding_symbol: StorageColumn::new(),
             env_frame_binding_cell: Vec::new(),
+            binding_index: HashMap::new(),
             env_cell_live: Vec::new(),
             env_cell_owner_frame: Vec::new(),
             env_cell_kind: Vec::new(),
@@ -111,6 +115,19 @@ impl EnvStack {
 
     pub(crate) fn live_cell_count(&self) -> usize {
         self.env_cell_live.iter().filter(|live| **live).count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_trace(&self) -> super::StorageAccessTrace {
+        super::StorageAccessTrace {
+            env_frame_binding_symbol: self.env_frame_binding_symbol.trace(),
+            ..super::StorageAccessTrace::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_storage_trace(&self) {
+        self.env_frame_binding_symbol.reset_trace();
     }
 
     pub(crate) fn set_current_frame(&mut self, frame: EnvFrameId) -> Result<EnvFrameId, Error> {
@@ -237,7 +254,7 @@ impl EnvStack {
     }
 
     pub(crate) fn cell_for_name_in_frame(
-        &self,
+        &mut self,
         frame: EnvFrameId,
         name: Symbol,
         symbols: &SymbolTable,
@@ -249,7 +266,7 @@ impl EnvStack {
     }
 
     pub(crate) fn lookup(
-        &self,
+        &mut self,
         name: Symbol,
         heap: &mut JsHeap,
         symbols: &SymbolTable,
@@ -338,6 +355,7 @@ impl EnvStack {
 
         self.env_frame_live.fill(false);
         self.env_frame_binding_live.fill(false);
+        self.binding_index.clear();
         Ok(())
     }
 
@@ -481,6 +499,7 @@ impl EnvStack {
         self.env_frame_binding_live.push(true);
         self.env_frame_binding_symbol.push(symbol);
         self.env_frame_binding_cell.push(cell);
+        self.binding_index.insert((frame.slot, symbol), cell);
         self.env_frame_binding_range_len[frame_index] += 1;
         Ok(())
     }
@@ -497,7 +516,7 @@ impl EnvStack {
             .filter(|index| self.env_frame_binding_live[*index])
             .map(|index| {
                 (
-                    self.env_frame_binding_symbol[index],
+                    self.binding_symbol(index),
                     self.env_frame_binding_cell[index],
                 )
             })
@@ -507,6 +526,8 @@ impl EnvStack {
         for index in self.binding_indices(frame)? {
             self.env_frame_binding_live[index] = false;
         }
+        self.binding_index
+            .retain(|(frame_slot, _), _| *frame_slot != frame.slot);
 
         self.env_frame_binding_range_start[frame_index] = self.env_frame_binding_live.len() as u32;
         self.env_frame_binding_range_len[frame_index] = 0;
@@ -540,6 +561,8 @@ impl EnvStack {
 
         let bindings = self.binding_indices(frame_id)?;
         self.env_frame_live[frame_index] = false;
+        self.binding_index
+            .retain(|(frame_slot, _), _| *frame_slot != frame_id.slot);
         for binding in bindings {
             if !self.env_frame_binding_live[binding] {
                 continue;
@@ -559,7 +582,7 @@ impl EnvStack {
         Ok(())
     }
 
-    fn find_cell(&self, name: Symbol) -> Option<BindingCellId> {
+    fn find_cell(&mut self, name: Symbol) -> Option<BindingCellId> {
         let mut current = Some(self.current);
 
         while let Some(frame_id) = current {
@@ -579,13 +602,23 @@ impl EnvStack {
     }
 
     fn binding_cell_in_frame(
-        &self,
+        &mut self,
         frame: EnvFrameId,
         name: Symbol,
     ) -> Result<Option<BindingCellId>, Error> {
+        self.validate_frame_id(frame)?;
+
+        if let Some(cell) = self.binding_index.get(&(frame.slot, name)).copied()
+            && self.validate_cell_id(cell).is_ok()
+        {
+            return Ok(Some(cell));
+        }
+
         for index in self.binding_indices(frame)? {
-            if self.env_frame_binding_live[index] && self.env_frame_binding_symbol[index] == name {
-                return Ok(Some(self.env_frame_binding_cell[index]));
+            if self.env_frame_binding_live[index] && self.binding_symbol(index) == name {
+                let cell = self.env_frame_binding_cell[index];
+                self.binding_index.insert((frame.slot, name), cell);
+                return Ok(Some(cell));
             }
         }
 
@@ -598,6 +631,13 @@ impl EnvStack {
         let start = self.env_frame_binding_range_start[frame_index] as usize;
         let len = self.env_frame_binding_range_len[frame_index] as usize;
         Ok((start..start + len).collect())
+    }
+
+    fn binding_symbol(&self, index: usize) -> Symbol {
+        *self
+            .env_frame_binding_symbol
+            .get(index)
+            .expect("env frame binding symbol column out of sync")
     }
 
     fn validate_frame_id(&self, id: EnvFrameId) -> Result<(), Error> {
