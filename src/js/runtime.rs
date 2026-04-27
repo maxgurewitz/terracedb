@@ -8,7 +8,8 @@ use super::vm::{InstructionBudget, RunResult};
 use super::{
     AttachmentInstallCtx, BindingKind, ExportName, GcPolicy, HeapStats, ImportName, JsAttachment,
     JsRuntimeId, JsValue, ModuleId, ModuleKey, ModuleNamespace, ModuleRegistry, ModuleState,
-    ObjectId, ResolvedExport, Symbol, SymbolTable, Vm, modules::format_export_name,
+    ObjectId, ResolvedExport, RuntimeStorageSegments, RuntimeStorageUsage, StackId, Symbol,
+    SymbolTable, Vm, modules::format_export_name,
 };
 use super::{BytecodeProgram, Instr, compile_module_source, compile_source_to_bytecode};
 
@@ -17,12 +18,14 @@ const JS_RUNTIME_SNAPSHOT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct JsRuntimeConfig {
     pub gc_policy: GcPolicy,
+    pub storage_segments: Option<RuntimeStorageSegments>,
 }
 
 impl Default for JsRuntimeConfig {
     fn default() -> Self {
         Self {
             gc_policy: GcPolicy::default(),
+            storage_segments: None,
         }
     }
 }
@@ -57,13 +60,32 @@ impl JsRuntimeInstance {
         Self {
             id,
             symbols: SymbolTable::new(),
-            vm: Vm::with_gc_policy(config.gc_policy),
+            vm: match config.storage_segments {
+                Some(segments) => Vm::with_storage_segments(segments, config.gc_policy),
+                None => Vm::with_gc_policy(config.gc_policy),
+            },
             modules: ModuleRegistry::new(),
         }
     }
 
     pub fn id(&self) -> JsRuntimeId {
         self.id
+    }
+
+    pub(crate) fn root_env(&self) -> super::EnvFrameId {
+        self.vm.root_env()
+    }
+
+    pub(crate) fn stack_id(&self) -> StackId {
+        self.vm.stack_id()
+    }
+
+    pub(crate) fn storage_segments(&self) -> RuntimeStorageSegments {
+        self.vm.storage_segments()
+    }
+
+    pub(crate) fn storage_usage(&self) -> RuntimeStorageUsage {
+        self.vm.storage_usage()
     }
 
     pub(crate) fn install_attachment(

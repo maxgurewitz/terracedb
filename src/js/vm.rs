@@ -7,7 +7,8 @@ use crate::Error;
 use super::attachment::JsHostBindings;
 use super::{
     BindingCellId, BindingKind, BytecodeProgram, EnvFrameId, EnvStack, GcPolicy, Instr, JsFunction,
-    JsHeap, JsValue, ModuleNamespace, ObjectId, ObjectKind, PropertyKey, Symbol, SymbolTable,
+    JsHeap, JsValue, ModuleNamespace, ObjectId, ObjectKind, PropertyKey, RuntimeStorageSegments,
+    RuntimeStorageUsage, SegmentId, StackId, Symbol, SymbolTable,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -24,6 +25,7 @@ pub enum RunResult {
 
 #[derive(Deserialize, Serialize)]
 pub struct Vm {
+    stack_id: StackId,
     stack: Vec<JsValue>,
     env: EnvStack,
     heap: JsHeap,
@@ -58,12 +60,55 @@ impl Vm {
     }
 
     pub fn with_gc_policy(gc_policy: GcPolicy) -> Self {
+        Self::with_storage_segments(
+            RuntimeStorageSegments {
+                heap: SegmentId(0),
+                bindings: SegmentId(1),
+                env_frames: SegmentId(2),
+                stack: SegmentId(3),
+            },
+            gc_policy,
+        )
+    }
+
+    pub fn with_storage_segments(segments: RuntimeStorageSegments, gc_policy: GcPolicy) -> Self {
         Self {
+            stack_id: StackId {
+                segment: segments.stack,
+                slot: 0,
+            },
             stack: Vec::new(),
-            env: EnvStack::new(),
-            heap: JsHeap::with_gc_policy(gc_policy),
+            env: EnvStack::with_segments(segments.bindings, segments.env_frames),
+            heap: JsHeap::with_segment_and_gc_policy(segments.heap, gc_policy),
             execution: None,
             host: JsHostBindings::default(),
+        }
+    }
+
+    pub(crate) fn root_env(&self) -> EnvFrameId {
+        self.env.root()
+    }
+
+    pub(crate) fn stack_id(&self) -> StackId {
+        self.stack_id
+    }
+
+    pub(crate) fn storage_segments(&self) -> RuntimeStorageSegments {
+        RuntimeStorageSegments {
+            heap: self.heap.segment(),
+            bindings: self.env.binding_segment(),
+            env_frames: self.env.frame_segment(),
+            stack: self.stack_id.segment,
+        }
+    }
+
+    pub(crate) fn storage_usage(&self) -> RuntimeStorageUsage {
+        RuntimeStorageUsage {
+            heap_objects: self.heap.allocated_objects(),
+            binding_cells: self.env.live_cell_count(),
+            env_frames: self.env.live_frame_count(),
+            stacks: 1,
+            stack_values: self.stack.len(),
         }
     }
 

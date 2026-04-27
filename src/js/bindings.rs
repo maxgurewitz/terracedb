@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-use super::{JsHeap, JsValue, Symbol, SymbolTable};
+use super::{JsHeap, JsValue, SegmentId, Symbol, SymbolTable};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct EnvStack {
     root: EnvFrameId,
     current: EnvFrameId,
+    binding_segment: SegmentId,
+    frame_segment: SegmentId,
     frames: Vec<Option<EnvFrame>>,
     cells: Vec<Option<Binding>>,
 }
@@ -31,10 +33,16 @@ pub struct Binding {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct BindingCellId(pub u32);
+pub struct BindingCellId {
+    pub segment: SegmentId,
+    pub slot: u32,
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct EnvFrameId(pub u32);
+pub struct EnvFrameId {
+    pub segment: SegmentId,
+    pub slot: u32,
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BindingKind {
@@ -55,12 +63,17 @@ impl EnvFrame {
 }
 
 impl EnvStack {
-    pub(crate) fn new() -> Self {
-        let root = EnvFrameId(0);
+    pub(crate) fn with_segments(binding_segment: SegmentId, frame_segment: SegmentId) -> Self {
+        let root = EnvFrameId {
+            segment: frame_segment,
+            slot: 0,
+        };
 
         Self {
             root,
             current: root,
+            binding_segment,
+            frame_segment,
             frames: vec![Some(EnvFrame::new(None, 1))],
             cells: Vec::new(),
         }
@@ -78,6 +91,26 @@ impl EnvStack {
         Ok(self.current)
     }
 
+    pub(crate) fn root(&self) -> EnvFrameId {
+        self.root
+    }
+
+    pub(crate) fn binding_segment(&self) -> SegmentId {
+        self.binding_segment
+    }
+
+    pub(crate) fn frame_segment(&self) -> SegmentId {
+        self.frame_segment
+    }
+
+    pub(crate) fn live_frame_count(&self) -> usize {
+        self.frames.iter().filter(|frame| frame.is_some()).count()
+    }
+
+    pub(crate) fn live_cell_count(&self) -> usize {
+        self.cells.iter().filter(|cell| cell.is_some()).count()
+    }
+
     pub(crate) fn set_current_frame(&mut self, frame: EnvFrameId) -> Result<EnvFrameId, Error> {
         self.frame(frame)?;
 
@@ -89,7 +122,10 @@ impl EnvStack {
 
     pub(crate) fn create_module_frame(&mut self) -> EnvFrameId {
         let depth = self.frame(self.root).expect("root frame must exist").depth + 1;
-        let id = EnvFrameId(self.frames.len() as u32);
+        let id = EnvFrameId {
+            segment: self.frame_segment,
+            slot: self.frames.len() as u32,
+        };
 
         self.frames
             .push(Some(EnvFrame::new(Some(self.root), depth)));
@@ -110,7 +146,10 @@ impl EnvStack {
             .expect("current frame must exist")
             .depth
             + 1;
-        let id = EnvFrameId(self.frames.len() as u32);
+        let id = EnvFrameId {
+            segment: self.frame_segment,
+            slot: self.frames.len() as u32,
+        };
 
         self.frames
             .push(Some(EnvFrame::new(Some(self.current), depth)));
@@ -345,7 +384,10 @@ impl EnvStack {
                 frame
                     .as_ref()
                     .filter(|frame| frame.active)
-                    .map(|_| EnvFrameId(index as u32))
+                    .map(|_| EnvFrameId {
+                        segment: self.frame_segment,
+                        slot: index as u32,
+                    })
             })
             .collect()
     }
@@ -383,7 +425,10 @@ impl EnvStack {
                 frame
                     .as_ref()
                     .filter(|frame| !frame.active)
-                    .map(|_| EnvFrameId(index as u32))
+                    .map(|_| EnvFrameId {
+                        segment: self.frame_segment,
+                        slot: index as u32,
+                    })
             })
             .collect::<Vec<_>>();
         let mut released = 0;
@@ -445,49 +490,80 @@ impl EnvStack {
     }
 
     fn alloc_cell(&mut self, binding: Binding) -> BindingCellId {
-        let id = BindingCellId(self.cells.len() as u32);
+        let id = BindingCellId {
+            segment: self.binding_segment,
+            slot: self.cells.len() as u32,
+        };
         self.cells.push(Some(binding));
         id
     }
 
     fn frame(&self, id: EnvFrameId) -> Result<&EnvFrame, Error> {
+        self.validate_frame_id(id)?;
+
         self.frames
-            .get(id.0 as usize)
+            .get(id.slot as usize)
             .and_then(Option::as_ref)
-            .ok_or(Error::JsEnvFrameNotFound { frame: id.0 })
+            .ok_or(Error::JsEnvFrameNotFound { frame: id.slot })
     }
 
     fn frame_mut(&mut self, id: EnvFrameId) -> Result<&mut EnvFrame, Error> {
+        self.validate_frame_id(id)?;
+
         self.frames
-            .get_mut(id.0 as usize)
+            .get_mut(id.slot as usize)
             .and_then(Option::as_mut)
-            .ok_or(Error::JsEnvFrameNotFound { frame: id.0 })
+            .ok_or(Error::JsEnvFrameNotFound { frame: id.slot })
     }
 
     fn frame_slot_mut(&mut self, id: EnvFrameId) -> Result<&mut Option<EnvFrame>, Error> {
+        self.validate_frame_id(id)?;
+
         self.frames
-            .get_mut(id.0 as usize)
-            .ok_or(Error::JsEnvFrameNotFound { frame: id.0 })
+            .get_mut(id.slot as usize)
+            .ok_or(Error::JsEnvFrameNotFound { frame: id.slot })
     }
 
     fn cell(&self, id: BindingCellId) -> Result<&Binding, Error> {
+        self.validate_cell_id(id)?;
+
         self.cells
-            .get(id.0 as usize)
+            .get(id.slot as usize)
             .and_then(Option::as_ref)
-            .ok_or(Error::JsBindingCellNotFound { cell: id.0 })
+            .ok_or(Error::JsBindingCellNotFound { cell: id.slot })
     }
 
     fn cell_mut(&mut self, id: BindingCellId) -> Result<&mut Binding, Error> {
+        self.validate_cell_id(id)?;
+
         self.cells
-            .get_mut(id.0 as usize)
+            .get_mut(id.slot as usize)
             .and_then(Option::as_mut)
-            .ok_or(Error::JsBindingCellNotFound { cell: id.0 })
+            .ok_or(Error::JsBindingCellNotFound { cell: id.slot })
     }
 
     fn cell_slot_mut(&mut self, id: BindingCellId) -> Result<&mut Option<Binding>, Error> {
+        self.validate_cell_id(id)?;
+
         self.cells
-            .get_mut(id.0 as usize)
-            .ok_or(Error::JsBindingCellNotFound { cell: id.0 })
+            .get_mut(id.slot as usize)
+            .ok_or(Error::JsBindingCellNotFound { cell: id.slot })
+    }
+
+    fn validate_frame_id(&self, id: EnvFrameId) -> Result<(), Error> {
+        if id.segment != self.frame_segment {
+            return Err(Error::JsEnvFrameNotFound { frame: id.slot });
+        }
+
+        Ok(())
+    }
+
+    fn validate_cell_id(&self, id: BindingCellId) -> Result<(), Error> {
+        if id.segment != self.binding_segment {
+            return Err(Error::JsBindingCellNotFound { cell: id.slot });
+        }
+
+        Ok(())
     }
 }
 

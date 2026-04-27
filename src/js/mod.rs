@@ -8,6 +8,7 @@ mod modules;
 mod output;
 mod pool;
 mod runtime;
+mod storage;
 mod symbol;
 mod value;
 mod vm;
@@ -26,8 +27,7 @@ pub use heap::{
     HostFunctionKind, JsFunction, JsHeap, JsObject, JsProperty, ModuleNamespace, ObjectId,
     ObjectKind, PropertyKey,
 };
-pub use ids::JsRuntimeId;
-pub use ids::ModuleId;
+pub use ids::{JsRuntimeId, ModuleId, ProgramId, StackId};
 pub use modules::{
     CompiledModule, ExportName, ImportEntry, ImportName, IndirectExportEntry, LocalBindingEntry,
     LocalExportEntry, ModuleKey, ModuleRecord, ModuleRegistry, ModuleState, ResolvedExport,
@@ -36,6 +36,10 @@ pub use modules::{
 pub use output::{ChannelByteSink, JsOutputChunk, JsOutputReceiver, JsOutputSender, JsStreamKind};
 pub use pool::{JsPoolMsg, JsPoolReply, JsRuntimePoolActor, JsRuntimePoolConfig};
 pub use runtime::{JsRuntimeConfig, JsRuntimeInstance};
+pub use storage::{
+    PoolRuntimeStorage, RuntimeSlot, RuntimeState, RuntimeStorageSegments, RuntimeStorageUsage,
+    RuntimeTable, SegmentId, SegmentKind, SegmentMeta, SegmentTable,
+};
 pub use symbol::{Symbol, SymbolTable};
 pub use value::JsValue;
 pub use vm::{InstructionBudget, RunResult, Vm};

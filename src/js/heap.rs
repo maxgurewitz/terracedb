@@ -6,12 +6,21 @@ use crate::Error;
 
 use super::attachment::JsHostBindings;
 use super::{
-    BindingCellId, BytecodeProgram, EnvFrameId, JsStreamKind, JsValue, ModuleId, Symbol,
+    BindingCellId, BytecodeProgram, EnvFrameId, JsStreamKind, JsValue, ModuleId, SegmentId, Symbol,
     SymbolTable,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct ObjectId(pub u64);
+pub struct ObjectId {
+    pub segment: SegmentId,
+    pub slot: u32,
+}
+
+impl ObjectId {
+    pub(crate) fn debug_index(self) -> u64 {
+        self.slot as u64
+    }
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum PropertyKey {
@@ -36,7 +45,8 @@ impl Default for GcPolicy {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsHeap {
-    next_object_id: u64,
+    segment: SegmentId,
+    next_object_slot: u32,
     objects: HashMap<ObjectId, HeapObject>,
     gc_objects: Vec<ObjectId>,
     zero_ref: Vec<ObjectId>,
@@ -92,8 +102,13 @@ impl JsHeap {
     }
 
     pub fn with_gc_policy(gc_policy: GcPolicy) -> Self {
+        Self::with_segment_and_gc_policy(SegmentId(0), gc_policy)
+    }
+
+    pub fn with_segment_and_gc_policy(segment: SegmentId, gc_policy: GcPolicy) -> Self {
         Self {
-            next_object_id: 0,
+            segment,
+            next_object_slot: 0,
             objects: HashMap::new(),
             gc_objects: Vec::new(),
             zero_ref: Vec::new(),
@@ -107,10 +122,21 @@ impl JsHeap {
         }
     }
 
+    pub(crate) fn segment(&self) -> SegmentId {
+        self.segment
+    }
+
+    pub(crate) fn allocated_objects(&self) -> usize {
+        self.allocated_objects
+    }
+
     pub fn alloc_object(&mut self, kind: ObjectKind) -> ObjectId {
         let object = JsObject::new(kind);
-        let id = ObjectId(self.next_object_id);
-        self.next_object_id += 1;
+        let id = ObjectId {
+            segment: self.segment,
+            slot: self.next_object_slot,
+        };
+        self.next_object_slot += 1;
 
         let bytes = estimate_object_bytes(&object);
 
@@ -155,13 +181,14 @@ impl JsHeap {
     }
 
     pub fn free_object_ref(&mut self, id: ObjectId) -> Result<(), Error> {
-        let object = self
-            .objects
-            .get_mut(&id)
-            .ok_or(Error::JsObjectNotFound { object: id.0 })?;
+        let object = self.objects.get_mut(&id).ok_or(Error::JsObjectNotFound {
+            object: id.debug_index(),
+        })?;
 
         if object.header.ref_count == 0 {
-            return Err(Error::JsRefCountUnderflow { object: id.0 });
+            return Err(Error::JsRefCountUnderflow {
+                object: id.debug_index(),
+            });
         }
 
         object.header.ref_count -= 1;
@@ -197,7 +224,9 @@ impl JsHeap {
         value: JsValue,
     ) -> Result<(), Error> {
         if !self.objects.contains_key(&object) {
-            return Err(Error::JsObjectNotFound { object: object.0 });
+            return Err(Error::JsObjectNotFound {
+                object: object.debug_index(),
+            });
         }
 
         self.dup_value(&value);
@@ -290,10 +319,9 @@ impl JsHeap {
     }
 
     fn free_object_now(&mut self, id: ObjectId) -> Result<(), Error> {
-        let heap_object = self
-            .objects
-            .remove(&id)
-            .ok_or(Error::JsObjectNotFound { object: id.0 })?;
+        let heap_object = self.objects.remove(&id).ok_or(Error::JsObjectNotFound {
+            object: id.debug_index(),
+        })?;
 
         self.account_freed_object(id, heap_object.header.bytes);
         heap_object.object.release_children(self)
@@ -322,10 +350,14 @@ impl JsHeap {
             let child_object = self
                 .objects
                 .get_mut(&child)
-                .ok_or(Error::JsObjectNotFound { object: child.0 })?;
+                .ok_or(Error::JsObjectNotFound {
+                    object: child.debug_index(),
+                })?;
 
             if child_object.header.ref_count == 0 {
-                return Err(Error::JsRefCountUnderflow { object: child.0 });
+                return Err(Error::JsRefCountUnderflow {
+                    object: child.debug_index(),
+                });
             }
 
             child_object.header.ref_count -= 1;
@@ -356,10 +388,9 @@ impl JsHeap {
 
     fn gc_scan_object(&mut self, id: ObjectId) -> Result<(), Error> {
         let already_live = {
-            let object = self
-                .objects
-                .get_mut(&id)
-                .ok_or(Error::JsObjectNotFound { object: id.0 })?;
+            let object = self.objects.get_mut(&id).ok_or(Error::JsObjectNotFound {
+                object: id.debug_index(),
+            })?;
 
             if object.header.mark == GcMark::Live {
                 true
@@ -480,16 +511,18 @@ impl JsHeap {
     }
 
     fn object(&self, object: ObjectId) -> Result<&HeapObject, Error> {
-        self.objects
-            .get(&object)
-            .ok_or(Error::JsObjectNotFound { object: object.0 })
+        self.objects.get(&object).ok_or(Error::JsObjectNotFound {
+            object: object.debug_index(),
+        })
     }
 
     fn object_mut(&mut self, object: ObjectId) -> Result<&mut JsObject, Error> {
         self.objects
             .get_mut(&object)
             .map(|object| &mut object.object)
-            .ok_or(Error::JsObjectNotFound { object: object.0 })
+            .ok_or(Error::JsObjectNotFound {
+                object: object.debug_index(),
+            })
     }
 }
 

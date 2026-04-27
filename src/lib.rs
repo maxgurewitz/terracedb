@@ -26,9 +26,10 @@ pub use js::{
     JsOutputChunk, JsOutputReceiver, JsOutputSender, JsPoolMsg, JsPoolReply, JsProperty,
     JsRuntimeConfig, JsRuntimeId, JsRuntimeInstance, JsRuntimePoolActor, JsRuntimePoolConfig,
     JsSpan, JsStreamKind, JsValue, LocalBindingEntry, LocalExportEntry, ModuleId, ModuleKey,
-    ModuleRecord, ModuleRegistry, ModuleState, ObjectId, ObjectKind, PropertyKey, ResolvedExport,
-    RunResult, StarExportEntry, Symbol, SymbolTable, Vm, compile_module_source,
-    compile_source_to_bytecode,
+    ModuleRecord, ModuleRegistry, ModuleState, ObjectId, ObjectKind, PoolRuntimeStorage, ProgramId,
+    PropertyKey, ResolvedExport, RunResult, RuntimeSlot, RuntimeState, RuntimeStorageSegments,
+    RuntimeStorageUsage, RuntimeTable, SegmentId, SegmentKind, SegmentMeta, SegmentTable, StackId,
+    StarExportEntry, Symbol, SymbolTable, Vm, compile_module_source, compile_source_to_bytecode,
 };
 pub use runtime::{
     CallHandle, Runtime, RuntimeApi, RuntimeBuilder, Shutdown, SimRuntime, SimRuntimeBuilder,

@@ -4,7 +4,8 @@ use crate::{Actor, Env, Error, WorkerShardCtx};
 
 use super::{
     GcPolicy, HeapStats, InstructionBudget, JsAttachment, JsAttachmentBundle, JsRuntimeConfig,
-    JsRuntimeId, JsRuntimeInstance, JsValue, ModuleId, ModuleKey, RunResult,
+    JsRuntimeId, JsRuntimeInstance, JsValue, ModuleId, ModuleKey, PoolRuntimeStorage, RunResult,
+    RuntimeSlot, RuntimeState, RuntimeTable,
 };
 
 pub struct JsRuntimePoolConfig {
@@ -59,8 +60,8 @@ impl Default for JsRuntimePoolConfig {
 }
 
 pub struct JsRuntimePoolActor {
-    next_runtime_id: u64,
-    runtimes: HashMap<JsRuntimeId, JsRuntimeInstance>,
+    runtimes: RuntimeTable,
+    storage: PoolRuntimeStorage,
     attachments: Vec<Box<dyn JsAttachment + Send>>,
     module_sources: HashMap<ModuleKey, String>,
     gc_policy: GcPolicy,
@@ -137,8 +138,8 @@ pub enum JsPoolReply {
 impl JsRuntimePoolActor {
     pub fn new(config: JsRuntimePoolConfig) -> Self {
         Self {
-            next_runtime_id: 0,
-            runtimes: HashMap::new(),
+            runtimes: RuntimeTable::new(),
+            storage: PoolRuntimeStorage::new(),
             attachments: config.attachments,
             module_sources: HashMap::new(),
             gc_policy: config.gc_policy,
@@ -146,13 +147,14 @@ impl JsRuntimePoolActor {
     }
 
     fn create_runtime(&mut self) -> Result<JsPoolReply, Error> {
-        let runtime_id = JsRuntimeId(self.next_runtime_id);
-        self.next_runtime_id += 1;
+        let runtime_id = self.runtimes.allocate_id();
+        let storage_segments = self.storage.create_runtime_segments(runtime_id);
 
         let mut runtime = JsRuntimeInstance::with_config(
             runtime_id,
             JsRuntimeConfig {
                 gc_policy: self.gc_policy,
+                storage_segments: Some(storage_segments),
             },
         );
 
@@ -160,19 +162,44 @@ impl JsRuntimePoolActor {
             runtime.install_attachment(attachment.as_ref())?;
         }
 
-        self.runtimes.insert(runtime_id, runtime);
+        let slot = RuntimeSlot {
+            id: runtime_id,
+            state: RuntimeState::Idle,
+            root_env: runtime.root_env(),
+            stack: runtime.stack_id(),
+            current_program: None,
+            resident_bytes: self.storage.runtime_resident_bytes(runtime_id)?,
+            dirty_bytes: self.storage.runtime_dirty_bytes(runtime_id)?,
+        };
+
+        self.runtimes.insert(slot)?;
+        self.storage.insert_runtime(runtime_id, runtime)?;
+        self.refresh_runtime_accounting(runtime_id)?;
 
         Ok(JsPoolReply::RuntimeCreated(runtime_id))
     }
 
+    fn refresh_runtime_accounting(&mut self, runtime_id: JsRuntimeId) -> Result<(), Error> {
+        self.storage.refresh_runtime_usage(runtime_id)?;
+        let resident_bytes = self.storage.runtime_resident_bytes(runtime_id)?;
+        let dirty_bytes = self.storage.runtime_dirty_bytes(runtime_id)?;
+        let slot = self.runtimes.get_mut(runtime_id)?;
+        slot.resident_bytes = resident_bytes;
+        slot.dirty_bytes = dirty_bytes;
+        Ok(())
+    }
+
     fn eval(&mut self, runtime_id: JsRuntimeId, source: &str) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get_mut(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime_mut(runtime_id)?;
         match runtime.eval(source) {
-            Ok(value) => Ok(JsPoolReply::EvalCompleted(value)),
-            Err(err) => Ok(JsPoolReply::EvalFailed(err)),
+            Ok(value) => {
+                self.refresh_runtime_accounting(runtime_id)?;
+                Ok(JsPoolReply::EvalCompleted(value))
+            }
+            Err(err) => {
+                self.refresh_runtime_accounting(runtime_id)?;
+                Ok(JsPoolReply::EvalFailed(err))
+            }
         }
     }
 
@@ -187,10 +214,7 @@ impl JsRuntimePoolActor {
         runtime_id: JsRuntimeId,
         specifier: String,
     ) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get_mut(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime_mut(runtime_id)?;
 
         match runtime.evaluate_module(
             ModuleKey(specifier),
@@ -208,10 +232,7 @@ impl JsRuntimePoolActor {
         specifier: String,
         export_name: String,
     ) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get_mut(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime_mut(runtime_id)?;
         let export_name = runtime.module_export_name(&export_name);
 
         match runtime.get_module_export(&ModuleKey(specifier), export_name) {
@@ -221,10 +242,7 @@ impl JsRuntimePoolActor {
     }
 
     fn eval_start(&mut self, runtime_id: JsRuntimeId, source: &str) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get_mut(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime_mut(runtime_id)?;
 
         Ok(JsPoolReply::RunResult(runtime.eval_start(source)))
     }
@@ -234,28 +252,19 @@ impl JsRuntimePoolActor {
         runtime_id: JsRuntimeId,
         budget: InstructionBudget,
     ) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get_mut(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime_mut(runtime_id)?;
 
         Ok(JsPoolReply::RunResult(runtime.run_for_budget(budget)))
     }
 
     fn run_until_complete(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get_mut(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime_mut(runtime_id)?;
 
         Ok(JsPoolReply::RunResult(runtime.run_until_complete()))
     }
 
     fn serialize_runtime(&self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime(runtime_id)?;
 
         Ok(JsPoolReply::RuntimeSerialized {
             bytes: runtime.serialize()?,
@@ -263,10 +272,8 @@ impl JsRuntimePoolActor {
     }
 
     fn drop_runtime(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .remove(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let _slot = self.runtimes.remove(runtime_id)?;
+        let runtime = self.storage.remove_runtime(runtime_id)?;
 
         runtime.destroy()?;
 
@@ -277,21 +284,31 @@ impl JsRuntimePoolActor {
         let runtime = JsRuntimeInstance::deserialize(bytes, &self.attachments)?;
         let runtime_id = runtime.id();
 
-        if self.runtimes.contains_key(&runtime_id) {
+        if self.runtimes.contains(runtime_id) || self.storage.contains_runtime(runtime_id) {
             return Err(Error::JsRuntimeAlreadyExists(runtime_id));
         }
 
-        self.next_runtime_id = self.next_runtime_id.max(runtime_id.0 + 1);
-        self.runtimes.insert(runtime_id, runtime);
+        self.runtimes.bump_next_runtime_id(runtime_id);
+        self.storage
+            .register_runtime_segments(runtime_id, runtime.storage_segments());
+        let slot = RuntimeSlot {
+            id: runtime_id,
+            state: RuntimeState::SuspendedInMemory,
+            root_env: runtime.root_env(),
+            stack: runtime.stack_id(),
+            current_program: None,
+            resident_bytes: self.storage.runtime_resident_bytes(runtime_id)?,
+            dirty_bytes: self.storage.runtime_dirty_bytes(runtime_id)?,
+        };
+
+        self.runtimes.insert(slot)?;
+        self.storage.insert_runtime(runtime_id, runtime)?;
 
         Ok(JsPoolReply::RuntimeDeserialized { runtime_id })
     }
 
     fn force_gc(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get_mut(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime_mut(runtime_id)?;
 
         Ok(JsPoolReply::GcCompleted {
             freed: runtime.force_gc()?,
@@ -299,19 +316,14 @@ impl JsRuntimePoolActor {
     }
 
     fn heap_stats(&self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .get(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let runtime = self.storage.runtime(runtime_id)?;
 
         Ok(JsPoolReply::HeapStats(runtime.heap_stats()))
     }
 
     fn destroy_runtime(&mut self, runtime_id: JsRuntimeId) -> Result<JsPoolReply, Error> {
-        let runtime = self
-            .runtimes
-            .remove(&runtime_id)
-            .ok_or(Error::RuntimeNotFound(runtime_id))?;
+        let _slot = self.runtimes.remove(runtime_id)?;
+        let runtime = self.storage.remove_runtime(runtime_id)?;
 
         runtime.destroy()?;
 
@@ -367,7 +379,7 @@ mod tests {
     use crate::{
         AttachmentInstallCtx, ConsoleAttachment, CoreHostAttachments, CoreHostConfig,
         HostModuleInstallCtx, JsAttachment, JsOutputChunk, JsOutputReceiver, JsStreamKind,
-        ModuleKey,
+        ModuleKey, ObjectId,
     };
 
     struct HostNumbersAttachment;
@@ -527,6 +539,86 @@ mod tests {
             JsPoolReply::GcCompleted { freed } => Ok(freed),
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    fn create_runtime_direct(pool: &mut JsRuntimePoolActor) -> Result<JsRuntimeId, Error> {
+        match pool.create_runtime()? {
+            JsPoolReply::RuntimeCreated(id) => Ok(id),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn js_pool_runtime_owns_distinct_segments() -> Result<(), Error> {
+        let mut pool = JsRuntimePoolActor::new(JsRuntimePoolConfig::new());
+        let r1 = create_runtime_direct(&mut pool)?;
+        let r2 = create_runtime_direct(&mut pool)?;
+
+        let s1 = pool.storage.runtime_segments(r1)?.clone();
+        let s2 = pool.storage.runtime_segments(r2)?.clone();
+
+        assert!(!s1.heap.is_empty());
+        assert!(!s1.bindings.is_empty());
+        assert!(!s1.env_frames.is_empty());
+        assert!(!s1.stacks.is_empty());
+        assert!(!s2.heap.is_empty());
+        assert_ne!(s1.heap, s2.heap);
+        assert_ne!(s1.bindings, s2.bindings);
+        assert_ne!(s1.env_frames, s2.env_frames);
+        assert_ne!(s1.stacks, s2.stacks);
+
+        assert_eq!(pool.storage.segments.owner(s1.heap[0])?, r1);
+        assert_eq!(pool.storage.segments.owner(s2.heap[0])?, r2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_pool_records_object_allocations_in_owner_heap_segment() -> Result<(), Error> {
+        let mut pool = JsRuntimePoolActor::new(JsRuntimePoolConfig::new());
+        let r1 = create_runtime_direct(&mut pool)?;
+        let r2 = create_runtime_direct(&mut pool)?;
+
+        assert!(matches!(
+            pool.eval(r1, "let obj = {};")?,
+            JsPoolReply::EvalCompleted(JsValue::Undefined)
+        ));
+        assert!(matches!(
+            pool.eval(r2, "let obj = {};")?,
+            JsPoolReply::EvalCompleted(JsValue::Undefined)
+        ));
+
+        let s1 = pool.storage.runtime_segments(r1)?.clone();
+        let s2 = pool.storage.runtime_segments(r2)?.clone();
+        let h1 = pool.storage.segments.meta(s1.heap[0])?;
+        let h2 = pool.storage.segments.meta(s2.heap[0])?;
+
+        assert_eq!(h1.owner, r1);
+        assert_eq!(h2.owner, r2);
+        assert!(h1.used_slots > 0);
+        assert!(h2.used_slots > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn js_pool_rejects_cross_runtime_object_owner_validation() -> Result<(), Error> {
+        let mut pool = JsRuntimePoolActor::new(JsRuntimePoolConfig::new());
+        let r1 = create_runtime_direct(&mut pool)?;
+        let r2 = create_runtime_direct(&mut pool)?;
+        let r1_heap = pool.storage.runtime_segments(r1)?.heap[0];
+        let object = ObjectId {
+            segment: r1_heap,
+            slot: 0,
+        };
+
+        assert_eq!(pool.storage.validate_object_owner(r1, object), Ok(()));
+        assert!(matches!(
+            pool.storage.validate_object_owner(r2, object),
+            Err(Error::JsSegmentOwnerMismatch { .. })
+        ));
+
+        Ok(())
     }
 
     fn destroy_runtime(
