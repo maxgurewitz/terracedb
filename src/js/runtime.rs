@@ -6,56 +6,76 @@ use super::attachment::{AttachmentHostCtx, HostModuleInstallCtx};
 use super::modules::CompiledModule;
 use super::vm::{InstructionBudget, RunResult};
 use super::{
-    AttachmentInstallCtx, BindingKind, ExportName, GcPolicy, HeapStats, ImportName, JsAttachment,
-    JsRuntimeId, JsValue, ModuleId, ModuleKey, ModuleNamespace, ModuleRegistry, ModuleState,
-    ObjectId, ResolvedExport, RuntimeStorageSegments, RuntimeStorageUsage, StackId, Symbol,
-    SymbolTable, Vm, modules::format_export_name,
+    AttachmentInstallCtx, BindingKind, ExportName, HeapStats, ImportName, JsAttachment,
+    JsRuntimeId, JsValue, ModuleId, ModuleKey, ModuleNamespace, ModuleRegistry, ModuleRegistryId,
+    ModuleState, ObjectId, ResolvedExport, RuntimeStorageSegments, StackId, Symbol, SymbolTable,
+    SymbolTableId, Vm, VmStateId, modules::format_export_name,
 };
 use super::{BytecodeProgram, Instr, compile_module_source, compile_source_to_bytecode};
 
 const JS_RUNTIME_SNAPSHOT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub struct JsRuntimeConfig {
-    pub gc_policy: GcPolicy,
-    pub storage_segments: Option<RuntimeStorageSegments>,
+pub(crate) struct RuntimeRecord {
+    id: JsRuntimeId,
+    storage_segments: RuntimeStorageSegments,
+    symbol_table: SymbolTableId,
+    vm_state: VmStateId,
+    module_registry: ModuleRegistryId,
 }
 
-pub struct JsRuntimeInstance {
-    id: JsRuntimeId,
-    symbols: SymbolTable,
+pub(crate) struct RuntimeRecordView<'a> {
+    pub id: JsRuntimeId,
+    pub symbols: &'a mut SymbolTable,
+    pub vm: &'a mut Vm,
+    pub modules: &'a mut ModuleRegistry,
+}
+
+pub(crate) struct RuntimeRecordViewRef<'a> {
+    pub id: JsRuntimeId,
+    pub storage_segments: RuntimeStorageSegments,
+    pub symbols: &'a SymbolTable,
+    pub vm: &'a Vm,
+    pub modules: &'a ModuleRegistry,
+}
+
+pub(crate) struct RuntimeDetached {
     vm: Vm,
-    modules: ModuleRegistry,
 }
 
 #[derive(serde::Deserialize)]
-struct JsRuntimeSnapshot {
-    version: u32,
-    runtime_id: JsRuntimeId,
-    symbols: SymbolTable,
-    vm: Vm,
-    modules: ModuleRegistry,
+pub(crate) struct RuntimeSnapshot {
+    pub version: u32,
+    pub runtime_id: JsRuntimeId,
+    pub storage_segments: RuntimeStorageSegments,
+    pub symbols: SymbolTable,
+    pub vm: Vm,
+    pub modules: ModuleRegistry,
 }
 
 #[derive(serde::Serialize)]
 struct JsRuntimeSnapshotRef<'a> {
     version: u32,
     runtime_id: JsRuntimeId,
+    storage_segments: RuntimeStorageSegments,
     symbols: &'a SymbolTable,
     vm: &'a Vm,
     modules: &'a ModuleRegistry,
 }
 
-impl JsRuntimeInstance {
-    pub(crate) fn with_config(id: JsRuntimeId, config: JsRuntimeConfig) -> Self {
+impl RuntimeRecord {
+    pub(crate) fn new(
+        id: JsRuntimeId,
+        storage_segments: RuntimeStorageSegments,
+        symbol_table: SymbolTableId,
+        vm_state: VmStateId,
+        module_registry: ModuleRegistryId,
+    ) -> Self {
         Self {
             id,
-            symbols: SymbolTable::new(),
-            vm: match config.storage_segments {
-                Some(segments) => Vm::with_storage_segments(segments, config.gc_policy),
-                None => Vm::with_gc_policy(config.gc_policy),
-            },
-            modules: ModuleRegistry::new(),
+            storage_segments,
+            symbol_table,
+            vm_state,
+            module_registry,
         }
     }
 
@@ -64,21 +84,37 @@ impl JsRuntimeInstance {
     }
 
     pub(crate) fn root_env(&self) -> super::EnvFrameId {
-        self.vm.root_env()
+        super::EnvFrameId {
+            segment: self.storage_segments.env_frames,
+            slot: 0,
+        }
     }
 
     pub(crate) fn stack_id(&self) -> StackId {
-        self.vm.stack_id()
+        StackId {
+            segment: self.storage_segments.stack,
+            slot: 0,
+        }
     }
 
     pub(crate) fn storage_segments(&self) -> RuntimeStorageSegments {
-        self.vm.storage_segments()
+        self.storage_segments
     }
 
-    pub(crate) fn storage_usage(&self) -> RuntimeStorageUsage {
-        self.vm.storage_usage()
+    pub(crate) fn symbol_table_id(&self) -> SymbolTableId {
+        self.symbol_table
     }
 
+    pub(crate) fn vm_state_id(&self) -> VmStateId {
+        self.vm_state
+    }
+
+    pub(crate) fn module_registry_id(&self) -> ModuleRegistryId {
+        self.module_registry
+    }
+}
+
+impl RuntimeRecordView<'_> {
     pub(crate) fn install_attachment(
         &mut self,
         attachment: &dyn JsAttachment,
@@ -86,7 +122,7 @@ impl JsRuntimeInstance {
         let (heap, global_env, host) = self.vm.install_parts_mut();
         let mut ctx = AttachmentInstallCtx {
             runtime_id: self.id,
-            symbols: &mut self.symbols,
+            symbols: self.symbols,
             heap,
             global_env,
             host,
@@ -108,8 +144,8 @@ impl JsRuntimeInstance {
     }
 
     pub fn eval(&mut self, source: &str) -> Result<JsValue, Error> {
-        let program = compile_source_to_bytecode(source, &mut self.symbols)?;
-        let result = self.vm.run(program, &self.symbols);
+        let program = compile_source_to_bytecode(source, self.symbols)?;
+        let result = self.vm.run(program, self.symbols);
         let gc_result = self.vm.maybe_run_gc();
 
         gc_result?;
@@ -117,7 +153,7 @@ impl JsRuntimeInstance {
     }
 
     pub(crate) fn eval_start(&mut self, source: &str) -> RunResult {
-        match compile_source_to_bytecode(source, &mut self.symbols) {
+        match compile_source_to_bytecode(source, self.symbols) {
             Ok(program) => match self.vm.start(program) {
                 Ok(result) => result,
                 Err(err) => RunResult::Failed(err),
@@ -127,7 +163,7 @@ impl JsRuntimeInstance {
     }
 
     pub(crate) fn run_for_budget(&mut self, budget: InstructionBudget) -> RunResult {
-        let result = self.vm.run_for_budget(budget, &self.symbols);
+        let result = self.vm.run_for_budget(budget, self.symbols);
         if !matches!(result, RunResult::Suspended)
             && let Err(err) = self.vm.maybe_run_gc()
         {
@@ -138,7 +174,7 @@ impl JsRuntimeInstance {
     }
 
     pub(crate) fn run_until_complete(&mut self) -> RunResult {
-        let result = self.vm.run_until_complete(&self.symbols);
+        let result = self.vm.run_until_complete(self.symbols);
         if !matches!(result, RunResult::Suspended)
             && let Err(err) = self.vm.maybe_run_gc()
         {
@@ -146,10 +182,6 @@ impl JsRuntimeInstance {
         }
 
         result
-    }
-
-    pub fn heap_stats(&self) -> HeapStats {
-        self.vm.heap_stats()
     }
 
     pub fn force_gc(&mut self) -> Result<usize, Error> {
@@ -186,15 +218,15 @@ impl JsRuntimeInstance {
         match self.modules.resolve_export(module, export_name)? {
             ResolvedExport::Binding { binding, .. } => {
                 let symbol = self.symbol_for_export_name(export_name);
-                self.vm.load_cell(binding, symbol, &self.symbols)
+                self.vm.load_cell(binding, symbol, self.symbols)
             }
             ResolvedExport::Ambiguous => Err(Error::JsModuleExportAmbiguous {
-                export: format_export_name(export_name, &self.symbols),
+                export: format_export_name(export_name, self.symbols),
             }),
             ResolvedExport::Namespace { .. } | ResolvedExport::NotFound => {
                 Err(Error::JsModuleExportNotFound {
                     specifier: key.0.clone(),
-                    export: format_export_name(export_name, &self.symbols),
+                    export: format_export_name(export_name, self.symbols),
                 })
             }
         }
@@ -206,49 +238,6 @@ impl JsRuntimeInstance {
         } else {
             ExportName::Named(self.symbols.intern(name))
         }
-    }
-
-    pub(crate) fn serialize(&self) -> Result<Vec<u8>, Error> {
-        bincode::serialize(&JsRuntimeSnapshotRef {
-            version: JS_RUNTIME_SNAPSHOT_VERSION,
-            runtime_id: self.id,
-            symbols: &self.symbols,
-            vm: &self.vm,
-            modules: &self.modules,
-        })
-        .map_err(|err| Error::JsSnapshot(err.to_string()))
-    }
-
-    pub(crate) fn deserialize(
-        bytes: &[u8],
-        attachments: &[Box<dyn JsAttachment + Send>],
-    ) -> Result<Self, Error> {
-        let snapshot = bincode::deserialize::<JsRuntimeSnapshot>(bytes)
-            .map_err(|err| Error::JsSnapshot(err.to_string()))?;
-
-        if snapshot.version != JS_RUNTIME_SNAPSHOT_VERSION {
-            return Err(Error::JsSnapshot(format!(
-                "unsupported snapshot version {}",
-                snapshot.version
-            )));
-        }
-
-        let mut runtime = Self {
-            id: snapshot.runtime_id,
-            symbols: snapshot.symbols,
-            vm: snapshot.vm,
-            modules: snapshot.modules,
-        };
-
-        for attachment in attachments {
-            runtime.bind_attachment_host(attachment.as_ref())?;
-        }
-
-        Ok(runtime)
-    }
-
-    pub fn destroy(mut self) -> Result<(), Error> {
-        self.vm.destroy()
     }
 
     fn load_module_graph(
@@ -264,7 +253,7 @@ impl JsRuntimeInstance {
         let Some(source) = sources.get(&key) else {
             return self.load_host_module(key, attachments);
         };
-        let compiled = compile_module_source(source, &mut self.symbols)?;
+        let compiled = compile_module_source(source, self.symbols)?;
         let env_frame = self.vm.create_module_frame();
         let id = self.modules.insert_loaded(key, env_frame, compiled);
         let requested = self.modules.get(id)?.requested_modules.clone();
@@ -293,8 +282,7 @@ impl JsRuntimeInstance {
         let env_frame = self.vm.create_module_frame();
         let local_export_entries = {
             let (heap, env, _) = self.vm.install_parts_mut();
-            let mut ctx =
-                HostModuleInstallCtx::new(self.id, &mut self.symbols, heap, env, env_frame);
+            let mut ctx = HostModuleInstallCtx::new(self.id, self.symbols, heap, env, env_frame);
 
             if !attachment.install_module(&key, &mut ctx)? {
                 return Err(Error::JsModuleNotDefined {
@@ -365,11 +353,11 @@ impl JsRuntimeInstance {
         for binding in local_bindings {
             if self
                 .vm
-                .cell_for_name_in_frame(env_frame, binding.name, &self.symbols)
+                .cell_for_name_in_frame(env_frame, binding.name, self.symbols)
                 .is_err()
             {
                 self.vm
-                    .declare_in_frame(env_frame, binding.name, binding.kind, &self.symbols)?;
+                    .declare_in_frame(env_frame, binding.name, binding.kind, self.symbols)?;
             }
         }
 
@@ -378,7 +366,7 @@ impl JsRuntimeInstance {
         for export in local_exports {
             let cell =
                 self.vm
-                    .cell_for_name_in_frame(env_frame, export.local_name, &self.symbols)?;
+                    .cell_for_name_in_frame(env_frame, export.local_name, self.symbols)?;
             export_cells.insert(export.export_name, cell);
         }
 
@@ -404,7 +392,7 @@ impl JsRuntimeInstance {
                         &import.module_request,
                     )?;
                     self.vm
-                        .alias_in_frame(env_frame, import.local_name, cell, &self.symbols)?;
+                        .alias_in_frame(env_frame, import.local_name, cell, self.symbols)?;
                 }
                 ImportName::Default => {
                     let cell = self.resolve_required_binding(
@@ -413,7 +401,7 @@ impl JsRuntimeInstance {
                         &import.module_request,
                     )?;
                     self.vm
-                        .alias_in_frame(env_frame, import.local_name, cell, &self.symbols)?;
+                        .alias_in_frame(env_frame, import.local_name, cell, self.symbols)?;
                 }
                 ImportName::Namespace => {
                     let object = self.create_module_namespace_object(dependency)?;
@@ -422,7 +410,7 @@ impl JsRuntimeInstance {
                         import.local_name,
                         BindingKind::Const,
                         JsValue::Object(object),
-                        &self.symbols,
+                        self.symbols,
                     )?;
                 }
             }
@@ -440,12 +428,12 @@ impl JsRuntimeInstance {
         match self.modules.resolve_export(module, export_name)? {
             ResolvedExport::Binding { binding, .. } => Ok(binding),
             ResolvedExport::Ambiguous => Err(Error::JsModuleExportAmbiguous {
-                export: format_export_name(export_name, &self.symbols),
+                export: format_export_name(export_name, self.symbols),
             }),
             ResolvedExport::Namespace { .. } | ResolvedExport::NotFound => {
                 Err(Error::JsModuleExportNotFound {
                     specifier: request.0.clone(),
-                    export: format_export_name(export_name, &self.symbols),
+                    export: format_export_name(export_name, self.symbols),
                 })
             }
         }
@@ -496,7 +484,7 @@ impl JsRuntimeInstance {
             (record.program.clone(), record.env_frame)
         };
 
-        match self.vm.run_in_frame(program, env_frame, &self.symbols) {
+        match self.vm.run_in_frame(program, env_frame, self.symbols) {
             Ok(_) => {
                 self.modules.get_mut(module)?.state = ModuleState::Evaluated;
                 Ok(())
@@ -516,8 +504,46 @@ impl JsRuntimeInstance {
     }
 }
 
-impl Drop for JsRuntimeInstance {
-    fn drop(&mut self) {
-        let _ = self.vm.destroy();
+impl RuntimeRecordViewRef<'_> {
+    pub(crate) fn heap_stats(&self) -> HeapStats {
+        self.vm.heap_stats()
+    }
+
+    pub(crate) fn serialize(&self) -> Result<Vec<u8>, Error> {
+        bincode::serialize(&JsRuntimeSnapshotRef {
+            version: JS_RUNTIME_SNAPSHOT_VERSION,
+            runtime_id: self.id,
+            storage_segments: self.storage_segments,
+            symbols: self.symbols,
+            vm: self.vm,
+            modules: self.modules,
+        })
+        .map_err(|err| Error::JsSnapshot(err.to_string()))
+    }
+}
+
+impl RuntimeSnapshot {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let snapshot = bincode::deserialize::<RuntimeSnapshot>(bytes)
+            .map_err(|err| Error::JsSnapshot(err.to_string()))?;
+
+        if snapshot.version != JS_RUNTIME_SNAPSHOT_VERSION {
+            return Err(Error::JsSnapshot(format!(
+                "unsupported snapshot version {}",
+                snapshot.version
+            )));
+        }
+
+        Ok(snapshot)
+    }
+}
+
+impl RuntimeDetached {
+    pub(crate) fn new(vm: Vm) -> Self {
+        Self { vm }
+    }
+
+    pub(crate) fn destroy(mut self) -> Result<(), Error> {
+        self.vm.destroy()
     }
 }

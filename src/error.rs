@@ -67,6 +67,17 @@ pub enum Error {
         expected: JsRuntimeId,
         actual: JsRuntimeId,
     },
+    JsSegmentFull {
+        segment: u64,
+    },
+    JsSegmentSlotEmpty {
+        segment: u64,
+        slot: u32,
+    },
+    JsSegmentSlotOutOfBounds {
+        segment: u64,
+        slot: u32,
+    },
     JsSnapshot(String),
     JsHeapLeak {
         objects: usize,

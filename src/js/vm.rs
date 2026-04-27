@@ -62,6 +62,10 @@ impl Vm {
     pub fn with_gc_policy(gc_policy: GcPolicy) -> Self {
         Self::with_storage_segments(
             RuntimeStorageSegments {
+                runtime_record: SegmentId(4),
+                symbol_table: SegmentId(5),
+                vm_state: SegmentId(6),
+                module_registry: SegmentId(7),
                 heap: SegmentId(0),
                 bindings: SegmentId(1),
                 env_frames: SegmentId(2),
@@ -91,15 +95,6 @@ impl Vm {
 
     pub(crate) fn stack_id(&self) -> StackId {
         self.stack_id
-    }
-
-    pub(crate) fn storage_segments(&self) -> RuntimeStorageSegments {
-        RuntimeStorageSegments {
-            heap: self.heap.segment(),
-            bindings: self.env.binding_segment(),
-            env_frames: self.env.frame_segment(),
-            stack: self.stack_id.segment,
-        }
     }
 
     pub(crate) fn storage_usage(&self) -> RuntimeStorageUsage {

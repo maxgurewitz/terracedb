@@ -95,14 +95,6 @@ impl EnvStack {
         self.root
     }
 
-    pub(crate) fn binding_segment(&self) -> SegmentId {
-        self.binding_segment
-    }
-
-    pub(crate) fn frame_segment(&self) -> SegmentId {
-        self.frame_segment
-    }
-
     pub(crate) fn live_frame_count(&self) -> usize {
         self.frames.iter().filter(|frame| frame.is_some()).count()
     }

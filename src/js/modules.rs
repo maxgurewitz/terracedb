@@ -25,7 +25,7 @@ pub enum ModuleState {
 pub struct ModuleRegistry {
     next_module_id: u64,
     by_key: HashMap<ModuleKey, ModuleId>,
-    modules: HashMap<ModuleId, ModuleRecord>,
+    modules: Vec<Option<ModuleRecord>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -106,7 +106,7 @@ impl ModuleRegistry {
         Self {
             next_module_id: 0,
             by_key: HashMap::new(),
-            modules: HashMap::new(),
+            modules: Vec::new(),
         }
     }
 
@@ -128,30 +128,33 @@ impl ModuleRegistry {
         self.next_module_id += 1;
 
         self.by_key.insert(key.clone(), id);
-        self.modules.insert(
+        let slot = id.0 as usize;
+        if self.modules.len() <= slot {
+            self.modules.resize_with(slot + 1, || None);
+        }
+
+        self.modules[slot] = Some(ModuleRecord {
             id,
-            ModuleRecord {
-                id,
-                key,
-                state: ModuleState::Loaded,
-                requested_modules: compiled.requested_modules,
-                import_entries: compiled.import_entries,
-                local_export_entries: compiled.local_export_entries,
-                indirect_export_entries: compiled.indirect_export_entries,
-                star_export_entries: compiled.star_export_entries,
-                local_bindings: compiled.local_bindings,
-                env_frame,
-                program: compiled.program,
-                export_cells: HashMap::new(),
-            },
-        );
+            key,
+            state: ModuleState::Loaded,
+            requested_modules: compiled.requested_modules,
+            import_entries: compiled.import_entries,
+            local_export_entries: compiled.local_export_entries,
+            indirect_export_entries: compiled.indirect_export_entries,
+            star_export_entries: compiled.star_export_entries,
+            local_bindings: compiled.local_bindings,
+            env_frame,
+            program: compiled.program,
+            export_cells: HashMap::new(),
+        });
 
         id
     }
 
     pub fn get(&self, id: ModuleId) -> Result<&ModuleRecord, Error> {
         self.modules
-            .get(&id)
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
             .ok_or_else(|| Error::JsModuleNotDefined {
                 specifier: format!("<module:{}>", id.0),
             })
@@ -159,7 +162,8 @@ impl ModuleRegistry {
 
     pub fn get_mut(&mut self, id: ModuleId) -> Result<&mut ModuleRecord, Error> {
         self.modules
-            .get_mut(&id)
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_mut)
             .ok_or_else(|| Error::JsModuleNotDefined {
                 specifier: format!("<module:{}>", id.0),
             })

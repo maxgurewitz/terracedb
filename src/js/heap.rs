@@ -47,7 +47,8 @@ impl Default for GcPolicy {
 pub struct JsHeap {
     segment: SegmentId,
     next_object_slot: u32,
-    objects: HashMap<ObjectId, HeapObject>,
+    objects: Vec<Option<HeapObject>>,
+    free_slots: Vec<u32>,
     gc_objects: Vec<ObjectId>,
     zero_ref: Vec<ObjectId>,
     tmp_cycle: Vec<ObjectId>,
@@ -109,7 +110,8 @@ impl JsHeap {
         Self {
             segment,
             next_object_slot: 0,
-            objects: HashMap::new(),
+            objects: Vec::new(),
+            free_slots: Vec::new(),
             gc_objects: Vec::new(),
             zero_ref: Vec::new(),
             tmp_cycle: Vec::new(),
@@ -122,35 +124,33 @@ impl JsHeap {
         }
     }
 
-    pub(crate) fn segment(&self) -> SegmentId {
-        self.segment
-    }
-
     pub(crate) fn allocated_objects(&self) -> usize {
         self.allocated_objects
     }
 
     pub fn alloc_object(&mut self, kind: ObjectKind) -> ObjectId {
         let object = JsObject::new(kind);
+        let slot = self.free_slots.pop().unwrap_or(self.next_object_slot);
         let id = ObjectId {
             segment: self.segment,
-            slot: self.next_object_slot,
+            slot,
         };
-        self.next_object_slot += 1;
+        self.next_object_slot = self.next_object_slot.max(slot + 1);
 
         let bytes = estimate_object_bytes(&object);
 
-        self.objects.insert(
-            id,
-            HeapObject {
-                header: GcHeader {
-                    ref_count: 0,
-                    mark: GcMark::None,
-                    bytes,
-                },
-                object,
+        if self.objects.len() <= slot as usize {
+            self.objects.resize_with(slot as usize + 1, || None);
+        }
+
+        self.objects[slot as usize] = Some(HeapObject {
+            header: GcHeader {
+                ref_count: 0,
+                mark: GcMark::None,
+                bytes,
             },
-        );
+            object,
+        });
         self.gc_objects.push(id);
         self.allocated_objects += 1;
         self.allocated_bytes += bytes;
@@ -175,15 +175,20 @@ impl JsHeap {
     pub fn dup_object(&mut self, id: ObjectId) {
         let object = self
             .objects
-            .get_mut(&id)
+            .get_mut(id.slot as usize)
+            .and_then(Option::as_mut)
             .expect("dup_object for missing object");
         object.header.ref_count += 1;
     }
 
     pub fn free_object_ref(&mut self, id: ObjectId) -> Result<(), Error> {
-        let object = self.objects.get_mut(&id).ok_or(Error::JsObjectNotFound {
-            object: id.debug_index(),
-        })?;
+        let object = self
+            .objects
+            .get_mut(id.slot as usize)
+            .and_then(Option::as_mut)
+            .ok_or(Error::JsObjectNotFound {
+                object: id.debug_index(),
+            })?;
 
         if object.header.ref_count == 0 {
             return Err(Error::JsRefCountUnderflow {
@@ -223,7 +228,7 @@ impl JsHeap {
         key: PropertyKey,
         value: JsValue,
     ) -> Result<(), Error> {
-        if !self.objects.contains_key(&object) {
+        if self.object(object).is_err() {
             return Err(Error::JsObjectNotFound {
                 object: object.debug_index(),
             });
@@ -306,8 +311,8 @@ impl JsHeap {
     pub(crate) fn drain_zero_ref(&mut self) -> Result<(), Error> {
         while let Some(id) = self.zero_ref.pop() {
             let should_free = self
-                .objects
-                .get(&id)
+                .object(id)
+                .ok()
                 .is_some_and(|object| object.header.ref_count == 0);
 
             if should_free {
@@ -319,9 +324,13 @@ impl JsHeap {
     }
 
     fn free_object_now(&mut self, id: ObjectId) -> Result<(), Error> {
-        let heap_object = self.objects.remove(&id).ok_or(Error::JsObjectNotFound {
-            object: id.debug_index(),
-        })?;
+        let heap_object = self
+            .objects
+            .get_mut(id.slot as usize)
+            .and_then(Option::take)
+            .ok_or(Error::JsObjectNotFound {
+                object: id.debug_index(),
+            })?;
 
         self.account_freed_object(id, heap_object.header.bytes);
         heap_object.object.release_children(self)
@@ -331,7 +340,7 @@ impl JsHeap {
         self.tmp_cycle.clear();
 
         for id in self.gc_objects.clone() {
-            if self.objects.contains_key(&id) {
+            if self.object(id).is_ok() {
                 self.gc_decref_children(id)?;
             }
         }
@@ -349,7 +358,8 @@ impl JsHeap {
         for child in children {
             let child_object = self
                 .objects
-                .get_mut(&child)
+                .get_mut(child.slot as usize)
+                .and_then(Option::as_mut)
                 .ok_or(Error::JsObjectNotFound {
                     object: child.debug_index(),
                 })?;
@@ -374,8 +384,8 @@ impl JsHeap {
     fn gc_scan_live(&mut self) -> Result<(), Error> {
         for id in self.gc_objects.clone() {
             let is_live_root = self
-                .objects
-                .get(&id)
+                .object(id)
+                .ok()
                 .is_some_and(|object| object.header.ref_count > 0);
 
             if is_live_root {
@@ -388,9 +398,13 @@ impl JsHeap {
 
     fn gc_scan_object(&mut self, id: ObjectId) -> Result<(), Error> {
         let already_live = {
-            let object = self.objects.get_mut(&id).ok_or(Error::JsObjectNotFound {
-                object: id.debug_index(),
-            })?;
+            let object = self
+                .objects
+                .get_mut(id.slot as usize)
+                .and_then(Option::as_mut)
+                .ok_or(Error::JsObjectNotFound {
+                    object: id.debug_index(),
+                })?;
 
             if object.header.mark == GcMark::Live {
                 true
@@ -411,7 +425,11 @@ impl JsHeap {
         });
 
         for child in children {
-            if let Some(child_object) = self.objects.get_mut(&child) {
+            if let Some(child_object) = self
+                .objects
+                .get_mut(child.slot as usize)
+                .and_then(Option::as_mut)
+            {
                 child_object.header.ref_count += 1;
             }
 
@@ -424,8 +442,8 @@ impl JsHeap {
     fn gc_restore_cycles(&mut self) -> Result<(), Error> {
         for id in self.tmp_cycle.clone() {
             let should_restore = self
-                .objects
-                .get(&id)
+                .object(id)
+                .ok()
                 .is_some_and(|object| object.header.mark != GcMark::Live);
 
             if should_restore {
@@ -444,7 +462,11 @@ impl JsHeap {
         });
 
         for child in children {
-            if let Some(child_object) = self.objects.get_mut(&child) {
+            if let Some(child_object) = self
+                .objects
+                .get_mut(child.slot as usize)
+                .and_then(Option::as_mut)
+            {
                 child_object.header.ref_count += 1;
             }
         }
@@ -457,15 +479,15 @@ impl JsHeap {
         let collected = candidates
             .into_iter()
             .filter(|id| {
-                self.objects
-                    .get(id)
+                self.object(*id)
+                    .ok()
                     .is_some_and(|object| object.header.mark != GcMark::Live)
             })
             .collect::<Vec<_>>();
 
         self.gc_phase = GcPhase::RemoveCycles;
         for id in &collected {
-            if self.objects.contains_key(id) {
+            if self.object(*id).is_ok() {
                 self.release_object_children(*id)?;
             }
         }
@@ -474,7 +496,11 @@ impl JsHeap {
         let mut freed = 0;
 
         for id in collected {
-            let Some(heap_object) = self.objects.remove(&id) else {
+            let Some(heap_object) = self
+                .objects
+                .get_mut(id.slot as usize)
+                .and_then(Option::take)
+            else {
                 continue;
             };
 
@@ -497,8 +523,10 @@ impl JsHeap {
         Ok(())
     }
     fn reset_gc_marks(&mut self) {
-        for object in self.objects.values_mut() {
-            object.header.mark = GcMark::None;
+        for object in &mut self.objects {
+            if let Some(object) = object.as_mut() {
+                object.header.mark = GcMark::None;
+            }
         }
     }
 
@@ -508,18 +536,23 @@ impl JsHeap {
         self.allocated_bytes = self.allocated_bytes.saturating_sub(bytes);
         self.gc_objects.retain(|existing| *existing != id);
         self.zero_ref.retain(|existing| *existing != id);
+        self.free_slots.push(id.slot);
     }
 
     fn object(&self, object: ObjectId) -> Result<&HeapObject, Error> {
-        self.objects.get(&object).ok_or(Error::JsObjectNotFound {
-            object: object.debug_index(),
-        })
+        self.objects
+            .get(object.slot as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::JsObjectNotFound {
+                object: object.debug_index(),
+            })
     }
 
     fn object_mut(&mut self, object: ObjectId) -> Result<&mut JsObject, Error> {
         self.objects
-            .get_mut(&object)
-            .map(|object| &mut object.object)
+            .get_mut(object.slot as usize)
+            .and_then(Option::as_mut)
+            .map(|heap_object| &mut heap_object.object)
             .ok_or(Error::JsObjectNotFound {
                 object: object.debug_index(),
             })
